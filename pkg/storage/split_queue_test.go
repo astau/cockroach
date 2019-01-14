@@ -11,98 +11,100 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package storage
 
 import (
+	"context"
 	"math"
 	"testing"
 
-	"golang.org/x/net/context"
-
 	"github.com/cockroachdb/cockroach/pkg/config"
-	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/gogo/protobuf/proto"
 )
 
-// TestSplitQueueShouldQueue verifies shouldQueue method correctly
+// TestSplitQueueShouldQueue verifies shouldSplitRange method correctly
 // combines splits in zone configs with the size of the range.
 func TestSplitQueueShouldQueue(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	tc := testContext{}
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	tc.Start(t, stopper)
 
 	// Set zone configs.
-	config.TestingSetZoneConfig(2000, config.ZoneConfig{RangeMaxBytes: 32 << 20})
-	config.TestingSetZoneConfig(2002, config.ZoneConfig{RangeMaxBytes: 32 << 20})
+	config.TestingSetZoneConfig(2000, config.ZoneConfig{RangeMaxBytes: proto.Int64(32 << 20)})
+	config.TestingSetZoneConfig(2002, config.ZoneConfig{RangeMaxBytes: proto.Int64(32 << 20)})
 
-	// Despite faking the zone configs, we still need to have a gossip entry.
-	if err := tc.gossip.AddInfoProto(gossip.KeySystemConfig, &config.SystemConfig{}, 0); err != nil {
-		t.Fatal(err)
-	}
+	minQPSForSplit := SplitByLoadQPSThreshold.Get(&tc.store.ClusterSettings().SV)
 
 	testCases := []struct {
 		start, end roachpb.RKey
 		bytes      int64
+		QPS        float64
+		maxBytes   int64
 		shouldQ    bool
 		priority   float64
 	}{
-		// No intersection, no bytes.
-		{roachpb.RKeyMin, roachpb.RKey("/"), 0, false, 0},
-		// Intersection in zone, no bytes.
-		{keys.MakeTablePrefix(2001), roachpb.RKeyMax, 0, true, 1},
-		// Already split at largest ID.
-		{keys.MakeTablePrefix(2002), roachpb.RKeyMax, 0, false, 0},
-		// Multiple intersections, no bytes.
-		{roachpb.RKeyMin, roachpb.RKeyMax, 0, true, 1},
-		// No intersection, max bytes.
-		{roachpb.RKeyMin, roachpb.RKey("/"), 64 << 20, false, 0},
-		// No intersection, max bytes+1.
-		{roachpb.RKeyMin, roachpb.RKey("/"), 64<<20 + 1, true, 1},
-		// No intersection, max bytes * 2.
-		{roachpb.RKeyMin, roachpb.RKey("/"), 64 << 21, true, 2},
-		// Intersection, max bytes +1.
-		{keys.MakeTablePrefix(2000), roachpb.RKeyMax, 32<<20 + 1, true, 2},
-		// Split needed at table boundary, but no zone config.
-		{keys.MakeTablePrefix(2001), roachpb.RKeyMax, 32<<20 + 1, true, 1},
+		// No intersection, no bytes, no load.
+		{roachpb.RKeyMin, roachpb.RKey(keys.MetaMax), 0, 0, 64 << 20, false, 0},
+		// Intersection in zone, no bytes, no load.
+		{keys.MakeTablePrefix(2001), roachpb.RKeyMax, 0, 0, 64 << 20, true, 1},
+		// Already split at largest ID, no load.
+		{keys.MakeTablePrefix(2002), roachpb.RKeyMax, 0, 0, 32 << 20, false, 0},
+		// Multiple intersections, no bytes, no load.
+		{roachpb.RKeyMin, roachpb.RKeyMax, 0, 0, 64 << 20, true, 1},
+		// No intersection, max bytes, no load.
+		{roachpb.RKeyMin, roachpb.RKey(keys.MetaMax), 64 << 20, 0, 64 << 20, false, 0},
+		// No intersection, max bytes+1, no load.
+		{roachpb.RKeyMin, roachpb.RKey(keys.MetaMax), 64<<20 + 1, 0, 64 << 20, true, 1},
+		// No intersection, max bytes * 2, no load.
+		{roachpb.RKeyMin, roachpb.RKey(keys.MetaMax), 64 << 21, 0, 64 << 20, true, 2},
+		// Intersection, max bytes +1, no load.
+		{keys.MakeTablePrefix(2000), roachpb.RKeyMax, 32<<20 + 1, 0, 32 << 20, true, 2},
+		// Split needed at table boundary, but no zone config, no load.
+		{keys.MakeTablePrefix(2001), roachpb.RKeyMax, 32<<20 + 1, 0, 64 << 20, true, 1},
+		// Split needed because of load.
+		{roachpb.RKeyMin, roachpb.RKey(keys.MetaMax), 0, float64(minQPSForSplit), 64 << 20, true, 1},
 	}
 
-	splitQ := newSplitQueue(tc.store, nil, tc.gossip)
-
-	cfg, ok := tc.gossip.GetSystemConfig()
-	if !ok {
+	cfg := tc.gossip.GetSystemConfig()
+	if cfg == nil {
 		t.Fatal("config not set")
 	}
 
 	for i, test := range testCases {
-		func() {
-			// Hold lock throughout to reduce chance of random commands leading
-			// to inconsistent state.
-			tc.repl.mu.Lock()
-			defer tc.repl.mu.Unlock()
-			ms := enginepb.MVCCStats{KeyBytes: test.bytes}
-			if err := setMVCCStats(context.Background(), tc.repl.store.Engine(), tc.repl.RangeID, ms); err != nil {
-				t.Fatal(err)
-			}
-			tc.repl.mu.state.Stats = ms
-		}()
-
+		// Create a replica for testing that is not hooked up to the store. This
+		// ensures that the store won't be mucking with our replica concurrently
+		// during testing (e.g. via the system config gossip update).
 		copy := *tc.repl.Desc()
 		copy.StartKey = test.start
 		copy.EndKey = test.end
-		if err := tc.repl.setDesc(&copy); err != nil {
+		repl, err := NewReplica(&copy, tc.store, 0)
+		if err != nil {
 			t.Fatal(err)
 		}
-		shouldQ, priority := splitQ.shouldQueue(context.TODO(), hlc.ZeroTimestamp, tc.repl, cfg)
+
+		repl.mu.Lock()
+		repl.mu.state.Stats = &enginepb.MVCCStats{KeyBytes: test.bytes}
+		repl.mu.Unlock()
+		repl.splitMu.Lock()
+		repl.splitMu.qps = test.QPS
+		repl.splitMu.Unlock()
+		zoneConfig := config.DefaultZoneConfig()
+		zoneConfig.RangeMaxBytes = proto.Int64(test.maxBytes)
+		repl.SetZoneConfig(&zoneConfig)
+
+		// Testing using shouldSplitRange instead of shouldQueue to avoid using the splitFinder
+		// This tests the merge queue behavior too as a result. For splitFinder tests,
+		// see split/split_test.go.
+		shouldQ, priority := shouldSplitRange(repl.Desc(), repl.GetMVCCStats(),
+			repl.GetSplitQPS(), repl.SplitByLoadQPSThreshold(), repl.GetMaxBytes(), cfg)
 		if shouldQ != test.shouldQ {
 			t.Errorf("%d: should queue expected %t; got %t", i, test.shouldQ, shouldQ)
 		}

@@ -1,6 +1,23 @@
 // Copyright 2011 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// license that can be found in licenses/BSD-golang.txt.
+
+// Portions of this file are additionally subject to the following license
+// and copyright.
+//
+// Copyright 2016 The Cockroach Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+// implied. See the License for the specific language governing
+// permissions and limitations under the License.
 
 // Copied from Go's text/template/parse package and modified for yacc.
 
@@ -87,8 +104,7 @@ func (t *Tree) unexpected(token item, context string) {
 
 // recover is the handler that turns panics into returns from the top level of Parse.
 func (t *Tree) recover(errp *error) {
-	e := recover()
-	if e != nil {
+	if e := recover(); e != nil {
 		if _, ok := e.(runtime.Error); ok {
 			panic(e)
 		}
@@ -97,7 +113,6 @@ func (t *Tree) recover(errp *error) {
 		}
 		*errp = e.(error)
 	}
-	return
 }
 
 // startParse initializes the parser, using the lexer.
@@ -139,7 +154,9 @@ func (t *Tree) parse() {
 func (t *Tree) parseProduction(p *ProductionNode) {
 	const context = "production"
 	t.expect(itemColon, context)
-	t.expect(itemNL, context)
+	if t.peek().typ == itemNL {
+		t.next()
+	}
 	expectExpr := true
 	for {
 		token := t.next()
@@ -179,7 +196,9 @@ func (t *Tree) parseExpression(e *ExpressionNode) {
 			e.Items = append(e.Items, Item{token.val, TypLiteral})
 		case itemExpr:
 			e.Command = token.val
-			t.expect(itemNL, context)
+			if t.peek().typ == itemNL {
+				t.next()
+			}
 			return
 		case itemPct, itemComment:
 			// ignore

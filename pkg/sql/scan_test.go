@@ -11,13 +11,12 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
-package sql_test
+package sql
 
 import (
 	"bytes"
+	"context"
 	gosql "database/sql"
 	"fmt"
 	"math/rand"
@@ -25,7 +24,8 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/row"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
@@ -128,17 +128,17 @@ func testScanBatchQuery(t *testing.T, db *gosql.DB, numSpans, numAs, numBs int, 
 func TestScanBatches(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
+	// The test will screw around with KVBatchSize; make sure to restore it at the end.
+	restore := row.SetKVBatchSize(10)
+	defer restore()
+
 	s, db, _ := serverutils.StartServer(
 		t, base.TestServerArgs{UseDatabase: "test"})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	if _, err := db.Exec(`CREATE DATABASE IF NOT EXISTS test`); err != nil {
 		t.Fatal(err)
 	}
-
-	// The test will screw around with KVBatchSize; make sure to restore it at the end.
-	restore := sqlbase.SetKVBatchSize(10)
-	defer restore()
 
 	numAs := 5
 	numBs := 20
@@ -175,7 +175,7 @@ func TestScanBatches(t *testing.T) {
 	numSpanValues := []int{0, 1, 2, 3}
 
 	for _, batch := range batchSizes {
-		sqlbase.SetKVBatchSize(int64(batch))
+		row.SetKVBatchSize(int64(batch))
 		for _, numSpans := range numSpanValues {
 			testScanBatchQuery(t, db, numSpans, numAs, numBs, false)
 			testScanBatchQuery(t, db, numSpans, numAs, numBs, true)
@@ -184,5 +184,32 @@ func TestScanBatches(t *testing.T) {
 
 	if _, err := db.Exec(`DROP TABLE test.scan`); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestKVLimitHint(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	testCases := []struct {
+		hardLimit int64
+		softLimit int64
+		filter    tree.TypedExpr
+		expected  int64
+	}{
+		{hardLimit: 0, softLimit: 0, filter: nil, expected: 0},
+		{hardLimit: 0, softLimit: 1, filter: nil, expected: 2},
+		{hardLimit: 0, softLimit: 23, filter: nil, expected: 46},
+		{hardLimit: 0, softLimit: 1, filter: tree.DBoolFalse, expected: 2},
+		{hardLimit: 1, softLimit: 0, filter: nil, expected: 1},
+		{hardLimit: 1, softLimit: 23, filter: nil, expected: 1},
+		{hardLimit: 5, softLimit: 23, filter: nil, expected: 5},
+		{hardLimit: 1, softLimit: 23, filter: tree.DBoolTrue, expected: 1},
+		{hardLimit: 1, softLimit: 23, filter: tree.DBoolFalse, expected: 2},
+	}
+	for _, tc := range testCases {
+		sn := scanNode{hardLimit: tc.hardLimit, softLimit: tc.softLimit, filter: tc.filter}
+		if limitHint := sn.limitHint(); limitHint != tc.expected {
+			t.Errorf("%+v: got %d", tc, limitHint)
+		}
 	}
 }

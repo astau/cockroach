@@ -11,44 +11,44 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Andrei Matei (andreimatei1@gmail.com)
 
 package testcluster
 
 import (
+	"context"
 	gosql "database/sql"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/pkg/errors"
-	"golang.org/x/net/context"
-
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/pkg/errors"
 )
 
 // TestCluster represents a set of TestServers. The hope is that it can be used
 // analoguous to TestServer, but with control over range replication.
 type TestCluster struct {
-	Servers []*server.TestServer
-	Conns   []*gosql.DB
-	stopper *stop.Stopper
-	mu      struct {
+	Servers         []*server.TestServer
+	Conns           []*gosql.DB
+	stopper         *stop.Stopper
+	replicationMode base.TestClusterReplicationMode
+	mu              struct {
 		syncutil.Mutex
 		serverStoppers []*stop.Stopper
 	}
@@ -93,7 +93,7 @@ func (tc *TestCluster) stopServers() {
 		go func(s *stop.Stopper) {
 			defer wg.Done()
 			if s != nil {
-				s.Quiesce()
+				s.Quiesce(context.TODO())
 			}
 		}(s)
 	}
@@ -101,7 +101,7 @@ func (tc *TestCluster) stopServers() {
 
 	for i := range tc.mu.serverStoppers {
 		if tc.mu.serverStoppers[i] != nil {
-			tc.mu.serverStoppers[i].Stop()
+			tc.mu.serverStoppers[i].Stop(context.TODO())
 			tc.mu.serverStoppers[i] = nil
 		}
 	}
@@ -112,7 +112,7 @@ func (tc *TestCluster) StopServer(idx int) {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 	if tc.mu.serverStoppers[idx] != nil {
-		tc.mu.serverStoppers[idx].Stop()
+		tc.mu.serverStoppers[idx].Stop(context.TODO())
 		tc.mu.serverStoppers[idx] = nil
 	}
 }
@@ -124,34 +124,24 @@ func StartTestCluster(t testing.TB, nodes int, args base.TestClusterArgs) *TestC
 	if nodes < 1 {
 		t.Fatal("invalid cluster size: ", nodes)
 	}
-	if args.ServerArgs.JoinAddr != "" {
-		t.Fatal("can't specify a join addr when starting a cluster")
-	}
-	if args.ServerArgs.Stopper != nil {
-		t.Fatal("can't set individual server stoppers when starting a cluster")
-	}
-	storeKnobs := args.ServerArgs.Knobs.Store
-	if storeKnobs != nil &&
-		(storeKnobs.(*storage.StoreTestingKnobs).DisableSplitQueue ||
-			storeKnobs.(*storage.StoreTestingKnobs).DisableReplicateQueue) {
-		t.Fatal("can't disable an individual server's queues when starting a cluster; " +
-			"the cluster controls replication")
-	}
 
-	switch args.ReplicationMode {
-	case base.ReplicationAuto:
-	case base.ReplicationManual:
-		if args.ServerArgs.Knobs.Store == nil {
-			args.ServerArgs.Knobs.Store = &storage.StoreTestingKnobs{}
+	if err := checkServerArgsForCluster(
+		args.ServerArgs, args.ReplicationMode, disallowJoinAddr,
+	); err != nil {
+		t.Fatal(err)
+	}
+	for _, sargs := range args.ServerArgsPerNode {
+		if err := checkServerArgsForCluster(
+			sargs, args.ReplicationMode, disallowJoinAddr,
+		); err != nil {
+			t.Fatal(err)
 		}
-		storeKnobs := args.ServerArgs.Knobs.Store.(*storage.StoreTestingKnobs)
-		storeKnobs.DisableSplitQueue = true
-		storeKnobs.DisableReplicateQueue = true
-	default:
-		t.Fatal("unexpected replication mode")
 	}
 
-	tc := &TestCluster{}
+	tc := &TestCluster{
+		stopper:         stop.NewStopper(),
+		replicationMode: args.ReplicationMode,
+	}
 	tc.stopper = stop.NewStopper()
 
 	for i := 0; i < nodes; i++ {
@@ -161,39 +151,134 @@ func StartTestCluster(t testing.TB, nodes int, args base.TestClusterArgs) *TestC
 		} else {
 			serverArgs = args.ServerArgs
 		}
-		serverArgs.PartOfCluster = true
 		if i > 0 {
 			serverArgs.JoinAddr = tc.Servers[0].ServingAddr()
 		}
-		tc.AddServer(t, serverArgs)
+		if err := tc.doAddServer(t, serverArgs); err != nil {
+			t.Fatal(err)
+		}
+		// We want to wait for stores for each server in order to have predictable
+		// store IDs. Otherwise, stores can be asynchronously bootstrapped in an
+		// unexpected order (#22342).
+		tc.WaitForStores(t, tc.Servers[0].Gossip())
 	}
 
 	// Create a closer that will stop the individual server stoppers when the
 	// cluster stopper is stopped.
 	tc.stopper.AddCloser(stop.CloserFn(tc.stopServers))
 
-	tc.WaitForStores(t, tc.Servers[0].Gossip())
-
-	// TODO(peter): We should replace the hardcoded 3 with the default ZoneConfig
-	// replication factor.
-	if args.ReplicationMode == base.ReplicationAuto && nodes >= 3 {
+	if tc.replicationMode == base.ReplicationAuto {
 		if err := tc.WaitForFullReplication(); err != nil {
 			t.Fatal(err)
 		}
 	}
+
+	// Wait until a NodeStatus is persisted for every node (see #25488, #25649, #31574).
+	tc.WaitForNodeStatuses(t)
 	return tc
+}
+
+type checkType bool
+
+const (
+	disallowJoinAddr checkType = false
+	allowJoinAddr    checkType = true
+)
+
+// checkServerArgsForCluster sanity-checks TestServerArgs to work for a cluster
+// with a given replicationMode.
+func checkServerArgsForCluster(
+	args base.TestServerArgs, replicationMode base.TestClusterReplicationMode, checkType checkType,
+) error {
+	if checkType == disallowJoinAddr && args.JoinAddr != "" {
+		return errors.Errorf("can't specify a join addr when starting a cluster: %s",
+			args.JoinAddr)
+	}
+	if args.Stopper != nil {
+		return errors.Errorf("can't set individual server stoppers when starting a cluster")
+	}
+	if args.Knobs.Store != nil {
+		storeKnobs := args.Knobs.Store.(*storage.StoreTestingKnobs)
+		if storeKnobs.DisableSplitQueue || storeKnobs.DisableReplicateQueue {
+			return errors.Errorf("can't disable an individual server's queues when starting a cluster; " +
+				"the cluster controls replication")
+		}
+	}
+
+	if replicationMode != base.ReplicationAuto && replicationMode != base.ReplicationManual {
+		return errors.Errorf("unexpected replication mode: %s", replicationMode)
+	}
+
+	return nil
 }
 
 // AddServer creates a server with the specified arguments and appends it to
 // the TestCluster.
+//
+// The new Server's copy of serverArgs might be changed according to the
+// cluster's ReplicationMode.
 func (tc *TestCluster) AddServer(t testing.TB, serverArgs base.TestServerArgs) {
+	if serverArgs.JoinAddr == "" && len(tc.Servers) > 0 {
+		serverArgs.JoinAddr = tc.Servers[0].ServingAddr()
+	}
+	if err := tc.doAddServer(t, serverArgs); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (tc *TestCluster) doAddServer(t testing.TB, serverArgs base.TestServerArgs) error {
+	serverArgs.PartOfCluster = true
+	// Check args even though they might have been checked in StartTestCluster;
+	// this method might be called for servers being added after the cluster was
+	// started, in which case the check has not been performed.
+	if err := checkServerArgsForCluster(
+		serverArgs,
+		tc.replicationMode,
+		// Allow JoinAddr here; servers being added after the TestCluster has been
+		// started should have a JoinAddr filled in at this point.
+		allowJoinAddr,
+	); err != nil {
+		return err
+	}
 	serverArgs.Stopper = stop.NewStopper()
+	if tc.replicationMode == base.ReplicationManual {
+		var stkCopy storage.StoreTestingKnobs
+		if stk := serverArgs.Knobs.Store; stk != nil {
+			stkCopy = *stk.(*storage.StoreTestingKnobs)
+		}
+		stkCopy.DisableSplitQueue = true
+		stkCopy.DisableMergeQueue = true
+		stkCopy.DisableReplicateQueue = true
+		serverArgs.Knobs.Store = &stkCopy
+	}
+
 	s, conn, _ := serverutils.StartServer(t, serverArgs)
+
+	if tc.replicationMode == base.ReplicationManual && len(tc.Servers) == 0 {
+		// We've already disabled the merge queue via testing knobs above, but ALTER
+		// TABLE ... SPLIT AT will throw an error unless we also disable merges via
+		// the cluster setting.
+		//
+		// TODO(benesch): this won't be necessary once we have sticky bits for
+		// splits.
+		if _, err := conn.Exec(`SET CLUSTER SETTING kv.range_merge.queue_enabled = false`); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Disable LBS if the server being added has a scan interval arg this low.
+	if serverArgs.ScanInterval > 0 && serverArgs.ScanInterval <= 100*time.Millisecond {
+		if _, err := conn.Exec(`SET CLUSTER SETTING kv.range_split.by_load_enabled = false`); err != nil {
+			t.Fatal(err)
+		}
+	}
+
 	tc.Servers = append(tc.Servers, s.(*server.TestServer))
 	tc.Conns = append(tc.Conns, conn)
 	tc.mu.Lock()
 	tc.mu.serverStoppers = append(tc.mu.serverStoppers, serverArgs.Stopper)
 	tc.mu.Unlock()
+	return nil
 }
 
 // WaitForStores waits for all of the store descriptors to be gossiped. Servers
@@ -255,105 +340,86 @@ func (tc *TestCluster) SplitRange(
 }
 
 // Target returns a ReplicationTarget for the specified server.
-func (tc *TestCluster) Target(serverIdx int) base.ReplicationTarget {
+func (tc *TestCluster) Target(serverIdx int) roachpb.ReplicationTarget {
 	s := tc.Servers[serverIdx]
-	return base.ReplicationTarget{
+	return roachpb.ReplicationTarget{
 		NodeID:  s.GetNode().Descriptor.NodeID,
 		StoreID: s.GetFirstStoreID(),
 	}
 }
 
 func (tc *TestCluster) changeReplicas(
-	action roachpb.ReplicaChangeType, startKey roachpb.RKey, targets ...base.ReplicationTarget,
+	changeType roachpb.ReplicaChangeType, startKey roachpb.RKey, targets ...roachpb.ReplicationTarget,
 ) (roachpb.RangeDescriptor, error) {
-	var rangeDesc roachpb.RangeDescriptor
-
-	// TODO(andrei): the following code has been adapted from
-	// multiTestContext.replicateRange(). Find a way to share.
-	for _, target := range targets {
-		// Perform a consistent read to get the updated range descriptor (as opposed
-		// to just going to one of the stores), to make sure we have the effects of
-		// the previous ChangeReplicas call. By the time ChangeReplicas returns the
-		// raft leader is guaranteed to have the updated version, but followers are
-		// not.
-		if err := tc.Servers[0].DB().GetProto(context.TODO(),
-			keys.RangeDescriptorKey(startKey), &rangeDesc); err != nil {
-			return roachpb.RangeDescriptor{}, err
-		}
-
-		// Ask an arbitrary replica of the range to perform the change. Note that
-		// the target for addition/removal is specified, this is about the choice
-		// of which replica receives the ChangeReplicas operation.
-		store, err := tc.findMemberStore(rangeDesc.Replicas[0].StoreID)
-		if err != nil {
-			return roachpb.RangeDescriptor{}, err
-		}
-		replica, err := store.GetReplica(rangeDesc.RangeID)
-		if err != nil {
-			return roachpb.RangeDescriptor{}, err
-		}
-		ctx := replica.AnnotateCtx(context.Background())
-		err = replica.ChangeReplicas(
-			ctx,
-			action,
-			roachpb.ReplicaDescriptor{
-				NodeID:  target.NodeID,
-				StoreID: target.StoreID,
-			}, &rangeDesc)
-		if err != nil {
-			return roachpb.RangeDescriptor{}, err
-		}
+	ctx := context.TODO()
+	if err := tc.Servers[0].DB().AdminChangeReplicas(
+		ctx, startKey.AsRawKey(), changeType, targets,
+	); err != nil {
+		return roachpb.RangeDescriptor{}, errors.Wrap(err, "AdminChangeReplicas error")
 	}
-	if err := tc.Servers[0].DB().GetProto(context.TODO(),
-		keys.RangeDescriptorKey(startKey), &rangeDesc); err != nil {
-		return roachpb.RangeDescriptor{}, err
+	var rangeDesc roachpb.RangeDescriptor
+	if err := tc.Servers[0].DB().GetProto(
+		ctx, keys.RangeDescriptorKey(startKey), &rangeDesc,
+	); err != nil {
+		return roachpb.RangeDescriptor{}, errors.Wrap(err, "range descriptor lookup error")
 	}
 	return rangeDesc, nil
 }
 
 // AddReplicas is part of TestClusterInterface.
 func (tc *TestCluster) AddReplicas(
-	startKey roachpb.Key, targets ...base.ReplicationTarget,
+	startKey roachpb.Key, targets ...roachpb.ReplicationTarget,
 ) (roachpb.RangeDescriptor, error) {
 	rKey := keys.MustAddr(startKey)
-	rangeDesc, err := tc.changeReplicas(
-		roachpb.ADD_REPLICA, rKey, targets...,
-	)
-	if err != nil {
-		return roachpb.RangeDescriptor{}, err
-	}
-
-	// Wait for the replication to complete on all destination nodes.
-	if err := util.RetryForDuration(time.Second*5, func() error {
-		for _, target := range targets {
-			// Use LookupReplica(keys) instead of GetRange(rangeID) to ensure that the
-			// snapshot has been transferred and the descriptor initialized.
-			store, err := tc.findMemberStore(target.StoreID)
-			if err != nil {
-				log.Errorf(context.TODO(), "unexpected error: %s", err)
-				return err
-			}
-			if store.LookupReplica(rKey, nil) == nil {
-				return errors.Errorf("range not found on store %d", target)
-			}
+	errRetry := errors.Errorf("target not found")
+	for {
+		rangeDesc, err := tc.changeReplicas(
+			roachpb.ADD_REPLICA, rKey, targets...,
+		)
+		if err != nil {
+			return roachpb.RangeDescriptor{}, err
 		}
-		return nil
-	}); err != nil {
-		return roachpb.RangeDescriptor{}, err
+
+		// Wait for the replication to complete on all destination nodes.
+		if err := retry.ForDuration(time.Second*25, func() error {
+			for _, target := range targets {
+				// Use LookupReplica(keys) instead of GetRange(rangeID) to ensure that the
+				// snapshot has been transferred and the descriptor initialized.
+				store, err := tc.findMemberStore(target.StoreID)
+				if err != nil {
+					log.Errorf(context.TODO(), "unexpected error: %s", err)
+					return err
+				}
+				repl := store.LookupReplica(rKey)
+				if repl == nil {
+					return errors.Wrapf(errRetry, "for target %s", target)
+				}
+				desc := repl.Desc()
+				if _, ok := desc.GetReplicaDescriptor(target.StoreID); !ok {
+					return errors.Errorf("target store %d not yet in range descriptor %v", target.StoreID, desc)
+				}
+			}
+			return nil
+		}); errors.Cause(err) == errRetry {
+			log.Warningf(context.Background(), "target was likely downreplicated again; retrying after %s", err)
+			continue
+		} else if err != nil {
+			return roachpb.RangeDescriptor{}, err
+		}
+		return rangeDesc, nil
 	}
-	return rangeDesc, nil
 }
 
 // RemoveReplicas is part of the TestServerInterface.
 func (tc *TestCluster) RemoveReplicas(
-	startKey roachpb.Key, targets ...base.ReplicationTarget,
+	startKey roachpb.Key, targets ...roachpb.ReplicationTarget,
 ) (roachpb.RangeDescriptor, error) {
 	return tc.changeReplicas(roachpb.REMOVE_REPLICA, keys.MustAddr(startKey), targets...)
 }
 
 // TransferRangeLease is part of the TestServerInterface.
 func (tc *TestCluster) TransferRangeLease(
-	rangeDesc roachpb.RangeDescriptor, dest base.ReplicationTarget,
+	rangeDesc roachpb.RangeDescriptor, dest roachpb.ReplicationTarget,
 ) error {
 	err := tc.Servers[0].DB().AdminTransferLease(context.TODO(),
 		rangeDesc.StartKey.AsRawKey(), dest.StoreID)
@@ -367,16 +433,16 @@ func (tc *TestCluster) TransferRangeLease(
 // without verifying if the lease is still active. Instead, it returns a time-
 // stamp taken off the queried node's clock.
 func (tc *TestCluster) FindRangeLease(
-	rangeDesc roachpb.RangeDescriptor, hint *base.ReplicationTarget,
-) (_ *roachpb.Lease, now hlc.Timestamp, _ error) {
+	rangeDesc roachpb.RangeDescriptor, hint *roachpb.ReplicationTarget,
+) (_ roachpb.Lease, now hlc.Timestamp, _ error) {
 	if hint != nil {
 		var ok bool
 		if _, ok = rangeDesc.GetReplicaDescriptor(hint.StoreID); !ok {
-			return nil, hlc.ZeroTimestamp, errors.Errorf(
+			return roachpb.Lease{}, hlc.Timestamp{}, errors.Errorf(
 				"bad hint: %+v; store doesn't have a replica of the range", hint)
 		}
 	} else {
-		hint = &base.ReplicationTarget{
+		hint = &roachpb.ReplicationTarget{
 			NodeID:  rangeDesc.Replicas[0].NodeID,
 			StoreID: rangeDesc.Replicas[0].StoreID}
 	}
@@ -391,61 +457,41 @@ func (tc *TestCluster) FindRangeLease(
 		}
 	}
 	if hintServer == nil {
-		return nil, hlc.ZeroTimestamp, errors.Errorf("bad hint: %+v; no such node", hint)
+		return roachpb.Lease{}, hlc.Timestamp{}, errors.Errorf("bad hint: %+v; no such node", hint)
 	}
-	leaseReq := roachpb.LeaseInfoRequest{
-		Span: roachpb.Span{
-			Key: rangeDesc.StartKey.AsRawKey(),
-		},
-	}
-	leaseResp, pErr := client.SendWrappedWith(
-		context.TODO(),
-		hintServer.DB().GetSender(),
-		roachpb.Header{
-			// INCONSISTENT read, since we want to make sure that the node used to
-			// send this is the one that processes the command, for the hint to
-			// matter.
-			ReadConsistency: roachpb.INCONSISTENT,
-		},
-		&leaseReq)
-	if pErr != nil {
-		return nil, hlc.ZeroTimestamp, pErr.GoError()
-	}
-	return leaseResp.(*roachpb.LeaseInfoResponse).Lease, hintServer.Clock().Now(), nil
+
+	return hintServer.GetRangeLease(context.TODO(), rangeDesc.StartKey.AsRawKey())
 }
 
 // FindRangeLeaseHolder is part of TestClusterInterface.
 func (tc *TestCluster) FindRangeLeaseHolder(
-	rangeDesc roachpb.RangeDescriptor, hint *base.ReplicationTarget,
-) (base.ReplicationTarget, error) {
+	rangeDesc roachpb.RangeDescriptor, hint *roachpb.ReplicationTarget,
+) (roachpb.ReplicationTarget, error) {
 	lease, now, err := tc.FindRangeLease(rangeDesc, hint)
 	if err != nil {
-		return base.ReplicationTarget{}, err
-	}
-	if lease == nil {
-		return base.ReplicationTarget{}, errors.New("no active lease")
+		return roachpb.ReplicationTarget{}, err
 	}
 	// Find lease replica in order to examine the lease state.
 	store, err := tc.findMemberStore(lease.Replica.StoreID)
 	if err != nil {
-		return base.ReplicationTarget{}, err
+		return roachpb.ReplicationTarget{}, err
 	}
 	replica, err := store.GetReplica(rangeDesc.RangeID)
 	if err != nil {
-		return base.ReplicationTarget{}, err
+		return roachpb.ReplicationTarget{}, err
 	}
 	if !replica.IsLeaseValid(lease, now) {
-		return base.ReplicationTarget{}, errors.New("no valid lease")
+		return roachpb.ReplicationTarget{}, errors.New("no valid lease")
 	}
 	replicaDesc := lease.Replica
-	return base.ReplicationTarget{NodeID: replicaDesc.NodeID, StoreID: replicaDesc.StoreID}, nil
+	return roachpb.ReplicationTarget{NodeID: replicaDesc.NodeID, StoreID: replicaDesc.StoreID}, nil
 }
 
 // WaitForSplitAndReplication waits for a range which starts with
 // startKey and then verifies that each replica in the range
 // descriptor has been created.
 func (tc *TestCluster) WaitForSplitAndReplication(startKey roachpb.Key) error {
-	return util.RetryForDuration(testutils.DefaultSucceedsSoonDuration, func() error {
+	return retry.ForDuration(testutils.DefaultSucceedsSoonDuration, func() error {
 		desc, err := tc.LookupRange(startKey)
 		if err != nil {
 			return errors.Wrapf(err, "unable to lookup range for %s", startKey)
@@ -494,6 +540,10 @@ func (tc *TestCluster) findMemberStore(storeID roachpb.StoreID) (*storage.Store,
 // WaitForFullReplication waits until all stores in the cluster
 // have no ranges with replication pending.
 func (tc *TestCluster) WaitForFullReplication() error {
+	if int32(len(tc.Servers)) < *config.DefaultZoneConfig().NumReplicas {
+		return nil
+	}
+
 	opts := retry.Options{
 		InitialBackoff: time.Millisecond * 10,
 		MaxBackoff:     time.Millisecond * 100,
@@ -503,12 +553,29 @@ func (tc *TestCluster) WaitForFullReplication() error {
 	notReplicated := true
 	for r := retry.Start(opts); r.Next() && notReplicated; {
 		notReplicated = false
-		for _, s := range tc.Servers {
+		for i, s := range tc.Servers {
 			err := s.Stores().VisitStores(func(s *storage.Store) error {
-				if err := s.ComputeMetrics(context.TODO(), 0); err != nil {
-					return err
+				if n := s.AvailableNodeCount(); n != len(tc.Servers) {
+					log.Infof(context.TODO(), "%s only sees %d/%d available nodes", s, n, len(tc.Servers))
+					notReplicated = true
+					return nil
 				}
-				if s.Metrics().UnderReplicatedRangeCount.Value() > 0 {
+				// Force the first node to upreplicate everything. Otherwise, if we rely
+				// on the scanner to do it, it'll take a while.
+				if i == 0 {
+					if err := s.ForceReplicationScanAndProcess(); err != nil {
+						return err
+					}
+				}
+				if err := s.ComputeMetrics(context.TODO(), 0); err != nil {
+					// This can sometimes fail since ComputeMetrics calls
+					// updateReplicationGauges which needs the system config gossiped.
+					log.Info(context.TODO(), err)
+					notReplicated = true
+					return nil
+				}
+				if n := s.Metrics().UnderReplicatedRangeCount.Value(); n > 0 {
+					log.Infof(context.TODO(), "%s has %d underreplicated ranges", s, n)
 					notReplicated = true
 				}
 				return nil
@@ -522,6 +589,69 @@ func (tc *TestCluster) WaitForFullReplication() error {
 		}
 	}
 	return nil
+}
+
+// WaitForNodeStatuses waits until a NodeStatus is persisted for every node and
+// store in the cluster.
+func (tc *TestCluster) WaitForNodeStatuses(t testing.TB) {
+	testutils.SucceedsSoon(t, func() error {
+		url := tc.Server(0).ServingAddr()
+		conn, err := tc.Server(0).RPCContext().GRPCDial(url).Connect(context.Background())
+		if err != nil {
+			return err
+		}
+		client := serverpb.NewStatusClient(conn)
+		response, err := client.Nodes(context.Background(), &serverpb.NodesRequest{})
+		if err != nil {
+			return err
+		}
+
+		if len(response.Nodes) < tc.NumServers() {
+			return fmt.Errorf("expected %d nodes registered, got %+v", tc.NumServers(), response)
+		}
+
+		// Check that all the nodes in the testcluster have a status. We tolerate
+		// other nodes having statuses (in some tests the cluster is configured with
+		// a pre-existing store).
+		nodeIDs := make(map[roachpb.NodeID]bool)
+		for _, node := range response.Nodes {
+			if len(node.StoreStatuses) == 0 {
+				return fmt.Errorf("missing StoreStatuses in NodeStatus: %+v", node)
+			}
+			nodeIDs[node.Desc.NodeID] = true
+		}
+		for _, s := range tc.Servers {
+			if id := s.GetNode().Descriptor.NodeID; !nodeIDs[id] {
+				return fmt.Errorf("missing n%d in NodeStatus: %+v", id, response)
+			}
+		}
+		return nil
+	})
+}
+
+// WaitForNodeLiveness waits until a liveness record is persisted for every
+// node in the cluster.
+func (tc *TestCluster) WaitForNodeLiveness(t testing.TB) {
+	testutils.SucceedsSoon(t, func() error {
+		db := tc.Servers[0].DB()
+		for _, s := range tc.Servers {
+			key := keys.NodeLivenessKey(s.NodeID())
+			var liveness storagepb.Liveness
+			if err := db.GetProto(context.Background(), key, &liveness); err != nil {
+				return err
+			}
+			if (liveness == storagepb.Liveness{}) {
+				return fmt.Errorf("no liveness record")
+			}
+			fmt.Printf("n%d: found liveness\n", s.NodeID())
+		}
+		return nil
+	})
+}
+
+// ReplicationMode implements TestClusterInterface.
+func (tc *TestCluster) ReplicationMode() base.TestClusterReplicationMode {
+	return tc.replicationMode
 }
 
 type testClusterFactoryImpl struct{}

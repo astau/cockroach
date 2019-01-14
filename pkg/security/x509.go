@@ -11,19 +11,14 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
 
 package security
 
 import (
 	"crypto"
-	"crypto/ecdsa"
 	"crypto/rand"
-	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/pem"
 	"math/big"
 	"net"
 	"time"
@@ -40,45 +35,13 @@ const (
 	// Make certs valid a day before to handle clock issues, specifically
 	// boot2docker: https://github.com/boot2docker/boot2docker/issues/69
 	validFrom     = -time.Hour * 24
-	validFor      = time.Hour * 24 * 365
 	maxPathLength = 1
 	caCommonName  = "Cockroach CA"
 )
 
-// generateKeyPair returns a random 'keySize' bit RSA key pair.
-func generateKeyPair(keySize int) (crypto.PrivateKey, crypto.PublicKey, error) {
-	private, err := rsa.GenerateKey(rand.Reader, keySize)
-	if err != nil {
-		return nil, nil, err
-	}
-	public := private.Public()
-	return private, public, err
-}
-
-// privateKeyPEMBlock generates a PEM block from a private key.
-func privateKeyPEMBlock(key crypto.PrivateKey) (*pem.Block, error) {
-	switch k := key.(type) {
-	case *rsa.PrivateKey:
-		return &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(k)}, nil
-	case *ecdsa.PrivateKey:
-		bytes, err := x509.MarshalECPrivateKey(k)
-		if err != nil {
-			return nil, errors.Errorf("error marshalling ECDSA key: %s", err)
-		}
-		return &pem.Block{Type: "EC PRIVATE KEY", Bytes: bytes}, nil
-	default:
-		return nil, errors.Errorf("unknown key type: %v", k)
-	}
-}
-
-// certificatePEMBlock generates a PEM block from a certificate.
-func certificatePEMBlock(cert []byte) (*pem.Block, error) {
-	return &pem.Block{Type: "CERTIFICATE", Bytes: cert}, nil
-}
-
 // newTemplate returns a partially-filled template.
 // It should be further populated based on whether the cert is for a CA or node.
-func newTemplate(commonName string) (*x509.Certificate, error) {
+func newTemplate(commonName string, lifetime time.Duration) (*x509.Certificate, error) {
 	// Generate a random serial number.
 	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
 	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
@@ -86,8 +49,9 @@ func newTemplate(commonName string) (*x509.Certificate, error) {
 		return nil, err
 	}
 
-	notBefore := timeutil.Now().Add(validFrom)
-	notAfter := notBefore.Add(validFor)
+	now := timeutil.Now()
+	notBefore := now.Add(validFrom)
+	notAfter := now.Add(lifetime)
 
 	cert := &x509.Certificate{
 		SerialNumber: serialNumber,
@@ -104,17 +68,12 @@ func newTemplate(commonName string) (*x509.Certificate, error) {
 	return cert, nil
 }
 
-// GenerateCA generates a CA certificate and returns the cert bytes as
-// well as the private key used to generate the certificate.
-func GenerateCA(keySize int) ([]byte, crypto.PrivateKey, error) {
-	privateKey, publicKey, err := generateKeyPair(keySize)
+// GenerateCA generates a CA certificate and signs it using the signer (a private key).
+// It returns the DER-encoded certificate.
+func GenerateCA(signer crypto.Signer, lifetime time.Duration) ([]byte, error) {
+	template, err := newTemplate(caCommonName, lifetime)
 	if err != nil {
-		return nil, nil, err
-	}
-
-	template, err := newTemplate(caCommonName)
-	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	// Set CA-specific fields.
@@ -124,82 +83,146 @@ func GenerateCA(keySize int) ([]byte, crypto.PrivateKey, error) {
 	template.KeyUsage |= x509.KeyUsageCertSign
 	template.KeyUsage |= x509.KeyUsageContentCommitment
 
-	certBytes, err := x509.CreateCertificate(rand.Reader, template, template, publicKey, privateKey)
+	certBytes, err := x509.CreateCertificate(
+		rand.Reader,
+		template,
+		template,
+		signer.Public(),
+		signer)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	return certBytes, privateKey, nil
+	return certBytes, nil
 }
 
-// GenerateServerCert generates a server certificate and returns the cert bytes as
-// well as the private key used to generate the certificate.
-// Takes in the CA cert and key, the size of the key to generate, and the list
-// of hosts/ip addresses this certificate applies to.
-func GenerateServerCert(
-	caCert *x509.Certificate, caKey crypto.PrivateKey, keySize int, hosts []string,
-) ([]byte, crypto.PrivateKey, error) {
-	privateKey, publicKey, err := generateKeyPair(keySize)
-	if err != nil {
-		return nil, nil, err
+func checkLifetimeAgainstCA(cert, ca *x509.Certificate) error {
+	if ca.NotAfter.After(cert.NotAfter) || ca.NotAfter.Equal(cert.NotAfter) {
+		return nil
 	}
 
-	template, err := newTemplate(NodeUser)
+	now := timeutil.Now()
+	// Truncate the lifetime to round hours, the maximum "pretty" duration.
+	niceCALifetime := ca.NotAfter.Sub(now).Hours()
+	niceCertLifetime := cert.NotAfter.Sub(now).Hours()
+	return errors.Errorf("CA lifetime is %fh, shorter than the requested %fh. "+
+		"Renew CA certificate, or rerun with --lifetime=%dh for a shorter duration.",
+		niceCALifetime, niceCertLifetime, int64(niceCALifetime))
+}
+
+// GenerateServerCert generates a server certificate and returns the cert bytes.
+// Takes in the CA cert and private key, the node public key, the certificate lifetime,
+// and the list of hosts/ip addresses this certificate applies to.
+func GenerateServerCert(
+	caCert *x509.Certificate,
+	caPrivateKey crypto.PrivateKey,
+	nodePublicKey crypto.PublicKey,
+	lifetime time.Duration,
+	hosts []string,
+) ([]byte, error) {
+	// Create template for user "NodeUser".
+	template, err := newTemplate(NodeUser, lifetime)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
+	}
+
+	// Don't issue certificates that outlast the CA cert.
+	if err := checkLifetimeAgainstCA(template, caCert); err != nil {
+		return nil, err
 	}
 
 	// Only server authentication is allowed.
 	template.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth}
-	if hosts != nil {
-		for _, h := range hosts {
-			if ip := net.ParseIP(h); ip != nil {
-				template.IPAddresses = append(template.IPAddresses, ip)
-			} else {
-				template.DNSNames = append(template.DNSNames, h)
-			}
+	for _, h := range hosts {
+		if ip := net.ParseIP(h); ip != nil {
+			template.IPAddresses = append(template.IPAddresses, ip)
+		} else {
+			template.DNSNames = append(template.DNSNames, h)
 		}
 	}
 
-	certBytes, err := x509.CreateCertificate(rand.Reader, template, caCert, publicKey, caKey)
+	certBytes, err := x509.CreateCertificate(rand.Reader, template, caCert, nodePublicKey, caPrivateKey)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	return certBytes, privateKey, nil
+	return certBytes, nil
 }
 
-// GenerateClientCert generates a client certificate and returns the cert bytes as
-// well as the private key used to generate the certificate.
-// The CA cert and private key should be passed in.
-// 'user' is the unique username stored in the Subject.CommonName field.
-func GenerateClientCert(
-	caCert *x509.Certificate, caKey crypto.PrivateKey, keySize int, name string,
-) ([]byte, crypto.PrivateKey, error) {
-
-	privateKey, publicKey, err := generateKeyPair(keySize)
+// GenerateUIServerCert generates a server certificate for the Admin UI and returns the cert bytes.
+// Takes in the CA cert and private key, the UI cert public key, the certificate lifetime,
+// and the list of hosts/ip addresses this certificate applies to.
+func GenerateUIServerCert(
+	caCert *x509.Certificate,
+	caPrivateKey crypto.PrivateKey,
+	certPublicKey crypto.PublicKey,
+	lifetime time.Duration,
+	hosts []string,
+) ([]byte, error) {
+	// Use the first host as the CN. We still place all in the alternative subject name.
+	template, err := newTemplate(hosts[0], lifetime)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
+
+	// Don't issue certificates that outlast the CA cert.
+	if err := checkLifetimeAgainstCA(template, caCert); err != nil {
+		return nil, err
+	}
+
+	// Only server authentication is allowed.
+	template.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
+	for _, h := range hosts {
+		if ip := net.ParseIP(h); ip != nil {
+			template.IPAddresses = append(template.IPAddresses, ip)
+		} else {
+			template.DNSNames = append(template.DNSNames, h)
+		}
+	}
+
+	certBytes, err := x509.CreateCertificate(rand.Reader, template, caCert, certPublicKey, caPrivateKey)
+	if err != nil {
+		return nil, err
+	}
+
+	return certBytes, nil
+}
+
+// GenerateClientCert generates a client certificate and returns the cert bytes.
+// Takes in the CA cert and private key, the client public key, the certificate lifetime,
+// and the username.
+func GenerateClientCert(
+	caCert *x509.Certificate,
+	caPrivateKey crypto.PrivateKey,
+	clientPublicKey crypto.PublicKey,
+	lifetime time.Duration,
+	user string,
+) ([]byte, error) {
 
 	// TODO(marc): should we add extra checks?
-	if len(name) == 0 {
-		return nil, nil, errors.Errorf("name cannot be empty")
+	if len(user) == 0 {
+		return nil, errors.Errorf("user cannot be empty")
 	}
 
-	template, err := newTemplate(name)
+	// Create template for "user".
+	template, err := newTemplate(user, lifetime)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
+	}
+
+	// Don't issue certificates that outlast the CA cert.
+	if err := checkLifetimeAgainstCA(template, caCert); err != nil {
+		return nil, err
 	}
 
 	// Set client-specific fields.
 	// Client authentication only.
 	template.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}
 
-	certBytes, err := x509.CreateCertificate(rand.Reader, template, caCert, publicKey, caKey)
+	certBytes, err := x509.CreateCertificate(rand.Reader, template, caCert, clientPublicKey, caPrivateKey)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	return certBytes, privateKey, nil
+	return certBytes, nil
 }

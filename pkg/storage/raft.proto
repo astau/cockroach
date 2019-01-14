@@ -11,16 +11,14 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tamir Duberstein (tamird@gmail.com)
 
 syntax = "proto2";
 package cockroach.storage;
 option go_package = "storage";
 
-import "cockroach/pkg/roachpb/errors.proto";
-import "cockroach/pkg/roachpb/metadata.proto";
-import "cockroach/pkg/storage/storagebase/state.proto";
+import "roachpb/errors.proto";
+import "roachpb/metadata.proto";
+import "storage/storagepb/state.proto";
 import "etcd/raft/raftpb/raft.proto";
 import "gogoproto/gogo.proto";
 
@@ -52,6 +50,9 @@ message RaftMessageRequest {
   optional uint64 range_id = 1 [(gogoproto.nullable) = false,
       (gogoproto.customname) = "RangeID",
       (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/roachpb.RangeID"];
+  // Optionally, the start key of the sending replica. This is only populated
+  // as a "hint" under certain conditions.
+  optional bytes range_start_key = 8 [(gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/roachpb.RKey"];
 
   optional roachpb.ReplicaDescriptor from_replica = 2 [(gogoproto.nullable) = false];
   optional roachpb.ReplicaDescriptor to_replica = 3 [(gogoproto.nullable) = false];
@@ -103,6 +104,24 @@ message RaftMessageResponse {
 
 // SnapshotRequest is the request used to send streaming snapshot requests.
 message SnapshotRequest {
+  enum Priority {
+    UNKNOWN = 0;
+    // RECOVERY is used for a Raft-initiated snapshots and for
+    // up-replication snapshots (i.e. when a dead node has been
+    // removed and the range needs to be up-replicated).
+    RECOVERY = 1;
+    // REBALANCE is used for snapshots involved in rebalancing.
+    REBALANCE = 2;
+  }
+
+  enum Strategy {
+    // KV_BATCH snapshots stream batches of KV pairs for all keys in a
+    // range from the sender the the receiver. These KV pairs are then
+    // combined into a large RocksDB WriteBatch that is atomically
+    // applied.
+    KV_BATCH = 0;
+  }
+
   message Header {
     reserved 1;
 
@@ -111,7 +130,7 @@ message SnapshotRequest {
     // field which holds the updated descriptor after the new replica
     // has been added while ReplicaState.Desc holds the descriptor
     // before the new replica has been added.
-    optional storagebase.ReplicaState state = 5 [(gogoproto.nullable) = false];
+    optional storagepb.ReplicaState state = 5 [(gogoproto.nullable) = false];
 
     // The inner raft message is of type MsgSnap, and its snapshot data contains a UUID.
     optional RaftMessageRequest raft_message_request = 2 [(gogoproto.nullable) = false];
@@ -123,6 +142,12 @@ message SnapshotRequest {
     // by raft because at that point it is better to queue up the stream
     // than to cancel it.
     optional bool can_decline = 4 [(gogoproto.nullable) = false];
+
+    // The priority of the snapshot.
+    optional Priority priority = 6 [(gogoproto.nullable) = false];
+
+    // The strategy of the snapshot.
+    optional Strategy strategy = 7 [(gogoproto.nullable) = false];
   }
 
   optional Header header = 1;
@@ -157,7 +182,7 @@ message ConfChangeContext {
       (gogoproto.customname) = "CommandID"];
 
   // Payload is the application-level command (i.e. an encoded
-  // storagebase.RaftCommand).
+  // storagepb.RaftCommand).
   optional bytes payload = 2;
 
   // Replica contains full details about the replica being added or removed.

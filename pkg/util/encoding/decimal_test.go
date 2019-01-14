@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Nathan VanBenschoten (nvanbenschoten@gmail.com)
 
 package encoding
 
@@ -20,15 +18,10 @@ import (
 	"bytes"
 	"fmt"
 	"math"
-	"math/big"
 	"math/rand"
-	"strconv"
-	"strings"
 	"testing"
 
-	"gopkg.in/inf.v0"
-
-	"github.com/cockroachdb/cockroach/pkg/util/decimal"
+	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 )
 
@@ -71,24 +64,9 @@ func TestDecimalMandE(t *testing.T) {
 		{"9223372036854775807", 10, []byte{0x13, 0x2d, 0x43, 0x91, 0x07, 0x89, 0x6d, 0x9b, 0x75, 0x0e}},
 	}
 	for _, c := range testCases {
-		// Deal with the issue that Dec.SetString can't handle exponent notation.
-		scale := 0
-		e := strings.IndexRune(c.Value, 'e')
-		if e != -1 {
-			var err error
-			scale, err = strconv.Atoi(c.Value[e+1:])
-			if err != nil {
-				t.Fatalf("could not parse value's exponent: %v", err)
-			}
-			c.Value = c.Value[:e]
-		}
-
-		d := new(inf.Dec)
-		if _, ok := d.SetString(c.Value); !ok {
+		d := new(apd.Decimal)
+		if _, _, err := d.SetString(c.Value); err != nil {
 			t.Fatalf("could not parse decimal from string %q", c.Value)
-		}
-		if scale != 0 {
-			d.SetScale(d.Scale() - inf.Scale(scale))
 		}
 
 		if e, m := decimalEandM(d, nil); e != c.E || !bytes.Equal(m, c.M) {
@@ -98,9 +76,9 @@ func TestDecimalMandE(t *testing.T) {
 	}
 }
 
-func mustDecimal(s string) *inf.Dec {
-	d, ok := new(inf.Dec).SetString(s)
-	if !ok {
+func mustDecimal(s string) *apd.Decimal {
+	d, _, err := new(apd.Decimal).SetString(s)
+	if err != nil {
 		panic(fmt.Sprintf("could not set string %q on decimal", s))
 	}
 	return d
@@ -112,17 +90,19 @@ func randBuf(rng *rand.Rand, maxLen int) []byte {
 	return buf
 }
 
-func encodeDecimalWithDir(dir Direction, buf []byte, d *inf.Dec) []byte {
+func encodeDecimalWithDir(dir Direction, buf []byte, d *apd.Decimal) []byte {
 	if dir == Ascending {
 		return EncodeDecimalAscending(buf, d)
 	}
 	return EncodeDecimalDescending(buf, d)
 }
 
-func decodeDecimalWithDir(t *testing.T, dir Direction, buf []byte, tmp []byte) ([]byte, *inf.Dec) {
+func decodeDecimalWithDir(
+	t *testing.T, dir Direction, buf []byte, tmp []byte,
+) ([]byte, apd.Decimal) {
 	var err error
 	var resBuf []byte
-	var res *inf.Dec
+	var res apd.Decimal
 	if dir == Ascending {
 		resBuf, res, err = DecodeDecimalAscending(buf, tmp)
 	} else {
@@ -134,53 +114,73 @@ func decodeDecimalWithDir(t *testing.T, dir Direction, buf []byte, tmp []byte) (
 	return resBuf, res
 }
 
+func mustDecimalFloat64(f float64) *apd.Decimal {
+	d, err := new(apd.Decimal).SetFloat64(f)
+	if err != nil {
+		panic(err)
+	}
+	return d
+}
+
+func mustDecimalString(s string) *apd.Decimal {
+	d, _, err := apd.NewFromString(s)
+	if err != nil {
+		panic(err)
+	}
+	return d
+}
+
 func TestEncodeDecimal(t *testing.T) {
 	testCases := []struct {
-		Value    *inf.Dec
+		Value    *apd.Decimal
 		Encoding []byte
 	}{
-		{inf.NewDec(-99122, -99999), []byte{0x1a, 0x86, 0x3c, 0xad, 0x38, 0xe6, 0xd7, 0x00}},
+		{&apd.Decimal{Form: apd.NaN}, []byte{0x18}},
+		{&apd.Decimal{Form: apd.Infinite, Negative: true}, []byte{0x19}},
+		{apd.New(-99122, 99999), []byte{0x1a, 0x86, 0x3c, 0xad, 0x38, 0xe6, 0xd7, 0x00}},
 		// Three duplicates to make sure -13*10^1000 <= -130*10^999 <= -13*10^1000
-		{inf.NewDec(-13, -1000), []byte{0x1a, 0x86, 0xfe, 0x0a, 0xe5, 0x00}},
-		{inf.NewDec(-130, -999), []byte{0x1a, 0x86, 0xfe, 0x0a, 0xe5, 0x00}},
-		{inf.NewDec(-13, -1000), []byte{0x1a, 0x86, 0xfe, 0x0a, 0xe5, 0x00}},
-		{decimal.NewDecFromFloat(-math.MaxFloat64), []byte{0x1a, 0x87, 0x64, 0xfc, 0x60, 0x66, 0x44, 0xe4, 0x9e, 0x82, 0xc0, 0x8d, 0x00}},
-		{inf.NewDec(-130, -100), []byte{0x1a, 0x87, 0xcb, 0xfc, 0xc3, 0x00}},
-		{inf.NewDec(-13, 0), []byte{0x24, 0xe5, 0x00}},
-		{inf.NewDec(-11, 0), []byte{0x24, 0xe9, 0x00}},
+		{apd.New(-13, 1000), []byte{0x1a, 0x86, 0xfe, 0x0a, 0xe5, 0x00}},
+		{apd.New(-130, 999), []byte{0x1a, 0x86, 0xfe, 0x0a, 0xe5, 0x00}},
+		{apd.New(-13, 1000), []byte{0x1a, 0x86, 0xfe, 0x0a, 0xe5, 0x00}},
+		{mustDecimalFloat64(-math.MaxFloat64), []byte{0x1a, 0x87, 0x64, 0xfc, 0x60, 0x66, 0x44, 0xe4, 0x9e, 0x82, 0xc0, 0x8d, 0x00}},
+		{apd.New(-130, 100), []byte{0x1a, 0x87, 0xcb, 0xfc, 0xc3, 0x00}},
+		{apd.New(-13, 0), []byte{0x24, 0xe5, 0x00}},
+		{apd.New(-11, 0), []byte{0x24, 0xe9, 0x00}},
 		{mustDecimal("-10.123456789"), []byte{0x24, 0xea, 0xe6, 0xba, 0x8e, 0x62, 0x4b, 0x00}},
 		{mustDecimal("-10"), []byte{0x24, 0xeb, 0x00}},
 		{mustDecimal("-9.123456789"), []byte{0x24, 0xec, 0xe6, 0xba, 0x8e, 0x62, 0x4b, 0x00}},
 		{mustDecimal("-9"), []byte{0x24, 0xed, 0x00}},
 		{mustDecimal("-1.1"), []byte{0x24, 0xfc, 0xeb, 0x00}},
-		{inf.NewDec(-1, 0), []byte{0x24, 0xfd, 0x00}},
-		{inf.NewDec(-8, 1), []byte{0x25, 0x5f, 0x00}},
-		{inf.NewDec(-1, 1), []byte{0x25, 0xeb, 0x00}},
+		{apd.New(-1, 0), []byte{0x24, 0xfd, 0x00}},
+		{apd.New(-8, -1), []byte{0x25, 0x5f, 0x00}},
+		{apd.New(-1, -1), []byte{0x25, 0xeb, 0x00}},
 		{mustDecimal("-.09"), []byte{0x25, 0xed, 0x00}},
 		{mustDecimal("-.054321"), []byte{0x25, 0xf4, 0xa8, 0xd5, 0x00}},
 		{mustDecimal("-.012"), []byte{0x25, 0xfc, 0xd7, 0x00}},
-		{inf.NewDec(-11, 4), []byte{0x26, 0x89, 0xe9, 0x00}},
-		{inf.NewDec(-11, 6), []byte{0x26, 0x8a, 0xe9, 0x00}},
-		{decimal.NewDecFromFloat(-math.SmallestNonzeroFloat64), []byte{0x26, 0xf6, 0xa1, 0xf5, 0x00}},
-		{inf.NewDec(-11, 66666), []byte{0x26, 0xf7, 0x82, 0x34, 0xe9, 0x00}},
-		{inf.NewDec(0, 0), []byte{0x27}},
-		{decimal.NewDecFromFloat(math.SmallestNonzeroFloat64), []byte{0x28, 0x87, 0x5e, 0x0a, 0x00}},
-		{inf.NewDec(11, 6), []byte{0x28, 0x87, 0xfd, 0x16, 0x00}},
-		{inf.NewDec(11, 4), []byte{0x28, 0x87, 0xfe, 0x16, 0x00}},
-		{inf.NewDec(1, 1), []byte{0x29, 0x14, 0x00}},
-		{inf.NewDec(8, 1), []byte{0x29, 0xa0, 0x00}},
-		{inf.NewDec(1, 0), []byte{0x2a, 0x02, 0x00}},
+		{apd.New(-11, -4), []byte{0x26, 0x89, 0xe9, 0x00}},
+		{apd.New(-11, -6), []byte{0x26, 0x8a, 0xe9, 0x00}},
+		{mustDecimalFloat64(-math.SmallestNonzeroFloat64), []byte{0x26, 0xf6, 0xa1, 0xf5, 0x00}},
+		{apd.New(-11, -66666), []byte{0x26, 0xf7, 0x82, 0x34, 0xe9, 0x00}},
+		{mustDecimal("-0"), []byte{0x27}},
+		{apd.New(0, 0), []byte{0x27}},
+		{mustDecimalFloat64(math.SmallestNonzeroFloat64), []byte{0x28, 0x87, 0x5e, 0x0a, 0x00}},
+		{apd.New(11, -6), []byte{0x28, 0x87, 0xfd, 0x16, 0x00}},
+		{apd.New(11, -4), []byte{0x28, 0x87, 0xfe, 0x16, 0x00}},
+		{apd.New(1, -1), []byte{0x29, 0x14, 0x00}},
+		{apd.New(8, -1), []byte{0x29, 0xa0, 0x00}},
+		{apd.New(1, 0), []byte{0x2a, 0x02, 0x00}},
 		{mustDecimal("1.1"), []byte{0x2a, 0x03, 0x14, 0x00}},
-		{inf.NewDec(11, 0), []byte{0x2a, 0x16, 0x00}},
-		{inf.NewDec(13, 0), []byte{0x2a, 0x1a, 0x00}},
-		{decimal.NewDecFromFloat(math.MaxFloat64), []byte{0x34, 0xf6, 0x9b, 0x03, 0x9f, 0x99, 0xbb, 0x1b, 0x61, 0x7d, 0x3f, 0x72, 0x00}},
+		{apd.New(11, 0), []byte{0x2a, 0x16, 0x00}},
+		{apd.New(13, 0), []byte{0x2a, 0x1a, 0x00}},
+		{mustDecimalFloat64(math.MaxFloat64), []byte{0x34, 0xf6, 0x9b, 0x03, 0x9f, 0x99, 0xbb, 0x1b, 0x61, 0x7d, 0x3f, 0x72, 0x00}},
 		// Four duplicates to make sure 13*10^1000 <= 130*10^999 <= 1300*10^998 <= 13*10^1000
-		{inf.NewDec(13, -1000), []byte{0x34, 0xf7, 0x01, 0xf5, 0x1a, 0x00}},
-		{inf.NewDec(130, -999), []byte{0x34, 0xf7, 0x01, 0xf5, 0x1a, 0x00}},
-		{inf.NewDec(1300, -998), []byte{0x34, 0xf7, 0x01, 0xf5, 0x1a, 0x00}},
-		{inf.NewDec(13, -1000), []byte{0x34, 0xf7, 0x01, 0xf5, 0x1a, 0x00}},
-		{inf.NewDec(99122, -99999), []byte{0x34, 0xf7, 0xc3, 0x52, 0xc7, 0x19, 0x28, 0x00}},
-		{inf.NewDec(99122839898321208, -99999), []byte{0x34, 0xf7, 0xc3, 0x58, 0xc7, 0x19, 0x39, 0x4f, 0xb3, 0xa7, 0x2b, 0x29, 0xa0, 0x00}},
+		{apd.New(13, 1000), []byte{0x34, 0xf7, 0x01, 0xf5, 0x1a, 0x00}},
+		{apd.New(130, 999), []byte{0x34, 0xf7, 0x01, 0xf5, 0x1a, 0x00}},
+		{apd.New(1300, 998), []byte{0x34, 0xf7, 0x01, 0xf5, 0x1a, 0x00}},
+		{apd.New(13, 1000), []byte{0x34, 0xf7, 0x01, 0xf5, 0x1a, 0x00}},
+		{apd.New(99122, 99999), []byte{0x34, 0xf7, 0xc3, 0x52, 0xc7, 0x19, 0x28, 0x00}},
+		{apd.New(99122839898321208, 99999), []byte{0x34, 0xf7, 0xc3, 0x58, 0xc7, 0x19, 0x39, 0x4f, 0xb3, 0xa7, 0x2b, 0x29, 0xa0, 0x00}},
+		{&apd.Decimal{Form: apd.Infinite}, []byte{0x35}},
 	}
 
 	rng, _ := randutil.NewPseudoRand()
@@ -189,53 +189,55 @@ func TestEncodeDecimal(t *testing.T) {
 	for _, dir := range []Direction{Ascending, Descending} {
 		for _, tmp := range [][]byte{nil, make([]byte, 0, 100)} {
 			for i, c := range testCases {
-				enc := encodeDecimalWithDir(dir, nil, c.Value)
-				_, dec := decodeDecimalWithDir(t, dir, enc, tmp)
-				if dir == Ascending && !bytes.Equal(enc, c.Encoding) {
-					t.Errorf("unexpected mismatch for %s. expected [% x], got [% x]",
-						c.Value, c.Encoding, enc)
-				}
-				if i > 0 {
-					if (bytes.Compare(lastEncoded, enc) > 0 && dir == Ascending) ||
-						(bytes.Compare(lastEncoded, enc) < 0 && dir == Descending) {
-						t.Errorf("%v: expected [% x] to be less than or equal to [% x]",
-							c.Value, testCases[i-1].Encoding, enc)
+				t.Run(fmt.Sprintf("%v_%d_%d_%s", dir, cap(tmp), i, c.Value), func(t *testing.T) {
+					enc := encodeDecimalWithDir(dir, nil, c.Value)
+					_, dec := decodeDecimalWithDir(t, dir, enc, tmp)
+					if dir == Ascending && !bytes.Equal(enc, c.Encoding) {
+						t.Errorf("unexpected mismatch for %s. expected [% x], got [% x]",
+							c.Value, c.Encoding, enc)
 					}
-				}
-				testPeekLength(t, enc)
-				if dec.Cmp(c.Value) != 0 {
-					t.Errorf("%d unexpected mismatch for %v. got %v", i, c.Value, dec)
-				}
-				lastEncoded = enc
-
-				// Test that appending the decimal to an existing buffer works. It
-				// is important to test with various values, slice lengths, and
-				// capacities because the various encoding paths try to use any
-				// spare capacity to avoid allocations.
-				for trials := 0; trials < 5; trials++ {
-					orig := randBuf(rng, 30)
-					origLen := len(orig)
-
-					bufCap := origLen + rng.Intn(30)
-					buf := make([]byte, origLen, bufCap)
-					copy(buf, orig)
-
-					enc := encodeDecimalWithDir(dir, buf, c.Value)
-					// Append some random bytes
-					enc = append(enc, randBuf(rng, 20)...)
-					_, dec := decodeDecimalWithDir(t, dir, enc[origLen:], tmp)
-
-					if dec.Cmp(c.Value) != 0 {
-						t.Errorf("unexpected mismatch for %v. got %v", c.Value, dec)
-					}
-					// Verify the existing values weren't modified.
-					for i := range orig {
-						if enc[i] != orig[i] {
-							t.Errorf("existing byte %d changed after encoding (from %d to %d)",
-								i, orig[i], enc[i])
+					if i > 0 {
+						if (bytes.Compare(lastEncoded, enc) > 0 && dir == Ascending) ||
+							(bytes.Compare(lastEncoded, enc) < 0 && dir == Descending) {
+							t.Errorf("%v: expected [% x] to be less than or equal to [% x]",
+								c.Value, testCases[i-1].Encoding, enc)
 						}
 					}
-				}
+					testPeekLength(t, enc)
+					if dec.Cmp(c.Value) != 0 {
+						t.Errorf("%d unexpected mismatch for %v. got %v", i, c.Value, dec)
+					}
+					lastEncoded = enc
+
+					// Test that appending the decimal to an existing buffer works. It
+					// is important to test with various values, slice lengths, and
+					// capacities because the various encoding paths try to use any
+					// spare capacity to avoid allocations.
+					for trials := 0; trials < 5; trials++ {
+						orig := randBuf(rng, 30)
+						origLen := len(orig)
+
+						bufCap := origLen + rng.Intn(30)
+						buf := make([]byte, origLen, bufCap)
+						copy(buf, orig)
+
+						enc := encodeDecimalWithDir(dir, buf, c.Value)
+						// Append some random bytes
+						enc = append(enc, randBuf(rng, 20)...)
+						_, dec := decodeDecimalWithDir(t, dir, enc[origLen:], tmp)
+
+						if dec.Cmp(c.Value) != 0 {
+							t.Errorf("unexpected mismatch for %v. got %v", c.Value, dec)
+						}
+						// Verify the existing values weren't modified.
+						for i := range orig {
+							if enc[i] != orig[i] {
+								t.Errorf("existing byte %d changed after encoding (from %d to %d)",
+									i, orig[i], enc[i])
+							}
+						}
+					}
+				})
 			}
 		}
 	}
@@ -245,7 +247,7 @@ func TestEncodeDecimalRand(t *testing.T) {
 	rng, _ := randutil.NewPseudoRand()
 	// Test both directions.
 	for _, dir := range []Direction{Ascending, Descending} {
-		var prev *inf.Dec
+		var prev *apd.Decimal
 		var prevEnc []byte
 		const randomTrials = 100000
 		for i := 0; i < randomTrials; i++ {
@@ -261,7 +263,7 @@ func TestEncodeDecimalRand(t *testing.T) {
 				tmp = randBuf(rng, 100)
 			}
 			var enc []byte
-			var res *inf.Dec
+			var res apd.Decimal
 			var err error
 			if dir == Ascending {
 				enc = EncodeDecimalAscending(appendTo, cur)
@@ -279,7 +281,7 @@ func TestEncodeDecimalRand(t *testing.T) {
 			testPeekLength(t, enc)
 
 			// Make sure we decode the same value we encoded.
-			if cur.Cmp(res) != 0 {
+			if cur.Cmp(&res) != 0 {
 				t.Fatalf("unexpected mismatch for %v, got %v", cur, res)
 			}
 
@@ -304,94 +306,100 @@ func TestEncodeDecimalRand(t *testing.T) {
 
 func TestNonsortingEncodeDecimal(t *testing.T) {
 	testCases := []struct {
-		Value    *inf.Dec
+		Value    *apd.Decimal
 		Encoding []byte
 	}{
-		{inf.NewDec(-99122, -99999), []byte{0x1a, 0xf8, 0x01, 0x86, 0xa4, 0x01, 0x83, 0x32}},
+		{&apd.Decimal{Form: apd.NaN}, []byte{0x18}},
+		{&apd.Decimal{Form: apd.Infinite, Negative: true}, []byte{0x19}},
+		{apd.New(-99122, 99999), []byte{0x1a, 0xf8, 0x01, 0x86, 0xa4, 0x01, 0x83, 0x32}},
 		// Three duplicates to make sure -13*10^1000 <= -130*10^999 <= -13*10^1000
-		{inf.NewDec(-13, -1000), []byte{0x1a, 0xf7, 0x03, 0xea, 0x0d}},
-		{inf.NewDec(-130, -999), []byte{0x1a, 0xf7, 0x03, 0xea, 0x0d}},
-		{inf.NewDec(-13, -1000), []byte{0x1a, 0xf7, 0x03, 0xea, 0x0d}},
-		{decimal.NewDecFromFloat(-math.MaxFloat64), []byte{0x1a, 0xf7, 0x01, 0x35, 0x3f, 0xdd, 0xec, 0x7f, 0x2f, 0xaf, 0x35}},
-		{inf.NewDec(-130, -100), []byte{0x1a, 0xef, 0x0d}},
-		{inf.NewDec(-13, 0), []byte{0x1a, 0x8a, 0x0d}},
-		{inf.NewDec(-11, 0), []byte{0x1a, 0x8a, 0x0b}},
-		{inf.NewDec(-1, 0), []byte{0x1a, 0x89, 0x01}},
-		{inf.NewDec(-8, 1), []byte{0x25, 0x08}},
-		{inf.NewDec(-1, 1), []byte{0x25, 0x01}},
-		{inf.NewDec(-11, 4), []byte{0x26, 0x8a, 0x0b}},
-		{inf.NewDec(-11, 6), []byte{0x26, 0x8c, 0x0b}},
-		{decimal.NewDecFromFloat(-math.SmallestNonzeroFloat64), []byte{0x26, 0xf7, 0x01, 0x43, 0x05}},
-		{inf.NewDec(-11, 66666), []byte{0x26, 0xf8, 0x01, 0x04, 0x68, 0x0b}},
-		{inf.NewDec(0, 0), []byte{0x27}},
-		{decimal.NewDecFromFloat(math.SmallestNonzeroFloat64), []byte{0x28, 0xf7, 0x01, 0x43, 0x05}},
-		{inf.NewDec(11, 6), []byte{0x28, 0x8c, 0x0b}},
-		{inf.NewDec(11, 4), []byte{0x28, 0x8a, 0x0b}},
-		{inf.NewDec(1, 1), []byte{0x29, 0x01}},
-		{inf.NewDec(12345, 5), []byte{0x29, 0x30, 0x39}},
-		{inf.NewDec(8, 1), []byte{0x29, 0x08}},
-		{inf.NewDec(1, 0), []byte{0x34, 0x89, 0x01}},
-		{inf.NewDec(11, 0), []byte{0x34, 0x8a, 0x0b}},
-		{inf.NewDec(13, 0), []byte{0x34, 0x8a, 0x0d}},
+		{apd.New(-13, 1000), []byte{0x1a, 0xf7, 0x03, 0xea, 0x0d}},
+		{apd.New(-130, 999), []byte{0x1a, 0xf7, 0x03, 0xea, 0x82}},
+		{apd.New(-13, 1000), []byte{0x1a, 0xf7, 0x03, 0xea, 0x0d}},
+		{mustDecimalFloat64(-math.MaxFloat64), []byte{0x1a, 0xf7, 0x01, 0x35, 0x3f, 0xdd, 0xec, 0x7f, 0x2f, 0xaf, 0x35}},
+		{apd.New(-130, 100), []byte{0x1a, 0xef, 0x82}},
+		{apd.New(-13, 0), []byte{0x1a, 0x8a, 0x0d}},
+		{apd.New(-11, 0), []byte{0x1a, 0x8a, 0x0b}},
+		{apd.New(-1, 0), []byte{0x1a, 0x89, 0x01}},
+		{apd.New(-8, -1), []byte{0x25, 0x08}},
+		{apd.New(-1, -1), []byte{0x25, 0x01}},
+		{apd.New(-11, -4), []byte{0x26, 0x8a, 0x0b}},
+		{apd.New(-11, -6), []byte{0x26, 0x8c, 0x0b}},
+		{mustDecimalFloat64(-math.SmallestNonzeroFloat64), []byte{0x26, 0xf7, 0x01, 0x43, 0x05}},
+		{apd.New(-11, -66666), []byte{0x26, 0xf8, 0x01, 0x04, 0x68, 0x0b}},
+		{mustDecimal("-0"), []byte{0x1a, 0x89}},
+		{apd.New(0, 0), []byte{0x27}},
+		{mustDecimalFloat64(math.SmallestNonzeroFloat64), []byte{0x28, 0xf7, 0x01, 0x43, 0x05}},
+		{apd.New(11, -6), []byte{0x28, 0x8c, 0x0b}},
+		{apd.New(11, -4), []byte{0x28, 0x8a, 0x0b}},
+		{apd.New(1, -1), []byte{0x29, 0x01}},
+		{apd.New(12345, -5), []byte{0x29, 0x30, 0x39}},
+		{apd.New(8, -1), []byte{0x29, 0x08}},
+		{apd.New(1, 0), []byte{0x34, 0x89, 0x01}},
+		{apd.New(11, 0), []byte{0x34, 0x8a, 0x0b}},
+		{apd.New(13, 0), []byte{0x34, 0x8a, 0x0d}},
 		// Note that this does not sort correctly!
-		{inf.NewDec(255, 0), []byte{0x34, 0x8b, 0xff}},
-		{inf.NewDec(256, 0), []byte{0x34, 0x8b, 0x01, 0x00}},
-		{decimal.NewDecFromFloat(math.MaxFloat64), []byte{0x34, 0xf7, 0x01, 0x35, 0x3f, 0xdd, 0xec, 0x7f, 0x2f, 0xaf, 0x35}},
+		{apd.New(255, 0), []byte{0x34, 0x8b, 0xff}},
+		{apd.New(256, 0), []byte{0x34, 0x8b, 0x01, 0x00}},
+		{mustDecimalFloat64(math.MaxFloat64), []byte{0x34, 0xf7, 0x01, 0x35, 0x3f, 0xdd, 0xec, 0x7f, 0x2f, 0xaf, 0x35}},
 		// Four duplicates to make sure 13*10^1000 <= 130*10^999 <= 1300*10^998 <= 13*10^1000
-		{inf.NewDec(13, -1000), []byte{0x34, 0xf7, 0x03, 0xea, 0x0d}},
-		{inf.NewDec(130, -999), []byte{0x34, 0xf7, 0x03, 0xea, 0x0d}},
-		{inf.NewDec(1300, -998), []byte{0x34, 0xf7, 0x03, 0xea, 0x0d}},
-		{inf.NewDec(13, -1000), []byte{0x34, 0xf7, 0x03, 0xea, 0x0d}},
-		{inf.NewDec(99122, -99999), []byte{0x34, 0xf8, 0x01, 0x86, 0xa4, 0x01, 0x83, 0x32}},
-		{inf.NewDec(99122839898321208, -99999), []byte{0x34, 0xf8, 0x01, 0x86, 0xb0, 0x01, 0x60, 0x27, 0xb2, 0x9d, 0x44, 0x71, 0x38}},
+		{apd.New(13, 1000), []byte{0x34, 0xf7, 0x03, 0xea, 0x0d}},
+		{apd.New(130, 999), []byte{0x34, 0xf7, 0x03, 0xea, 0x82}},
+		{apd.New(1300, 998), []byte{0x34, 0xf7, 0x03, 0xea, 0x05, 0x14}},
+		{apd.New(13, 1000), []byte{0x34, 0xf7, 0x03, 0xea, 0x0d}},
+		{apd.New(99122, 99999), []byte{0x34, 0xf8, 0x01, 0x86, 0xa4, 0x01, 0x83, 0x32}},
+		{apd.New(99122839898321208, 99999), []byte{0x34, 0xf8, 0x01, 0x86, 0xb0, 0x01, 0x60, 0x27, 0xb2, 0x9d, 0x44, 0x71, 0x38}},
+		{&apd.Decimal{Form: apd.Infinite}, []byte{0x35}},
+		{mustDecimalString("142378208485490985369999605144727062141206925976498256305323716858805588894693616552055968571135475510700810219028167653516982373238641332965927953273383572708760984694356069974208844865675206339235758647159337463780100273189720943242182911961627806424621091859596571173867825568394327041453823674373002756096"), []byte{0x34, 0xf7, 0x01, 0x35, 0xca, 0xc0, 0xd8, 0x34, 0x68, 0x5d, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
 	}
 
 	rng, _ := randutil.NewPseudoRand()
 
 	for _, tmp := range [][]byte{nil, make([]byte, 0, 100)} {
 		for i, c := range testCases {
-			enc := EncodeNonsortingDecimal(nil, c.Value)
-			dec, err := DecodeNonsortingDecimal(enc, tmp)
-			if err != nil {
-				t.Error(err)
-				continue
-			}
-			if !bytes.Equal(enc, c.Encoding) {
-				t.Errorf("unexpected mismatch for %s. expected [% x], got [% x]",
-					c.Value, c.Encoding, enc)
-			}
-			if dec.Cmp(c.Value) != 0 {
-				t.Errorf("%d unexpected mismatch for %v. got %v", i, c.Value, dec)
-			}
-			// Test that appending the decimal to an existing buffer works. It
-			// is important to test with various values, slice lengths, and
-			// capacities because the various encoding paths try to use any
-			// spare capacity to avoid allocations.
-			for trials := 0; trials < 5; trials++ {
-				orig := randBuf(rng, 30)
-				origLen := len(orig)
-
-				bufCap := origLen + rng.Intn(30)
-				buf := make([]byte, origLen, bufCap)
-				copy(buf, orig)
-
-				enc := EncodeNonsortingDecimal(buf, c.Value)
-				dec, err := DecodeNonsortingDecimal(enc[origLen:], tmp)
+			t.Run(fmt.Sprintf("%d_%d_%s", cap(tmp), i, c.Value), func(t *testing.T) {
+				enc := EncodeNonsortingDecimal(nil, c.Value)
+				dec, err := DecodeNonsortingDecimal(enc, tmp)
 				if err != nil {
 					t.Fatal(err)
 				}
-
-				if dec.Cmp(c.Value) != 0 {
-					t.Errorf("unexpected mismatch for %v. got %v", c.Value, dec)
+				if !bytes.Equal(enc, c.Encoding) {
+					t.Errorf("unexpected mismatch for %s. expected [% x], got [% x]",
+						c.Value, c.Encoding, enc)
 				}
-				// Verify the existing values weren't modified.
-				for i := range orig {
-					if enc[i] != orig[i] {
-						t.Errorf("existing byte %d changed after encoding (from %d to %d)",
-							i, orig[i], enc[i])
+				if dec.CmpTotal(c.Value) != 0 {
+					t.Errorf("%d unexpected mismatch for %v. got %v", i, c.Value, dec)
+				}
+				// Test that appending the decimal to an existing buffer works. It
+				// is important to test with various values, slice lengths, and
+				// capacities because the various encoding paths try to use any
+				// spare capacity to avoid allocations.
+				for trials := 0; trials < 5; trials++ {
+					orig := randBuf(rng, 30)
+					origLen := len(orig)
+
+					bufCap := origLen + rng.Intn(30)
+					buf := make([]byte, origLen, bufCap)
+					copy(buf, orig)
+
+					enc := EncodeNonsortingDecimal(buf, c.Value)
+					dec, err := DecodeNonsortingDecimal(enc[origLen:], tmp)
+					if err != nil {
+						t.Fatal(err)
+					}
+
+					if dec.CmpTotal(c.Value) != 0 {
+						t.Errorf("unexpected mismatch for %v. got %v", c.Value, dec)
+					}
+					// Verify the existing values weren't modified.
+					for i := range orig {
+						if enc[i] != orig[i] {
+							t.Errorf("existing byte %d changed after encoding (from %d to %d)",
+								i, orig[i], enc[i])
+						}
 					}
 				}
-			}
+			})
 		}
 	}
 }
@@ -420,7 +428,7 @@ func TestNonsortingEncodeDecimalRand(t *testing.T) {
 		}
 
 		// Make sure we decode the same value we encoded.
-		if cur.Cmp(res) != 0 {
+		if cur.Cmp(&res) != 0 {
 			t.Fatalf("unexpected mismatch for %v, got %v", cur, res)
 		}
 
@@ -431,12 +439,48 @@ func TestNonsortingEncodeDecimalRand(t *testing.T) {
 	}
 }
 
+// TestNonsortingEncodeDecimalRoundtrip tests that decimals can round trip
+// through EncodeNonsortingDecimal and DecodeNonsortingDecimal with an expected
+// coefficient and exponent.
+func TestNonsortingEncodeDecimalRoundtrip(t *testing.T) {
+	tests := map[string]string{
+		"0":         "0E+0",
+		"0.0":       "0E-1",
+		"0.00":      "0E-2",
+		"0e-10":     "0E-10",
+		"0.00e-10":  "0E-12",
+		"00":        "0E+0",
+		"-0":        "-0E+0",
+		"-0.0":      "-0E-1",
+		"-0.00":     "-0E-2",
+		"-0e-10":    "-0E-10",
+		"-0.00e-10": "-0E-12",
+		"-00":       "-0E+0",
+	}
+	for tc, expect := range tests {
+		t.Run(tc, func(t *testing.T) {
+			d, _, err := apd.NewFromString(tc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			enc := EncodeNonsortingDecimal(nil, d)
+			res, err := DecodeNonsortingDecimal(enc, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s := res.Text('E')
+			if expect != s {
+				t.Fatalf("expected %s, got %s", expect, s)
+			}
+		})
+	}
+}
+
 func TestUpperBoundNonsortingDecimalUnscaledSize(t *testing.T) {
 	x := make([]byte, 100)
-	u := new(big.Int)
+	d := new(apd.Decimal)
 	for i := 0; i < len(x); i++ {
-		u.SetString(string(x[:i]), 10)
-		d := inf.NewDecBig(u, 0)
+		d.Coeff.SetString(string(x[:i]), 10)
 		reference := UpperBoundNonsortingDecimalSize(d)
 		bound := upperBoundNonsortingDecimalUnscaledSize(i)
 		if bound < reference || bound > reference+bigWordSize {
@@ -448,18 +492,18 @@ func TestUpperBoundNonsortingDecimalUnscaledSize(t *testing.T) {
 
 // randDecimal generates a random decimal with exponent in the
 // range [minExp, maxExp].
-func randDecimal(rng *rand.Rand, minExp, maxExp int) *inf.Dec {
+func randDecimal(rng *rand.Rand, minExp, maxExp int) *apd.Decimal {
 	exp := randutil.RandIntInRange(rng, minExp, maxExp+1)
 	// Transform random float in [0, 1) to [-1, 1) and multiply by 10^exp.
 	floatVal := (rng.Float64()*2 - 1) * math.Pow10(exp)
-	return decimal.NewDecFromFloat(floatVal)
+	return mustDecimalFloat64(floatVal)
 }
 
 // makeDecimalVals creates decimal values with exponents in
 // the range [minExp, maxExp].
-func makeDecimalVals(minExp, maxExp int) []*inf.Dec {
+func makeDecimalVals(minExp, maxExp int) []*apd.Decimal {
 	rng, _ := randutil.NewPseudoRand()
-	vals := make([]*inf.Dec, 10000)
+	vals := make([]*apd.Decimal, 10000)
 	for i := range vals {
 		vals[i] = randDecimal(rng, minExp, maxExp)
 	}

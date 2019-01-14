@@ -11,18 +11,18 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 package distsqlrun
 
 import (
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"context"
+
+	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/pkg/errors"
 )
 
-// StreamEncoder converts EncDatum rows into a sequence of StreamMessage.
+// StreamEncoder converts EncDatum rows into a sequence of ProducerMessage.
 //
 // Sample usage:
 //   se := StreamEncoder{}
@@ -32,54 +32,114 @@ import (
 //          err := se.AddRow(...)
 //          ...
 //       }
-//       msg := se.FormMessage(false, nil)
+//       msg := se.FormMessage(nil)
 //       // Send out message.
 //       ...
 //   }
-//   msg := se.FormMessage(true, nil)
-//   // Send out final message
-//   ...
 type StreamEncoder struct {
-	// infos is initialized when the first row is received.
-	infos []DatumInfo
+	// infos is fully initialized when the first row is received.
+	infos            []distsqlpb.DatumInfo
+	infosInitialized bool
 
-	rowBuf []byte
+	rowBuf       []byte
+	numEmptyRows int
+	metadata     []distsqlpb.RemoteProducerMetadata
 
-	firstMessageDone bool
-	alloc            sqlbase.DatumAlloc
+	// headerSent is set after the first message (which contains the header) has
+	// been sent.
+	headerSent bool
+	// typingSent is set after the first message that contains any rows has been
+	// sent.
+	typingSent bool
+	alloc      sqlbase.DatumAlloc
 
 	// Preallocated structures to avoid allocations.
-	msg    StreamMessage
-	msgHdr StreamHeader
-	msgTrl StreamTrailer
+	msg    distsqlpb.ProducerMessage
+	msgHdr distsqlpb.ProducerHeader
 }
 
-func (se *StreamEncoder) setHeaderFields(flowID FlowID, streamID StreamID) {
+func (se *StreamEncoder) setHeaderFields(flowID distsqlpb.FlowID, streamID distsqlpb.StreamID) {
 	se.msgHdr.FlowID = flowID
 	se.msgHdr.StreamID = streamID
 }
 
-// AddRow encodes a row.
+func (se *StreamEncoder) init(types []sqlbase.ColumnType) {
+	se.infos = make([]distsqlpb.DatumInfo, len(types))
+	for i := range types {
+		se.infos[i].Type = types[i]
+	}
+}
+
+// AddMetadata encodes a metadata message. Unlike AddRow(), it cannot fail. This
+// is important for the caller because a failure to encode a piece of metadata
+// (particularly one that contains an error) would not be recoverable.
+//
+// Metadata records lose their ordering wrt the data rows. The convention is
+// that the StreamDecoder will return them first, before the data rows, thus
+// ensuring that rows produced _after_ an error are not received _before_ the
+// error.
+func (se *StreamEncoder) AddMetadata(meta ProducerMetadata) {
+	var enc distsqlpb.RemoteProducerMetadata
+	if meta.Ranges != nil {
+		enc.Value = &distsqlpb.RemoteProducerMetadata_RangeInfo{
+			RangeInfo: &distsqlpb.RemoteProducerMetadata_RangeInfos{
+				RangeInfo: meta.Ranges,
+			},
+		}
+	} else if meta.TraceData != nil {
+		enc.Value = &distsqlpb.RemoteProducerMetadata_TraceData_{
+			TraceData: &distsqlpb.RemoteProducerMetadata_TraceData{
+				CollectedSpans: meta.TraceData,
+			},
+		}
+	} else if meta.TxnCoordMeta != nil {
+		enc.Value = &distsqlpb.RemoteProducerMetadata_TxnCoordMeta{
+			TxnCoordMeta: meta.TxnCoordMeta,
+		}
+	} else if meta.RowNum != nil {
+		enc.Value = &distsqlpb.RemoteProducerMetadata_RowNum_{
+			RowNum: meta.RowNum,
+		}
+	} else {
+		enc.Value = &distsqlpb.RemoteProducerMetadata_Error{
+			Error: distsqlpb.NewError(meta.Err),
+		}
+	}
+	se.metadata = append(se.metadata, enc)
+}
+
+// AddRow encodes a message.
 func (se *StreamEncoder) AddRow(row sqlbase.EncDatumRow) error {
 	if se.infos == nil {
+		panic("init not called")
+	}
+	if len(se.infos) != len(row) {
+		return errors.Errorf("inconsistent row length: expected %d, got %d", len(se.infos), len(row))
+	}
+	if !se.infosInitialized {
 		// First row. Initialize encodings.
-		se.infos = make([]DatumInfo, len(row))
 		for i := range row {
 			enc, ok := row[i].Encoding()
 			if !ok {
 				enc = preferredEncoding
 			}
+			sType := se.infos[i].Type.SemanticType
+			if enc != sqlbase.DatumEncoding_VALUE &&
+				(sqlbase.HasCompositeKeyEncoding(sType) || sqlbase.MustBeValueEncoded(sType)) {
+				// Force VALUE encoding for composite types (key encodings may lose data).
+				enc = sqlbase.DatumEncoding_VALUE
+			}
 			se.infos[i].Encoding = enc
-			se.infos[i].Type = row[i].Type
 		}
+		se.infosInitialized = true
 	}
-	if len(se.infos) != len(row) {
-		return errors.Errorf("inconsistent row length: had %d, now %d",
-			len(se.infos), len(row))
+	if len(row) == 0 {
+		se.numEmptyRows++
+		return nil
 	}
 	for i := range row {
 		var err error
-		se.rowBuf, err = row[i].Encode(&se.alloc, se.infos[i].Encoding, se.rowBuf)
+		se.rowBuf, err = row[i].Encode(&se.infos[i].Type, &se.alloc, se.infos[i].Encoding, se.rowBuf)
 		if err != nil {
 			return err
 		}
@@ -88,28 +148,30 @@ func (se *StreamEncoder) AddRow(row sqlbase.EncDatumRow) error {
 }
 
 // FormMessage populates a message containing the rows added since the last call
-// to FormMessage. The returned StreamMessage should be treated as immutable. If
-// final is true, a message trailer is populated with the given error.
-func (se *StreamEncoder) FormMessage(final bool, trailerErr error) *StreamMessage {
+// to FormMessage. The returned ProducerMessage should be treated as immutable.
+func (se *StreamEncoder) FormMessage(ctx context.Context) *distsqlpb.ProducerMessage {
 	msg := &se.msg
 	msg.Header = nil
 	msg.Data.RawBytes = se.rowBuf
-	msg.Trailer = nil
-	if !se.firstMessageDone {
+	msg.Data.NumEmptyRows = int32(se.numEmptyRows)
+	msg.Data.Metadata = make([]distsqlpb.RemoteProducerMetadata, len(se.metadata))
+	copy(msg.Data.Metadata, se.metadata)
+	se.metadata = se.metadata[:0]
+
+	if !se.headerSent {
 		msg.Header = &se.msgHdr
-		if se.infos != nil {
-			msg.Header.Info = se.infos
-		} else {
-			if !final {
-				panic("trying to form non-final message with no rows")
-			}
+		se.headerSent = true
+	}
+	if !se.typingSent {
+		if se.infosInitialized {
+			msg.Typing = se.infos
+			se.typingSent = true
 		}
+	} else {
+		msg.Typing = nil
 	}
-	if final {
-		msg.Trailer = &se.msgTrl
-		msg.Trailer.Error = roachpb.NewError(trailerErr)
-	}
+
 	se.rowBuf = se.rowBuf[:0]
-	se.firstMessageDone = true
+	se.numEmptyRows = 0
 	return msg
 }

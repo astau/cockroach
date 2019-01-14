@@ -11,23 +11,20 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Kenji Kaneda (kenji.kaneda@gmail.com)
 
 package storage_test
 
 import (
+	"context"
 	"testing"
 	"time"
-
-	"github.com/pkg/errors"
-	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/pkg/errors"
 )
 
 // TestReplicaGCQueueDropReplica verifies that a removed replica is
@@ -43,11 +40,11 @@ func TestReplicaGCQueueDropReplicaDirect(t *testing.T) {
 	// the queue does a consistent lookup which will usually be read from
 	// Node 1. Hence, if Node 1 hasn't processed the removal when Node 2 has,
 	// no GC will take place since the consistent RangeLookup hits the first
-	// Node. We use the TestingCommandFilter to make sure that the second Node
+	// Node. We use the TestingEvalFilter to make sure that the second Node
 	// waits for the first.
 	cfg := storage.TestStoreConfig(nil)
 	mtc.storeConfig = &cfg
-	mtc.storeConfig.TestingKnobs.TestingCommandFilter =
+	mtc.storeConfig.TestingKnobs.EvalKnobs.TestingEvalFilter =
 		func(filterArgs storagebase.FilterArgs) *roachpb.Error {
 			et, ok := filterArgs.Req.(*roachpb.EndTransactionRequest)
 			if !ok || filterArgs.Sid != 2 {
@@ -74,11 +71,37 @@ func TestReplicaGCQueueDropReplicaDirect(t *testing.T) {
 	mtc.Start(t, numStores)
 
 	mtc.replicateRange(rangeID, 1, 2)
+
+	{
+		repl1, err := mtc.stores[1].GetReplica(rangeID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Put some bogus data on the replica which we're about to remove. Then,
+		// at the end of the test, check that that sideloaded storage is now
+		// empty (in other words, GC'ing the Replica took care of cleanup).
+		repl1.PutBogusSideloadedData()
+		if !repl1.HasBogusSideloadedData() {
+			t.Fatal("sideloaded storage ate our data")
+		}
+
+		defer func() {
+			if !t.Failed() {
+				testutils.SucceedsSoon(t, func() error {
+					if repl1.HasBogusSideloadedData() {
+						return errors.Errorf("first replica still has sideloaded files despite GC")
+					}
+					return nil
+				})
+			}
+		}()
+	}
+
 	mtc.unreplicateRange(rangeID, 1)
 
 	// Make sure the range is removed from the store.
 	testutils.SucceedsSoon(t, func() error {
-		if _, err := mtc.stores[1].GetReplica(rangeID); !testutils.IsError(err, "range .* was not found") {
+		if _, err := mtc.stores[1].GetReplica(rangeID); !testutils.IsError(err, "r[0-9]+ was not found") {
 			return errors.Errorf("expected range removal: %v", err) // NB: errors.Wrapf(nil, ...) returns nil.
 		}
 		return nil
@@ -111,14 +134,14 @@ func TestReplicaGCQueueDropReplicaGCOnScan(t *testing.T) {
 	mtc.stores[1].SetReplicaGCQueueActive(true)
 
 	// Increment the clock's timestamp to make the replica GC queue process the range.
-	mtc.expireLeases(context.TODO())
+	mtc.advanceClock(context.TODO())
 	mtc.manualClock.Increment(int64(storage.ReplicaGCQueueInactivityThreshold + 1))
 
 	// Make sure the range is removed from the store.
 	testutils.SucceedsSoon(t, func() error {
 		store := mtc.stores[1]
-		store.ForceReplicaGCScanAndProcess()
-		if _, err := store.GetReplica(rangeID); !testutils.IsError(err, "range .* was not found") {
+		store.MustForceReplicaGCScanAndProcess()
+		if _, err := store.GetReplica(rangeID); !testutils.IsError(err, "r[0-9]+ was not found") {
 			return errors.Errorf("expected range removal: %v", err) // NB: errors.Wrapf(nil, ...) returns nil.
 		}
 		return nil

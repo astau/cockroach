@@ -12,23 +12,17 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
-//
-// Author: Ben Darnell
 
 package storage
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 
-	"golang.org/x/net/context"
-
-	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/coreos/etcd/raft"
-	"github.com/coreos/etcd/raft/raftpb"
-	"github.com/gogo/protobuf/proto"
+	"go.etcd.io/etcd/raft"
+	"go.etcd.io/etcd/raft/raftpb"
 )
 
 // init installs an adapter to use clog for log messages from raft which
@@ -111,34 +105,40 @@ func (r *raftLogger) Panicf(format string, v ...interface{}) {
 	panic(fmt.Sprintf(format, v...))
 }
 
+func verboseRaftLoggingEnabled() bool {
+	return log.V(5)
+}
+
 func logRaftReady(ctx context.Context, ready raft.Ready) {
-	if log.V(5) {
-		var buf bytes.Buffer
-		if ready.SoftState != nil {
-			fmt.Fprintf(&buf, "  SoftState updated: %+v\n", *ready.SoftState)
-		}
-		if !raft.IsEmptyHardState(ready.HardState) {
-			fmt.Fprintf(&buf, "  HardState updated: %+v\n", ready.HardState)
-		}
-		for i, e := range ready.Entries {
-			fmt.Fprintf(&buf, "  New Entry[%d]: %.200s\n",
-				i, raft.DescribeEntry(e, raftEntryFormatter))
-		}
-		for i, e := range ready.CommittedEntries {
-			fmt.Fprintf(&buf, "  Committed Entry[%d]: %.200s\n",
-				i, raft.DescribeEntry(e, raftEntryFormatter))
-		}
-		if !raft.IsEmptySnap(ready.Snapshot) {
-			snap := ready.Snapshot
-			snap.Data = nil
-			fmt.Fprintf(&buf, "  Snapshot updated: %v\n", snap)
-		}
-		for i, m := range ready.Messages {
-			fmt.Fprintf(&buf, "  Outgoing Message[%d]: %.200s\n",
-				i, raftDescribeMessage(m, raftEntryFormatter))
-		}
-		log.Infof(ctx, "raft ready\n%s", buf.String())
+	if !verboseRaftLoggingEnabled() {
+		return
 	}
+
+	var buf bytes.Buffer
+	if ready.SoftState != nil {
+		fmt.Fprintf(&buf, "  SoftState updated: %+v\n", *ready.SoftState)
+	}
+	if !raft.IsEmptyHardState(ready.HardState) {
+		fmt.Fprintf(&buf, "  HardState updated: %+v\n", ready.HardState)
+	}
+	for i, e := range ready.Entries {
+		fmt.Fprintf(&buf, "  New Entry[%d]: %.200s\n",
+			i, raft.DescribeEntry(e, raftEntryFormatter))
+	}
+	for i, e := range ready.CommittedEntries {
+		fmt.Fprintf(&buf, "  Committed Entry[%d]: %.200s\n",
+			i, raft.DescribeEntry(e, raftEntryFormatter))
+	}
+	if !raft.IsEmptySnap(ready.Snapshot) {
+		snap := ready.Snapshot
+		snap.Data = nil
+		fmt.Fprintf(&buf, "  Snapshot updated: %v\n", snap)
+	}
+	for i, m := range ready.Messages {
+		fmt.Fprintf(&buf, "  Outgoing Message[%d]: %.200s\n",
+			i, raftDescribeMessage(m, raftEntryFormatter))
+	}
+	log.Infof(ctx, "raft ready (must-sync=%t)\n%s", ready.MustSync, buf.String())
 }
 
 // This is a fork of raft.DescribeMessage with a tweak to avoid logging
@@ -147,10 +147,7 @@ func raftDescribeMessage(m raftpb.Message, f raft.EntryFormatter) string {
 	var buf bytes.Buffer
 	fmt.Fprintf(&buf, "%x->%x %v Term:%d Log:%d/%d", m.From, m.To, m.Type, m.Term, m.LogTerm, m.Index)
 	if m.Reject {
-		fmt.Fprintf(&buf, " Rejected")
-		if m.RejectHint != 0 {
-			fmt.Fprintf(&buf, "(Hint:%d)", m.RejectHint)
-		}
+		fmt.Fprintf(&buf, " Rejected (Hint: %d)", m.RejectHint)
 	}
 	if m.Commit != 0 {
 		fmt.Fprintf(&buf, " Commit:%d", m.Commit)
@@ -177,29 +174,14 @@ func raftEntryFormatter(data []byte) string {
 	if len(data) == 0 {
 		return "[empty]"
 	}
-	commandID, encodedCmd := DecodeRaftCommand(data)
-	if len(data) >= 1024 {
-		// Don't try to unmarshal and stringify the command if it is large. Doing
-		// so is super expensive (multiple seconds for the call to String()) for
-		// large snapshot entries.
-		return fmt.Sprintf("[%x] [%d]", commandID, len(data))
-	}
-	var cmd storagebase.RaftCommand
-	if err := proto.Unmarshal(encodedCmd, &cmd); err != nil {
-		return fmt.Sprintf("[error parsing entry: %s]", err)
-	}
-	s := cmd.BatchRequest.String()
-	maxLen := 300
-	if len(s) > maxLen {
-		s = s[:maxLen]
-	}
-	return fmt.Sprintf("[%x] %s", commandID, s)
+	commandID, _ := DecodeRaftCommand(data)
+	return fmt.Sprintf("[%x] [%d]", commandID, len(data))
 }
 
-var _ security.RequestWithUser = &RaftMessageRequest{}
-
-// GetUser implements security.RequestWithUser.
-// Raft messages are always sent by the node user.
-func (*RaftMessageRequest) GetUser() string {
-	return security.NodeUser
+// IsPreemptive returns whether this is a preemptive snapshot or a Raft
+// snapshot.
+func (h *SnapshotRequest_Header) IsPreemptive() bool {
+	// Preemptive snapshots are addressed to replica ID 0. No other requests to
+	// replica ID 0 are allowed.
+	return h.RaftMessageRequest.ToReplica.ReplicaID == 0
 }

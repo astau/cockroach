@@ -12,17 +12,14 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
-//
-// Author: Matt Tracy (matt@cockroachlabs.com)
 
 package sql
 
 import (
+	"context"
 	"encoding/json"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/pkg/errors"
 )
@@ -31,7 +28,7 @@ import (
 type EventLogType string
 
 // NOTE: When you add a new event type here. Please manually add it to
-// ui/app/util/eventTypes.ts so that it will be recognized in the UI.
+// pkg/ui/src/util/eventTypes.ts so that it will be recognized in the UI.
 const (
 	// EventLogCreateDatabase is recorded when a database is created.
 	EventLogCreateDatabase EventLogType = "create_database"
@@ -42,18 +39,35 @@ const (
 	EventLogCreateTable EventLogType = "create_table"
 	// EventLogDropTable is recorded when a table is dropped.
 	EventLogDropTable EventLogType = "drop_table"
+	// EventLogTruncateTable is recorded when a table is truncated.
+	EventLogTruncateTable EventLogType = "truncate_table"
 	// EventLogAlterTable is recorded when a table is altered.
 	EventLogAlterTable EventLogType = "alter_table"
+	// EventLogCommentOnColumn is recorded when a column is commented.
+	EventLogCommentOnColumn EventLogType = "comment_on_column"
+	// EventLogCommentOnTable is recorded when a table is commented.
+	EventLogCommentOnDatabase EventLogType = "comment_on_database"
+	// EventLogCommentOnTable is recorded when a table is commented.
+	EventLogCommentOnTable EventLogType = "comment_on_table"
 
 	// EventLogCreateIndex is recorded when an index is created.
 	EventLogCreateIndex EventLogType = "create_index"
 	// EventLogDropIndex is recorded when an index is dropped.
 	EventLogDropIndex EventLogType = "drop_index"
+	// EventLogAlterIndex is recorded when an index is altered.
+	EventLogAlterIndex EventLogType = "alter_index"
 
 	// EventLogCreateView is recorded when a view is created.
 	EventLogCreateView EventLogType = "create_view"
 	// EventLogDropView is recorded when a view is dropped.
 	EventLogDropView EventLogType = "drop_view"
+
+	// EventLogCreateSequence is recorded when a sequence is created.
+	EventLogCreateSequence EventLogType = "create_sequence"
+	// EventLogDropSequence is recorded when a sequence is dropped.
+	EventLogDropSequence EventLogType = "drop_sequence"
+	// EventLogAlterSequence is recorded when a sequence is altered.
+	EventLogAlterSequence EventLogType = "alter_sequence"
 
 	// EventLogReverseSchemaChange is recorded when an in-progress schema change
 	// encounters a problem and is reversed.
@@ -61,50 +75,80 @@ const (
 	// EventLogFinishSchemaChange is recorded when a previously initiated schema
 	// change has completed.
 	EventLogFinishSchemaChange EventLogType = "finish_schema_change"
+	// EventLogFinishSchemaRollback is recorded when a previously
+	// initiated schema change rollback has completed.
+	EventLogFinishSchemaRollback EventLogType = "finish_schema_change_rollback"
 
 	// EventLogNodeJoin is recorded when a node joins the cluster.
 	EventLogNodeJoin EventLogType = "node_join"
 	// EventLogNodeRestart is recorded when an existing node rejoins the cluster
 	// after being offline.
 	EventLogNodeRestart EventLogType = "node_restart"
+	// EventLogNodeDecommissioned is recorded when a node is marked as
+	// decommissioning.
+	EventLogNodeDecommissioned EventLogType = "node_decommissioned"
+	// EventLogNodeRecommissioned is recorded when a decommissioned node is
+	// recommissioned.
+	EventLogNodeRecommissioned EventLogType = "node_recommissioned"
+
+	// EventLogSetClusterSetting is recorded when a cluster setting is changed.
+	EventLogSetClusterSetting EventLogType = "set_cluster_setting"
+
+	// EventLogSetZoneConfig is recorded when a zone config is changed.
+	EventLogSetZoneConfig EventLogType = "set_zone_config"
+	// EventLogRemoveZoneConfig is recorded when a zone config is removed.
+	EventLogRemoveZoneConfig EventLogType = "remove_zone_config"
+
+	// EventLogCreateStatistics is recorded when statistics are collected for a
+	// table.
+	EventLogCreateStatistics EventLogType = "create_statistics"
 )
+
+// EventLogSetClusterSettingDetail is the json details for a settings change.
+type EventLogSetClusterSettingDetail struct {
+	SettingName string
+	Value       string
+	User        string
+}
 
 // An EventLogger exposes methods used to record events to the event table.
 type EventLogger struct {
-	InternalExecutor
+	*InternalExecutor
 }
 
-// MakeEventLogger constructs a new EventLogger. A LeaseManager is required in
-// order to correctly execute SQL statements.
-func MakeEventLogger(leaseMgr *LeaseManager) EventLogger {
-	return EventLogger{InternalExecutor{
-		LeaseManager: leaseMgr,
-	}}
+// MakeEventLogger constructs a new EventLogger.
+func MakeEventLogger(execCfg *ExecutorConfig) EventLogger {
+	return EventLogger{InternalExecutor: execCfg.InternalExecutor}
 }
 
 // InsertEventRecord inserts a single event into the event log as part of the
 // provided transaction.
 func (ev EventLogger) InsertEventRecord(
-	txn *client.Txn, eventType EventLogType, targetID, reportingID int32, info interface{},
+	ctx context.Context,
+	txn *client.Txn,
+	eventType EventLogType,
+	targetID, reportingID int32,
+	info interface{},
 ) error {
 	// Record event record insertion in local log output.
-	txn.AddCommitTrigger(func() {
-		log.Infof(txn.Context, "Event: %q, target: %d, info: %+v",
+	txn.AddCommitTrigger(func(ctx context.Context) {
+		log.Infof(
+			ctx, "Event: %q, target: %d, info: %+v",
 			eventType,
 			targetID,
-			info)
+			info,
+		)
 	})
 
 	const insertEventTableStmt = `
 INSERT INTO system.eventlog (
-  timestamp, eventType, targetID, reportingID, info
+  timestamp, "eventType", "targetID", "reportingID", info
 )
 VALUES(
-  $1, $2, $3, $4, $5
+  now(), $1, $2, $3, $4
 )
 `
 	args := []interface{}{
-		ev.selectEventTimestamp(txn.Proto.Timestamp),
 		eventType,
 		targetID,
 		reportingID,
@@ -115,10 +159,10 @@ VALUES(
 		if err != nil {
 			return err
 		}
-		args[4] = string(infoBytes)
+		args[3] = string(infoBytes)
 	}
 
-	rows, err := ev.ExecuteStatementInTransaction("log-event", txn, insertEventTableStmt, args...)
+	rows, err := ev.Exec(ctx, "log-event", txn, insertEventTableStmt, args...)
 	if err != nil {
 		return err
 	}
@@ -126,19 +170,4 @@ VALUES(
 		return errors.Errorf("%d rows affected by log insertion; expected exactly one row affected.", rows)
 	}
 	return nil
-}
-
-// selectEventTimestamp selects a timestamp for this log message. If the
-// transaction this event is being written in has a non-zero timestamp, then that
-// timestamp should be used; otherwise, the store's physical clock is used.
-// This helps with testing; in normal usage, the logging of an event will never
-// be the first action in the transaction, and thus the transaction will have an
-// assigned database timestamp. However, in the case of our tests log events
-// *are* the first action in a transaction, and we must elect to use the store's
-// physical time instead.
-func (ev EventLogger) selectEventTimestamp(input hlc.Timestamp) time.Time {
-	if input == hlc.ZeroTimestamp {
-		return ev.LeaseManager.clock.PhysicalTime()
-	}
-	return input.GoTime()
 }

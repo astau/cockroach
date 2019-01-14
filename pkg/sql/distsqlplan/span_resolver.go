@@ -11,32 +11,23 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Andrei Matei (andreimatei1@gmail.com)
 
 package distsqlplan
 
 import (
+	"context"
 	"math"
 	"math/rand"
 
 	"github.com/cockroachdb/cockroach/pkg/gossip"
+	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/pkg/errors"
-	"golang.org/x/net/context"
 )
-
-// When choosing lease holders, we try to choose the same node for all the
-// ranges applicable, until we hit this limit. The rationale is that maybe a
-// bunch of those ranges don't have an active lease, so our choice is going to
-// be self-fulfilling. If so, we want to collocate the lease holders. But above
-// some limit, we prefer to take the parallelism and distribute to multiple
-// nodes. The actual number used is based on nothing.
-const maxPreferredRangesPerLeaseHolder = 10
 
 // SpanResolver resolves key spans to their respective ranges and lease holders.
 // Used for planning physical execution of distributed SQL queries.
@@ -49,9 +40,9 @@ const maxPreferredRangesPerLeaseHolder = 10
 //   spans ...spanWithDir,
 // ) ([][]kv.ReplicaInfo, error) {
 //   lr := distsql.NewSpanResolver(
-//   distSender, gossip, nodeDescriptor,
+//     distSender, gossip, nodeDescriptor,
 //     distsql.BinPackingLeaseHolderChoice)
-//   it := lr.NewSpanResolverIterator()
+//   it := lr.NewSpanResolverIterator(nil)
 //   res := make([][]kv.ReplicaInfo, 0)
 //   for _, span := range spans {
 //     repls := make([]kv.ReplicaInfo, 0)
@@ -74,7 +65,70 @@ const maxPreferredRangesPerLeaseHolder = 10
 // }
 //
 //
-type SpanResolver struct {
+type SpanResolver interface {
+	// NewSpanResolverIterator creates a new SpanResolverIterator.
+	// The txn is only used by the "fake" implementation (used for testing).
+	NewSpanResolverIterator(txn *client.Txn) SpanResolverIterator
+}
+
+// SpanResolverIterator is used to iterate over the ranges composing a key span.
+type SpanResolverIterator interface {
+	// Seek positions the iterator on the start of a span (span.Key or
+	// span.EndKey, depending on ScanDir). Note that span.EndKey is exclusive,
+	// regardless of scanDir.
+	//
+	// After calling this, ReplicaInfo() will return information about the range
+	// containing the start key of the span (or the end key, if the direction is
+	// Descending).
+	//
+	// NeedAnother() will return true until the iterator is positioned on or after
+	// the end of the span.  Possible errors encountered should be checked for
+	// with Valid().
+	//
+	// Seek can be called repeatedly on the same iterator. To make optimal uses of
+	// caches, Seek()s should be performed on spans sorted according to the
+	// scanDir (if Descending, then the span with the highest keys should be
+	// Seek()ed first).
+	//
+	// scanDir changes the direction in which Next() will advance the iterator.
+	Seek(ctx context.Context, span roachpb.Span, scanDir kv.ScanDirection)
+
+	// NeedAnother returns true if the current range is not the last for the span
+	// that was last Seek()ed.
+	NeedAnother() bool
+
+	// Next advances the iterator to the next range. The next range contains the
+	// last range's end key (but it does not necessarily start there, because of
+	// asynchronous range splits and caching effects).
+	// Possible errors encountered should be checked for with Valid().
+	Next(ctx context.Context)
+
+	// Valid returns false if an error was encountered by the last Seek() or Next().
+	Valid() bool
+
+	// Error returns any error encountered by the last Seek() or Next().
+	Error() error
+
+	// Desc returns the current RangeDescriptor.
+	Desc() roachpb.RangeDescriptor
+
+	// ReplicaInfo returns information about the replica that has been picked for
+	// the current range.
+	// A RangeUnavailableError is returned if there's no information in gossip
+	// about any of the replicas.
+	ReplicaInfo(ctx context.Context) (kv.ReplicaInfo, error)
+}
+
+// When choosing lease holders, we try to choose the same node for all the
+// ranges applicable, until we hit this limit. The rationale is that maybe a
+// bunch of those ranges don't have an active lease, so our choice is going to
+// be self-fulfilling. If so, we want to collocate the lease holders. But above
+// some limit, we prefer to take the parallelism and distribute to multiple
+// nodes. The actual number used is based on nothing.
+const maxPreferredRangesPerLeaseHolder = 10
+
+// spanResolver implements SpanResolver.
+type spanResolver struct {
 	gossip     *gossip.Gossip
 	distSender *kv.DistSender
 	oracle     leaseHolderOracle
@@ -84,6 +138,8 @@ type SpanResolver struct {
 	// holders.
 	nodeDesc roachpb.NodeDescriptor
 }
+
+var _ SpanResolver = &spanResolver{}
 
 // LeaseHolderChoosingPolicy enumerates the implementors of leaseHolderOracle.
 type LeaseHolderChoosingPolicy byte
@@ -95,13 +151,13 @@ const (
 	BinPackingLeaseHolderChoice
 )
 
-// NewSpanResolver creates a new SpanResolver.
+// NewSpanResolver creates a new spanResolver.
 func NewSpanResolver(
 	distSender *kv.DistSender,
 	gossip *gossip.Gossip,
 	nodeDesc roachpb.NodeDescriptor,
 	choosingPolicy LeaseHolderChoosingPolicy,
-) *SpanResolver {
+) SpanResolver {
 	var oracle leaseHolderOracle
 	switch choosingPolicy {
 	case RandomLeaseHolderChoice:
@@ -113,7 +169,7 @@ func NewSpanResolver(
 			nodeDesc: nodeDesc,
 		}
 	}
-	return &SpanResolver{
+	return &spanResolver{
 		distSender: distSender,
 		oracle:     oracle,
 		gossip:     gossip,
@@ -121,18 +177,22 @@ func NewSpanResolver(
 	}
 }
 
+// oracleQueryState encapsulates the history of assignments of ranges to nodes
+// done by an oracle on behalf of one particular query.
 type oracleQueryState struct {
-	rangesPerNode map[roachpb.NodeID]int
+	rangesPerNode  map[roachpb.NodeID]int
+	assignedRanges map[roachpb.RangeID]kv.ReplicaInfo
 }
 
 func makeOracleQueryState() oracleQueryState {
 	return oracleQueryState{
-		rangesPerNode: make(map[roachpb.NodeID]int),
+		rangesPerNode:  make(map[roachpb.NodeID]int),
+		assignedRanges: make(map[roachpb.RangeID]kv.ReplicaInfo),
 	}
 }
 
-// SpanResolverIterator iterates over the ranges composing a key span.
-type SpanResolverIterator struct {
+// spanResolverIterator implements the SpanResolverIterator interface.
+type spanResolverIterator struct {
 	// it is a wrapper RangeIterator.
 	it *kv.RangeIterator
 	// gossip is used to resolve NodeIds to addresses and node attributes, used to
@@ -145,30 +205,31 @@ type SpanResolverIterator struct {
 	curSpan roachpb.RSpan
 	// dir is the direction set by the last Seek()
 	dir kv.ScanDirection
-	// queryState accumulates information about the nodes that are lease holders
-	// for ranges resolved already by the iterator.
+	// queryState accumulates information about the assigned lease holders.
 	queryState oracleQueryState
 
 	err error
 }
 
+var _ SpanResolverIterator = &spanResolverIterator{}
+
 // NewSpanResolverIterator creates a new SpanResolverIterator.
-func (sr *SpanResolver) NewSpanResolverIterator() *SpanResolverIterator {
-	it := SpanResolverIterator{
+func (sr *spanResolver) NewSpanResolverIterator(_ *client.Txn) SpanResolverIterator {
+	return &spanResolverIterator{
 		gossip:     sr.gossip,
 		it:         kv.NewRangeIterator(sr.distSender),
 		oracle:     sr.oracle,
 		queryState: makeOracleQueryState(),
 	}
-	return &it
 }
 
-// Valid returns false if an error was encoutered by the last Seek() or Next().
-func (it *SpanResolverIterator) Valid() bool {
+// Valid is part of the SpanResolverIterator interface.
+func (it *spanResolverIterator) Valid() bool {
 	return it.err == nil && it.it.Valid()
 }
 
-func (it *SpanResolverIterator) Error() error {
+// Error is part of the SpanResolverIterator interface.
+func (it *spanResolverIterator) Error() error {
 	if it.err != nil {
 		return it.err
 	}
@@ -176,23 +237,8 @@ func (it *SpanResolverIterator) Error() error {
 	return it.it.Error().GoError()
 }
 
-// Seek positions the iterator on the start of a span (span.Key or span.EndKey,
-// depending on ScanDir). Note that span.EndKey is exclusive, regardless of
-// scanDir.
-// After calling this, ReplicaInfo() will return information about the range
-// containing the start key of the span (or the end key, if the direction is
-// Descending).
-// NeedAnother() will return true until the iterator is positioned on or after
-// the end of the span.
-// Possible errors encountered should be checked for with Valid().
-//
-// Seek can be called repeatedly on the same iterator. To make optimal uses of
-// caches, Seek()s should be performed on spans sorted according to the
-// scanDir (if Descending, then the span with the highest keys should be
-// Seek()ed first).
-//
-// scanDir changes the direction in which Next() will advance the iterator.
-func (it *SpanResolverIterator) Seek(
+// Seek is part of the SpanResolverIterator interface.
+func (it *spanResolverIterator) Seek(
 	ctx context.Context, span roachpb.Span, scanDir kv.ScanDirection,
 ) {
 	var key, endKey roachpb.RKey
@@ -205,7 +251,6 @@ func (it *SpanResolverIterator) Seek(
 		it.err = err
 		return
 	}
-	oldSpan := it.curSpan
 	oldDir := it.dir
 	it.curSpan = roachpb.RSpan{
 		Key:    key,
@@ -224,57 +269,66 @@ func (it *SpanResolverIterator) Seek(
 	// already positioned. If so, and if the direction also corresponds, there's
 	// no need to change the underlying iterator's state.
 	if it.dir == oldDir && it.it.Valid() {
-		if it.dir == kv.Ascending && oldSpan.ContainsKey(seekKey) {
+		reverse := (it.dir == kv.Descending)
+		desc := it.it.Desc()
+		if (reverse && desc.ContainsKeyInverted(seekKey)) ||
+			(!reverse && desc.ContainsKey(seekKey)) {
+			if log.V(1) {
+				log.Infof(ctx, "not seeking (key=%s); existing descriptor %s", seekKey, desc)
+			}
 			return
 		}
-		if it.dir == kv.Descending && oldSpan.ContainsExclusiveEndKey(seekKey) {
-			return
-		}
+	}
+	if log.V(1) {
+		log.Infof(ctx, "seeking (key=%s)", seekKey)
 	}
 	it.it.Seek(ctx, seekKey, scanDir)
 }
 
-// Next advances the iterator to the next range.
-// Possible errors encountered should be checked for with Valid().
-func (it *SpanResolverIterator) Next(ctx context.Context) {
+// Next is part of the SpanResolverIterator interface.
+func (it *spanResolverIterator) Next(ctx context.Context) {
 	if !it.Valid() {
 		panic(it.Error())
 	}
 	it.it.Next(ctx)
 }
 
-// NeedAnother returns true if the current range is not the last for the span
-// that was last Seek()ed.
-func (it *SpanResolverIterator) NeedAnother() bool {
+// NeedAnother is part of the SpanResolverIterator interface.
+func (it *spanResolverIterator) NeedAnother() bool {
 	return it.it.NeedAnother(it.curSpan)
 }
 
-// Desc returns the current RangeDescriptor.
-func (it *SpanResolverIterator) Desc() roachpb.RangeDescriptor {
+// Desc is part of the SpanResolverIterator interface.
+func (it *spanResolverIterator) Desc() roachpb.RangeDescriptor {
 	return *it.it.Desc()
 }
 
-// ReplicaInfo returns information about the replica that has been picked for
-// the current range.
-// A RangeUnavailableError is returned if there's no information in gossip
-// about any of the replicas.
-func (it *SpanResolverIterator) ReplicaInfo(ctx context.Context) (kv.ReplicaInfo, error) {
+// ReplicaInfo is part of the SpanResolverIterator interface.
+func (it *spanResolverIterator) ReplicaInfo(ctx context.Context) (kv.ReplicaInfo, error) {
 	if !it.Valid() {
 		panic(it.Error())
 	}
 
 	resolvedLH := false
 	var repl kv.ReplicaInfo
-	if lh, ok := it.it.LeaseHolder(ctx); ok {
-		repl.ReplicaDescriptor = lh
+	if storeID, ok := it.it.LeaseHolderStoreID(ctx); ok {
+		repl.ReplicaDescriptor = roachpb.ReplicaDescriptor{StoreID: storeID}
 		// Fill in the node descriptor.
-		nd, err := it.gossip.GetNodeDescriptor(repl.NodeID)
+		nodeID, err := it.gossip.GetNodeIDForStoreID(storeID)
 		if err != nil {
-			// Ignore the error; ask the oracle to pick another replica below.
-			log.VEventf(ctx, 2, "failed to resolve node %d: %s", repl.NodeID, err)
+			log.VEventf(ctx, 2, "failed to lookup store %d: %s", storeID, err)
+		} else {
+			nd, err := it.gossip.GetNodeDescriptor(nodeID)
+			if err != nil {
+				// Ignore the error; ask the oracle to pick another replica below.
+				log.VEventf(ctx, 2, "failed to resolve node %d: %s", nodeID, err)
+			} else {
+				repl.ReplicaDescriptor.NodeID = nodeID
+				repl.NodeDesc = nd
+				resolvedLH = true
+			}
 		}
-		repl.NodeDesc = nd
-		resolvedLH = true
+
 	}
 	if !resolvedLH {
 		leaseHolder, err := it.oracle.ChoosePreferredLeaseHolder(
@@ -285,6 +339,7 @@ func (it *SpanResolverIterator) ReplicaInfo(ctx context.Context) (kv.ReplicaInfo
 		repl = leaseHolder
 	}
 	it.queryState.rangesPerNode[repl.NodeID]++
+	it.queryState.assignedRanges[it.it.Desc().RangeID] = repl
 	return repl, nil
 }
 
@@ -347,11 +402,17 @@ var _ leaseHolderOracle = &binPackingOracle{}
 func (o *binPackingOracle) ChoosePreferredLeaseHolder(
 	desc roachpb.RangeDescriptor, queryState oracleQueryState,
 ) (kv.ReplicaInfo, error) {
+	// If we've assigned the range before, return that assignment.
+	if repl, ok := queryState.assignedRanges[desc.RangeID]; ok {
+		return repl, nil
+	}
+
 	replicas, err := replicaSliceOrErr(desc, o.gossip)
 	if err != nil {
 		return kv.ReplicaInfo{}, err
 	}
-	replicas.OptimizeReplicaOrder(&o.nodeDesc)
+
+	replicas.OptimizeReplicaOrder(&o.nodeDesc, nil /* TODO(andrei): plumb rpc context and remote clocks for latency */)
 
 	// Look for a replica that has been assigned some ranges, but it's not yet full.
 	minLoad := int(math.MaxInt32)

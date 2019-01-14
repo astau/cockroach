@@ -11,29 +11,40 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
 
 package util
 
 import (
 	"runtime"
+	"strconv"
 	"strings"
 )
 
-// GetSmallTrace produces a ":"-separated single line containing the
-// topmost 5 callers from a given skip level.
-func GetSmallTrace(skip int) string {
-	pc := make([]uintptr, 5)
-	nCallers := runtime.Callers(skip, pc[:])
-	callers := make([]string, nCallers)
+var prefix = func() string {
+	result := "github.com/cockroachdb/cockroach/pkg/"
+	if runtime.Compiler == "gccgo" {
+		result = strings.Replace(result, ".", "_", -1)
+		result = strings.Replace(result, "/", "_", -1)
+	}
+	return result
+}()
 
-	for i := range callers {
-		callers[i] = strings.TrimPrefix(
-			runtime.FuncForPC(pc[i]).Name(),
-			"github.com/cockroachdb/cockroach/pkg/",
-		)
+// GetSmallTrace returns a comma-separated string containing the top
+// 5 callers from a given skip level.
+func GetSmallTrace(skip int) string {
+	var pcs [5]uintptr
+	nCallers := runtime.Callers(skip, pcs[:])
+	callers := make([]string, 0, nCallers)
+	frames := runtime.CallersFrames(pcs[:])
+
+	for {
+		f, more := frames.Next()
+		function := strings.TrimPrefix(f.Function, prefix)
+		callers = append(callers, function+":"+strconv.Itoa(f.Line))
+		if !more {
+			break
+		}
 	}
 
-	return strings.Join(callers, ":")
+	return strings.Join(callers, ",")
 }

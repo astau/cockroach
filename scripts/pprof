@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 #
 # This script wraps "go tool pprof" (and stunnel) to work better with
-# HTTPS servers using untrusted certificates (like cockroachdb). "go
-# tool pprof" has no option to ignore certificate errors, so we setup
-# stunnel forwarding to make the server look like unencrypted HTTP.
+# HTTPS servers using untrusted certificates (like cockroachdb).
+#
+# Go 1.8 introduced the "https+insecure" option to ignore certificate
+# validation errors, but it did not extend to the symbolizer
+# (https://github.com/google/pprof/issues/94). In go 1.9, this script
+# should be obsolete.
 
 set -euo pipefail
 

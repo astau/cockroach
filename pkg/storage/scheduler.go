@@ -16,14 +16,11 @@ package storage
 
 import (
 	"container/list"
+	"context"
 	"fmt"
 	"sync"
-	"time"
-
-	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
@@ -110,11 +107,11 @@ func (q *rangeIDQueue) back() *rangeIDChunk {
 }
 
 type raftProcessor interface {
-	processReady(rangeID roachpb.RangeID)
-	processRequestQueue(rangeID roachpb.RangeID)
+	processReady(context.Context, roachpb.RangeID)
+	processRequestQueue(context.Context, roachpb.RangeID)
 	// Process a raft tick for the specified range. Return true if the range
 	// should be queued for ready processing.
-	processTick(rangeID roachpb.RangeID) bool
+	processTick(context.Context, roachpb.RangeID) bool
 }
 
 type raftScheduleState int
@@ -131,7 +128,7 @@ type raftScheduler struct {
 	numWorkers int
 
 	mu struct {
-		syncutil.TimedMutex
+		syncutil.Mutex
 		cond    *sync.Cond
 		queue   rangeIDQueue
 		state   map[roachpb.RangeID]raftScheduleState
@@ -142,32 +139,19 @@ type raftScheduler struct {
 }
 
 func newRaftScheduler(
-	ambient log.AmbientContext, metrics *StoreMetrics, processor raftProcessor, numWorkers int,
+	metrics *StoreMetrics, processor raftProcessor, numWorkers int,
 ) *raftScheduler {
 	s := &raftScheduler{
 		processor:  processor,
 		numWorkers: numWorkers,
 	}
-	muLogger := syncutil.ThresholdLogger(
-		ambient.AnnotateCtx(context.Background()),
-		defaultReplicaMuWarnThreshold,
-		func(ctx context.Context, msg string, args ...interface{}) {
-			log.Warningf(ctx, "raftScheduler.mu: "+msg, args...)
-		},
-		func(t time.Duration) {
-			if metrics != nil {
-				metrics.MuSchedulerNanos.RecordValue(t.Nanoseconds())
-			}
-		},
-	)
-	s.mu.TimedMutex = syncutil.MakeTimedMutex(muLogger)
-	s.mu.cond = sync.NewCond(&s.mu.TimedMutex)
+	s.mu.cond = sync.NewCond(&s.mu.Mutex)
 	s.mu.state = make(map[roachpb.RangeID]raftScheduleState)
 	return s
 }
 
-func (s *raftScheduler) Start(stopper *stop.Stopper) {
-	stopper.RunWorker(func() {
+func (s *raftScheduler) Start(ctx context.Context, stopper *stop.Stopper) {
+	stopper.RunWorker(ctx, func(ctx context.Context) {
 		<-stopper.ShouldStop()
 		s.mu.Lock()
 		s.mu.stopped = true
@@ -177,17 +161,17 @@ func (s *raftScheduler) Start(stopper *stop.Stopper) {
 
 	s.done.Add(s.numWorkers)
 	for i := 0; i < s.numWorkers; i++ {
-		stopper.RunWorker(func() {
-			s.worker(stopper)
+		stopper.RunWorker(ctx, func(ctx context.Context) {
+			s.worker(ctx)
 		})
 	}
 }
 
-func (s *raftScheduler) Wait() {
+func (s *raftScheduler) Wait(context.Context) {
 	s.done.Wait()
 }
 
-func (s *raftScheduler) worker(stopper *stop.Stopper) {
+func (s *raftScheduler) worker(ctx context.Context) {
 	defer s.done.Done()
 
 	// We use a sync.Cond for worker notification instead of a buffered
@@ -222,12 +206,12 @@ func (s *raftScheduler) worker(stopper *stop.Stopper) {
 		if state&stateRaftTick != 0 {
 			// processRaftTick returns true if the range should perform ready
 			// processing. Do not reorder this below the call to processReady.
-			if s.processor.processTick(id) {
+			if s.processor.processTick(ctx, id) {
 				state |= stateRaftReady
 			}
 		}
 		if state&stateRaftReady != 0 {
-			s.processor.processReady(id)
+			s.processor.processReady(ctx, id)
 		}
 		// Process requests last. This avoids a scenario where a tick and a
 		// "quiesce" message are processed in the same iteration and intervening
@@ -238,7 +222,7 @@ func (s *raftScheduler) worker(stopper *stop.Stopper) {
 		// unquiesce when the tick is processed, but we'll wake the leader in
 		// that case.
 		if state&stateRaftRequest != 0 {
-			s.processor.processRequestQueue(id)
+			s.processor.processRequestQueue(ctx, id)
 		}
 
 		s.mu.Lock()

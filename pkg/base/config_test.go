@@ -11,14 +11,10 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
 
 package base_test
 
 import (
-	"fmt"
-	"path/filepath"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -27,17 +23,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
 
-func fillCertPaths(cfg *base.Config, user string) {
-	cfg.SSLCA = filepath.Join(security.EmbeddedCertsDir, security.EmbeddedCACert)
-	cfg.SSLCAKey = filepath.Join(security.EmbeddedCertsDir, security.EmbeddedCAKey)
-	cfg.SSLCert = filepath.Join(security.EmbeddedCertsDir, fmt.Sprintf("%s.crt", user))
-	cfg.SSLCertKey = filepath.Join(security.EmbeddedCertsDir, fmt.Sprintf("%s.key", user))
-}
-
 func TestClientSSLSettings(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	const assetNotFound = "error setting up client TLS config: Asset .* not found"
+	const clientCertNotFound = "problem with client cert for user .*: not found"
+	const certDirNotFound = "problem loading certs directory"
 
 	testCases := []struct {
 		// args
@@ -52,16 +42,16 @@ func TestClientSSLSettings(t *testing.T) {
 	}{
 		{true, false, security.NodeUser, "http", "", true, false},
 		{true, true, "not-a-user", "http", "", true, false},
-		{false, true, "not-a-user", "https", assetNotFound, true, false},
-		{false, false, security.NodeUser, "https", assetNotFound, false, true},
+		{false, true, "not-a-user", "https", clientCertNotFound, true, false},
+		{false, false, security.NodeUser, "https", certDirNotFound, false, true},
 		{false, true, security.NodeUser, "https", "", false, false},
-		{false, true, "bad-user", "https", assetNotFound, false, false},
+		{false, true, "bad-user", "https", clientCertNotFound, false, false},
 	}
 
 	for tcNum, tc := range testCases {
 		cfg := &base.Config{Insecure: tc.insecure, User: tc.user}
 		if tc.hasCerts {
-			fillCertPaths(cfg, tc.user)
+			testutils.FillCerts(cfg)
 		}
 		if cfg.HTTPRequestScheme() != tc.requestScheme {
 			t.Fatalf("#%d: expected HTTPRequestScheme=%s, got: %s", tcNum, tc.requestScheme, cfg.HTTPRequestScheme())
@@ -106,7 +96,7 @@ func TestServerSSLSettings(t *testing.T) {
 	for tcNum, tc := range testCases {
 		cfg := &base.Config{Insecure: tc.insecure, User: security.NodeUser}
 		if tc.hasCerts {
-			fillCertPaths(cfg, security.NodeUser)
+			testutils.FillCerts(cfg)
 		}
 		if cfg.HTTPRequestScheme() != tc.requestScheme {
 			t.Fatalf("#%d: expected HTTPRequestScheme=%s, got: %s", tcNum, tc.requestScheme, cfg.HTTPRequestScheme())

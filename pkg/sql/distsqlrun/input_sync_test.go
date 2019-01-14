@@ -11,28 +11,29 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 package distsqlrun
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/pkg/errors"
 )
 
 func TestOrderedSync(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	columnTypeInt := &sqlbase.ColumnType{Kind: sqlbase.ColumnType_INT}
+	columnTypeInt := &sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT}
 	v := [6]sqlbase.EncDatum{}
 	for i := range v {
-		v[i] = sqlbase.DatumToEncDatum(*columnTypeInt, parser.NewDInt(parser.DInt(i)))
+		v[i] = sqlbase.DatumToEncDatum(*columnTypeInt, tree.NewDInt(tree.DInt(i)))
 	}
 
 	asc := encoding.Ascending
@@ -109,26 +110,29 @@ func TestOrderedSync(t *testing.T) {
 	for testIdx, c := range testCases {
 		var sources []RowSource
 		for _, srcRows := range c.sources {
-			rowBuf := &RowBuffer{Rows: srcRows}
+			rowBuf := NewRowBuffer(threeIntCols, srcRows, RowBufferArgs{})
 			sources = append(sources, rowBuf)
 		}
-		src, err := makeOrderedSync(c.ordering, sources)
+		evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+		defer evalCtx.Stop(context.Background())
+		src, err := makeOrderedSync(c.ordering, evalCtx, sources)
 		if err != nil {
 			t.Fatal(err)
 		}
+		src.Start(context.Background())
 		var retRows sqlbase.EncDatumRows
 		for {
-			row, err := src.NextRow()
-			if err != nil {
-				t.Fatal(err)
+			row, meta := src.Next()
+			if meta != nil {
+				t.Fatalf("unexpected metadata: %v", meta)
 			}
 			if row == nil {
 				break
 			}
 			retRows = append(retRows, row)
 		}
-		expStr := c.expected.String()
-		retStr := retRows.String()
+		expStr := c.expected.String(threeIntCols)
+		retStr := retRows.String(threeIntCols)
 		if expStr != retStr {
 			t.Errorf("invalid results for case %d; expected:\n   %s\ngot:\n   %s",
 				testIdx, expStr, retStr)
@@ -139,25 +143,28 @@ func TestOrderedSync(t *testing.T) {
 func TestUnorderedSync(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	columnTypeInt := &sqlbase.ColumnType{Kind: sqlbase.ColumnType_INT}
-	mrc := &MultiplexedRowChannel{}
-	mrc.Init(5)
+	columnTypeInt := sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT}
+	mrc := &RowChannel{}
+	mrc.InitWithNumSenders([]sqlbase.ColumnType{columnTypeInt}, 5)
+	producerErr := make(chan error, 100)
 	for i := 1; i <= 5; i++ {
 		go func(i int) {
 			for j := 1; j <= 100; j++ {
-				a := sqlbase.DatumToEncDatum(*columnTypeInt, parser.NewDInt(parser.DInt(i)))
-				b := sqlbase.DatumToEncDatum(*columnTypeInt, parser.NewDInt(parser.DInt(j)))
+				a := sqlbase.DatumToEncDatum(columnTypeInt, tree.NewDInt(tree.DInt(i)))
+				b := sqlbase.DatumToEncDatum(columnTypeInt, tree.NewDInt(tree.DInt(j)))
 				row := sqlbase.EncDatumRow{a, b}
-				mrc.PushRow(row)
+				if status := mrc.Push(row, nil /* meta */); status != NeedMoreRows {
+					producerErr <- errors.Errorf("producer error: unexpected response: %d", status)
+				}
 			}
-			mrc.Close(nil)
+			mrc.ProducerDone()
 		}(i)
 	}
 	var retRows sqlbase.EncDatumRows
 	for {
-		row, err := mrc.NextRow()
-		if err != nil {
-			t.Fatal(err)
+		row, meta := mrc.Next()
+		if meta != nil {
+			t.Fatalf("unexpected metadata: %v", meta)
 		}
 		if row == nil {
 			break
@@ -168,9 +175,9 @@ func TestUnorderedSync(t *testing.T) {
 	for i := 1; i <= 5; i++ {
 		j := 1
 		for _, row := range retRows {
-			if int(*(row[0].Datum.(*parser.DInt))) == i {
-				if int(*(row[1].Datum.(*parser.DInt))) != j {
-					t.Errorf("Expected [%d %d], got %s", i, j, row)
+			if int(tree.MustBeDInt(row[0].Datum)) == i {
+				if int(tree.MustBeDInt(row[1].Datum)) != j {
+					t.Errorf("Expected [%d %d], got %s", i, j, row.String(twoIntCols))
 				}
 				j++
 			}
@@ -179,35 +186,52 @@ func TestUnorderedSync(t *testing.T) {
 			t.Errorf("Missing [%d %d]", i, j)
 		}
 	}
+	select {
+	case err := <-producerErr:
+		t.Fatal(err)
+	default:
+	}
 
 	// Test case when one source closes with an error.
-	mrc = &MultiplexedRowChannel{}
-	mrc.Init(5)
+	mrc = &RowChannel{}
+	mrc.InitWithNumSenders([]sqlbase.ColumnType{columnTypeInt}, 5)
 	for i := 1; i <= 5; i++ {
 		go func(i int) {
 			for j := 1; j <= 100; j++ {
-				a := sqlbase.DatumToEncDatum(*columnTypeInt, parser.NewDInt(parser.DInt(i)))
-				b := sqlbase.DatumToEncDatum(*columnTypeInt, parser.NewDInt(parser.DInt(j)))
+				a := sqlbase.DatumToEncDatum(columnTypeInt, tree.NewDInt(tree.DInt(i)))
+				b := sqlbase.DatumToEncDatum(columnTypeInt, tree.NewDInt(tree.DInt(j)))
 				row := sqlbase.EncDatumRow{a, b}
-				mrc.PushRow(row)
+				if status := mrc.Push(row, nil /* meta */); status != NeedMoreRows {
+					producerErr <- errors.Errorf("producer error: unexpected response: %d", status)
+				}
 			}
-			var err error
 			if i == 3 {
-				err = fmt.Errorf("Test error")
+				err := fmt.Errorf("Test error")
+				mrc.Push(nil /* row */, &ProducerMetadata{Err: err})
 			}
-			mrc.Close(err)
+			mrc.ProducerDone()
 		}(i)
 	}
+	foundErr := false
 	for {
-		row, err := mrc.NextRow()
-		if err != nil {
-			if err.Error() != "Test error" {
-				t.Error(err)
+		row, meta := mrc.Next()
+		if meta != nil && meta.Err != nil {
+			if meta.Err.Error() != "Test error" {
+				t.Error(meta.Err)
+			} else {
+				foundErr = true
 			}
+		}
+		if row == nil && meta == nil {
 			break
 		}
-		if row == nil {
-			t.Error("Did not receive expected error")
-		}
+	}
+	select {
+	case err := <-producerErr:
+		t.Fatal(err)
+	default:
+	}
+	if !foundErr {
+		t.Error("Did not receive expected error")
 	}
 }

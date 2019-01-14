@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 
-set -xeuo pipefail
+set -euxo pipefail
 
-source "$(dirname "${0}")"/../../build/init-docker.sh
-"$(dirname "${0}")"/../../build/builder.sh make install GOFLAGS='-tags clockoffset'
+"$(dirname "${0}")"/prepare.sh
 
 # The log files that should be created by -l below can only
 # be created if the parent directory already exists. Ensure
@@ -11,4 +10,6 @@ source "$(dirname "${0}")"/../../build/init-docker.sh
 mkdir -p artifacts/acceptance
 export TMPDIR=$PWD/artifacts/acceptance
 
-go test -tags acceptance ./pkg/acceptance ${GOFLAGS-} -run "${TESTS-.}" -timeout ${TESTTIMEOUT-10m} ${TESTFLAGS--v -nodes 3} -l "$TMPDIR"
+# For the acceptance tests that run without Docker.
+make build
+make test PKG=./pkg/acceptance TESTTIMEOUT="${TESTTIMEOUT-30m}" TAGS=acceptance TESTFLAGS="${TESTFLAGS--v} -l $TMPDIR"

@@ -11,19 +11,19 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Irfan Sharif (irfansharif@cockroachlabs.com)
 
 package distsqlrun
 
 import (
+	"context"
+	"fmt"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-
-	"golang.org/x/net/context"
 )
 
 func TestDistinct(t *testing.T) {
@@ -31,17 +31,19 @@ func TestDistinct(t *testing.T) {
 
 	v := [15]sqlbase.EncDatum{}
 	for i := range v {
-		v[i] = sqlbase.DatumToEncDatum(sqlbase.ColumnType{Kind: sqlbase.ColumnType_INT},
-			parser.NewDInt(parser.DInt(i)))
+		v[i] = sqlbase.DatumToEncDatum(sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT},
+			tree.NewDInt(tree.DInt(i)))
 	}
 
 	testCases := []struct {
-		spec     DistinctSpec
+		spec     distsqlpb.DistinctSpec
 		input    sqlbase.EncDatumRows
 		expected sqlbase.EncDatumRows
 	}{
 		{
-			spec: DistinctSpec{},
+			spec: distsqlpb.DistinctSpec{
+				DistinctColumns: []uint32{0, 1},
+			},
 			input: sqlbase.EncDatumRows{
 				{v[2], v[3]},
 				{v[5], v[6]},
@@ -58,9 +60,11 @@ func TestDistinct(t *testing.T) {
 				{v[3], v[5]},
 				{v[2], v[9]},
 			},
-		}, {
-			spec: DistinctSpec{
-				OrderedColumns: []uint32{1},
+		},
+		{
+			spec: distsqlpb.DistinctSpec{
+				OrderedColumns:  []uint32{1},
+				DistinctColumns: []uint32{0, 1},
 			},
 			input: sqlbase.EncDatumRows{
 				{v[2], v[3]},
@@ -79,33 +83,115 @@ func TestDistinct(t *testing.T) {
 				{v[5], v[6]},
 			},
 		},
+		{
+			spec: distsqlpb.DistinctSpec{
+				OrderedColumns:  []uint32{1},
+				DistinctColumns: []uint32{1},
+			},
+			input: sqlbase.EncDatumRows{
+				{v[2], v[3]},
+				{v[2], v[3]},
+				{v[2], v[6]},
+				{v[2], v[9]},
+				{v[3], v[5]},
+				{v[5], v[6]},
+				{v[6], v[6]},
+				{v[7], v[6]},
+			},
+			expected: sqlbase.EncDatumRows{
+				{v[2], v[3]},
+				{v[2], v[6]},
+				{v[2], v[9]},
+				{v[3], v[5]},
+				{v[5], v[6]},
+			},
+		},
 	}
 
 	for _, c := range testCases {
-		ds := c.spec
+		t.Run("", func(t *testing.T) {
+			ds := c.spec
 
-		in := &RowBuffer{Rows: c.input}
-		out := &RowBuffer{}
+			in := NewRowBuffer(twoIntCols, c.input, RowBufferArgs{})
+			out := &RowBuffer{}
 
-		flowCtx := FlowCtx{
-			Context: context.Background(),
-		}
+			st := cluster.MakeTestingClusterSettings()
+			evalCtx := tree.MakeTestingEvalContext(st)
+			defer evalCtx.Stop(context.Background())
+			flowCtx := FlowCtx{
+				Settings: st,
+				EvalCtx:  &evalCtx,
+			}
 
-		d, err := newDistinct(&flowCtx, &ds, in, out)
-		if err != nil {
-			t.Fatal(err)
-		}
+			d, err := NewDistinct(&flowCtx, 0 /* processorID */, &ds, in, &distsqlpb.PostProcessSpec{}, out)
+			if err != nil {
+				t.Fatal(err)
+			}
 
-		d.Run(nil)
-		if out.Err != nil {
-			t.Fatal(out.Err)
-		}
-		if !out.Closed {
-			t.Fatalf("output RowReceiver not closed")
-		}
+			d.Run(context.Background())
+			if !out.ProducerClosed {
+				t.Fatalf("output RowReceiver not closed")
+			}
+			var res sqlbase.EncDatumRows
+			for {
+				row := out.NextNoMeta(t).Copy()
+				if row == nil {
+					break
+				}
+				res = append(res, row)
+			}
 
-		if result := out.Rows.String(); result != c.expected.String() {
-			t.Errorf("invalid results: %s, expected %s'", result, c.expected.String())
-		}
+			if result := res.String(twoIntCols); result != c.expected.String(twoIntCols) {
+				t.Errorf("invalid results: %s, expected %s'", result, c.expected.String(twoIntCols))
+			}
+		})
 	}
+}
+
+func benchmarkDistinct(b *testing.B, orderedColumns []uint32) {
+	const numCols = 2
+
+	ctx := context.Background()
+	st := cluster.MakeTestingClusterSettings()
+	evalCtx := tree.MakeTestingEvalContext(st)
+	defer evalCtx.Stop(ctx)
+
+	flowCtx := &FlowCtx{
+		Settings: st,
+		EvalCtx:  &evalCtx,
+	}
+	spec := &distsqlpb.DistinctSpec{
+		DistinctColumns: []uint32{0, 1},
+	}
+	spec.OrderedColumns = orderedColumns
+
+	post := &distsqlpb.PostProcessSpec{}
+	for _, numRows := range []int{1 << 4, 1 << 8, 1 << 12, 1 << 16} {
+		b.Run(fmt.Sprintf("rows=%d", numRows), func(b *testing.B) {
+			input := NewRepeatableRowSource(twoIntCols, makeIntRows(numRows, numCols))
+
+			b.SetBytes(int64(8 * numRows * numCols))
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				d, err := NewDistinct(flowCtx, 0 /* processorID */, spec, input, post, &RowDisposer{})
+				if err != nil {
+					b.Fatal(err)
+				}
+				d.Run(context.Background())
+				input.Reset()
+			}
+		})
+	}
+}
+
+func BenchmarkOrderedDistinct(b *testing.B) {
+	benchmarkDistinct(b, []uint32{0, 1})
+}
+
+func BenchmarkPartiallyOrderedDistinct(b *testing.B) {
+	benchmarkDistinct(b, []uint32{0})
+}
+
+func BenchmarkUnorderedDistinct(b *testing.B) {
+	benchmarkDistinct(b, []uint32{})
 }

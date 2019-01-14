@@ -11,14 +11,12 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tamir Duberstein (tamird@gmail.com)
 
 // This utility detects new tests added in a given pull request, and runs them
 // under stress in our CI infrastructure.
 //
 // Note that this program will directly exec `make`, so there is no need to
-// process its output. See build/teamcity- test{,race}.sh for usage examples.
+// process its output. See build/teamcity-test{,race}.sh for usage examples.
 //
 // Note that our CI infrastructure has no notion of "pull requests", forcing
 // the approach taken here be quite brute-force with respect to its use of the
@@ -41,9 +39,8 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/oauth2"
-
 	"github.com/google/go-github/github"
+	"golang.org/x/oauth2"
 )
 
 const githubAPITokenEnv = "GITHUB_API_TOKEN"
@@ -54,8 +51,13 @@ const makeTargetEnv = "TARGET"
 //
 // It is a Test (say) if there is a character after Test that is not a lower-case letter.
 // We don't want TesticularCancer.
-var newGoTestRE = regexp.MustCompile(`^\+\s*func (Test[^a-z]\w*)\(.*\*testing\.TB?\) {$`)
-var newGoBenchmarkRE = regexp.MustCompile(`^\+\s*func (Benchmark[^a-z]\w*)\(.*\*testing\.T?B\) {$`)
+const goTestStr = `func (Test[^a-z]\w*)\(.*\*testing\.TB?\) {$`
+const goBenchmarkStr = `func (Benchmark[^a-z]\w*)\(.*\*testing\.T?B\) {$`
+
+var currentGoTestRE = regexp.MustCompile(`.*` + goTestStr)
+var currentGoBenchmarkRE = regexp.MustCompile(`.*` + goBenchmarkStr)
+var newGoTestRE = regexp.MustCompile(`^\+\s*` + goTestStr)
+var newGoBenchmarkRE = regexp.MustCompile(`^\+\s*` + goBenchmarkStr)
 
 type pkg struct {
 	tests, benchmarks []string
@@ -70,6 +72,8 @@ func pkgsFromDiff(r io.Reader) (map[string]pkg, error) {
 	pkgs := make(map[string]pkg)
 
 	var curPkgName string
+	var curTestName string
+	var curBenchmarkName string
 	var inPrefix bool
 	for reader := bufio.NewReader(r); ; {
 		line, isPrefix, err := reader.ReadLine()
@@ -100,8 +104,85 @@ func pkgsFromDiff(r io.Reader) (map[string]pkg, error) {
 			curPkg := pkgs[curPkgName]
 			curPkg.benchmarks = append(curPkg.benchmarks, string(newGoBenchmarkRE.ReplaceAll(line, []byte(replacement))))
 			pkgs[curPkgName] = curPkg
+		case currentGoTestRE.Match(line):
+			curTestName = ""
+			curBenchmarkName = ""
+			if !bytes.HasPrefix(line, []byte{'-'}) {
+				curTestName = string(currentGoTestRE.ReplaceAll(line, []byte(replacement)))
+			}
+		case currentGoBenchmarkRE.Match(line):
+			curTestName = ""
+			curBenchmarkName = ""
+			if !bytes.HasPrefix(line, []byte{'-'}) {
+				curBenchmarkName = string(currentGoBenchmarkRE.ReplaceAll(line, []byte(replacement)))
+			}
+		case bytes.HasPrefix(line, []byte{'-'}) && bytes.Contains(line, []byte(".Skip")):
+			if curPkgName != "" {
+				switch {
+				case len(curTestName) > 0:
+					if !(curPkgName == "build" && curTestName == "TestStyle") {
+						curPkg := pkgs[curPkgName]
+						curPkg.tests = append(curPkg.tests, curTestName)
+						pkgs[curPkgName] = curPkg
+					}
+				case len(curBenchmarkName) > 0:
+					curPkg := pkgs[curPkgName]
+					curPkg.benchmarks = append(curPkg.benchmarks, curBenchmarkName)
+					pkgs[curPkgName] = curPkg
+				}
+			}
 		}
 	}
+}
+
+func findPullRequest(
+	ctx context.Context, client *github.Client, org, repo, sha string,
+) *github.PullRequest {
+	opts := &github.PullRequestListOptions{
+		ListOptions: github.ListOptions{PerPage: 100},
+	}
+	for {
+		pulls, resp, err := client.PullRequests.List(ctx, org, repo, opts)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		for _, pull := range pulls {
+			if *pull.Head.SHA == sha {
+				return pull
+			}
+		}
+
+		if resp.NextPage == 0 {
+			return nil
+		}
+		opts.Page = resp.NextPage
+	}
+}
+
+func ghClient(ctx context.Context) *github.Client {
+	var httpClient *http.Client
+	if token, ok := os.LookupEnv(githubAPITokenEnv); ok {
+		httpClient = oauth2.NewClient(ctx, oauth2.StaticTokenSource(
+			&oauth2.Token{AccessToken: token},
+		))
+	} else {
+		log.Printf("GitHub API token environment variable %s is not set", githubAPITokenEnv)
+	}
+	return github.NewClient(httpClient)
+}
+
+func getDiff(
+	ctx context.Context, client *github.Client, org, repo string, prNum int,
+) (string, error) {
+	diff, _, err := client.PullRequests.GetRaw(
+		ctx,
+		org,
+		repo,
+		prNum,
+		github.RawOptions{Type: github.Diff},
+	)
+	return diff, err
 }
 
 func main() {
@@ -123,68 +204,91 @@ func main() {
 		log.Fatal(err)
 	}
 
-	var httpClient *http.Client
-	if token, ok := os.LookupEnv(githubAPITokenEnv); ok {
-		httpClient = oauth2.NewClient(context.Background(), oauth2.StaticTokenSource(
-			&oauth2.Token{AccessToken: token},
-		))
-	} else {
-		log.Printf("GitHub API token environment variable %s is not set", githubAPITokenEnv)
-	}
-	client := github.NewClient(httpClient)
+	ctx := context.Background()
+	client := ghClient(ctx)
 
-	pulls, _, err := client.PullRequests.List(org, repo, nil)
-	if err != nil {
-		log.Fatal(err)
-	}
-	var currentPull *github.PullRequest
-	for _, pull := range pulls {
-		if *pull.Head.SHA == sha {
-			currentPull = pull
-			break
-		}
-	}
+	currentPull := findPullRequest(ctx, client, org, repo, sha)
 	if currentPull == nil {
 		log.Printf("SHA %s not found in open pull requests, skipping stress", sha)
 		return
 	}
 
-	diff, _, err := client.PullRequests.GetRaw(
-		org,
-		repo,
-		*currentPull.Number,
-		github.RawOptions{Type: github.Patch},
-	)
+	diff, err := getDiff(ctx, client, org, repo, *currentPull.Number)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	pkgs, err := pkgsFromDiff(strings.NewReader(diff))
-	if err != nil {
-		log.Fatal(err)
-	}
-	if len(pkgs) > 0 {
-		// 5 minutes total seems OK.
-		duration := (5 * time.Minute) / time.Duration(len(pkgs))
-		for name, pkg := range pkgs {
-			tests := "-"
-			if len(pkg.tests) > 0 {
-				tests = "(" + strings.Join(pkg.tests, "|") + ")"
+	if target == "checkdeps" {
+		var vendorChanged bool
+		for _, path := range []string{"Gopkg.lock", "vendor"} {
+			if strings.Contains(diff, fmt.Sprintf("\n--- a/%[1]s\n+++ b/%[1]s\n", path)) {
+				vendorChanged = true
+				break
 			}
-
-			cmd := exec.Command(
-				"make",
-				target,
-				fmt.Sprintf("PKG=./%s", name),
-				fmt.Sprintf("TESTS=%s", tests),
-				fmt.Sprintf("STRESSFLAGS=-stderr -maxfails 1 -maxtime %s", duration),
-			)
+		}
+		if vendorChanged {
+			cmd := exec.Command("dep", "ensure", "-v")
 			cmd.Dir = crdb.Dir
 			cmd.Stdout = os.Stdout
 			cmd.Stderr = os.Stderr
 			log.Println(cmd.Args)
 			if err := cmd.Run(); err != nil {
 				log.Fatal(err)
+			}
+
+			// Check for diffs.
+			var foundDiff bool
+			for _, dir := range []string{filepath.Join(crdb.Dir, "vendor"), crdb.Dir} {
+				cmd := exec.Command("git", "diff")
+				cmd.Dir = dir
+				log.Println(cmd.Dir, cmd.Args)
+				if output, err := cmd.CombinedOutput(); err != nil {
+					log.Fatalf("%s: %s", err, string(output))
+				} else if len(output) > 0 {
+					foundDiff = true
+					log.Printf("unexpected diff:\n%s", output)
+				}
+			}
+			if foundDiff {
+				os.Exit(1)
+			}
+		}
+	} else {
+		pkgs, err := pkgsFromDiff(strings.NewReader(diff))
+		if err != nil {
+			log.Fatal(err)
+		}
+		if len(pkgs) > 0 {
+			// 5 minutes total seems OK, but at least a minute per test.
+			duration := (5 * time.Minute) / time.Duration(len(pkgs))
+			if duration < time.Minute {
+				duration = time.Minute
+			}
+			// Use a timeout shorter than the duration so that hanging tests don't
+			// get a free pass.
+			timeout := (3 * duration) / 4
+			for name, pkg := range pkgs {
+				tests := "-"
+				if len(pkg.tests) > 0 {
+					tests = "(" + strings.Join(pkg.tests, "|") + ")"
+				}
+
+				cmd := exec.Command(
+					"make",
+					target,
+					fmt.Sprintf("PKG=./%s", name),
+					fmt.Sprintf("TESTS=%s", tests),
+					fmt.Sprintf("TESTTIMEOUT=%s", timeout),
+					fmt.Sprintf("STRESSFLAGS=-stderr -maxfails 1 -maxtime %s", duration),
+				)
+				cmd.Env = append(os.Environ(), "COCKROACH_NIGHTLY_STRESS=true")
+				cmd.Dir = crdb.Dir
+				cmd.Stdout = os.Stdout
+				cmd.Stderr = os.Stderr
+				log.Println(cmd.Args)
+				if err := cmd.Run(); err != nil {
+					log.Fatal(err)
+				}
 			}
 		}
 	}

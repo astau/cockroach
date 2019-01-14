@@ -11,108 +11,76 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Jibson (mjibson@cockroachlabs.com)
 
 package sql
 
 import (
-	"bytes"
+	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/pkg/errors"
 )
 
-// returningHelper implements the logic used for statements with RETURNING clauses. It accumulates
-// result rows, one for each call to append().
-type returningHelper struct {
-	p *planner
-	// Expected columns.
-	columns ResultColumns
-	// Processed copies of expressions from ReturningExprs.
-	exprs        []parser.TypedExpr
-	rowCount     int
-	source       *dataSourceInfo
-	curSourceRow parser.DTuple
-
-	// This struct must be allocated on the heap and its location stay
-	// stable after construction because it implements
-	// IndexedVarContainer and the IndexedVar objects in sub-expressions
-	// will link to it by reference after checkRenderStar / analyzeExpr.
-	// Enforce this using NoCopy.
-	noCopy util.NoCopy
+// resultsNeeded determines whether a statement that might have a
+// RETURNING clause needs to provide values for result rows for a
+// downstream plan.
+func resultsNeeded(r tree.ReturningClause) bool {
+	switch t := r.(type) {
+	case *tree.ReturningExprs:
+		return true
+	case *tree.ReturningNothing, *tree.NoReturningClause:
+		return false
+	default:
+		panic(errors.Errorf("unexpected ReturningClause type: %T", t))
+	}
 }
 
-// newReturningHelper creates a new returningHelper for use by an
-// insert/update node.
-func (p *planner) newReturningHelper(
-	r parser.ReturningExprs,
-	desiredTypes []parser.Type,
-	alias string,
-	tablecols []sqlbase.ColumnDescriptor,
-) (*returningHelper, error) {
-	rh := &returningHelper{
-		p: p,
-	}
-	if len(r) == 0 {
-		return rh, nil
-	}
+// Returning wraps the given source node in a way suitable for the
+// given RETURNING specification.
+func (p *planner) Returning(
+	ctx context.Context,
+	source batchedPlanNode,
+	r tree.ReturningClause,
+	desiredTypes []types.T,
+	tn *tree.TableName,
+) (planNode, error) {
+	// serialize the data-modifying plan to ensure that no data is
+	// observed that hasn't been validated first. See the comments
+	// on BatchedNext() in plan_batch.go.
 
-	for _, e := range r {
-		if err := p.parser.AssertNoAggregationOrWindowing(
-			e.Expr, "RETURNING", p.session.SearchPath,
-		); err != nil {
-			return nil, err
+	switch t := r.(type) {
+	case *tree.ReturningNothing, *tree.NoReturningClause:
+		// We could use serializeNode here, but using rowCountNode is an
+		// optimization that saves on calls to Next() by the caller.
+		return &rowCountNode{source: source}, nil
+
+	case *tree.ReturningExprs:
+		serialized := &serializeNode{source: source}
+		info := sqlbase.NewSourceInfoForSingleTable(*tn, planColumns(source))
+		r := &renderNode{
+			source:     planDataSource{info: info, plan: serialized},
+			sourceInfo: sqlbase.MultiSourceInfo{info},
 		}
-	}
 
-	rh.columns = make(ResultColumns, 0, len(r))
-	aliasTableName := parser.TableName{TableName: parser.Name(alias)}
-	rh.source = newSourceInfoForSingleTable(aliasTableName, makeResultColumns(tablecols))
-	rh.exprs = make([]parser.TypedExpr, 0, len(r))
-	ivarHelper := parser.MakeIndexedVarHelper(rh, len(tablecols))
-	for _, target := range r {
-		cols, typedExprs, _, err := p.computeRender(target, parser.TypeAny, rh.source, ivarHelper, true)
+		// We need to save and restore the previous value of the field in
+		// semaCtx in case we are recursively called within a subquery
+		// context.
+		defer p.semaCtx.Properties.Restore(p.semaCtx.Properties)
+
+		// Ensure there are no special functions in the RETURNING clause.
+		p.semaCtx.Properties.Require("RETURNING", tree.RejectSpecial)
+
+		err := p.initTargets(ctx, r, tree.SelectExprs(*t), desiredTypes)
 		if err != nil {
 			return nil, err
 		}
-		rh.columns = append(rh.columns, cols...)
-		rh.exprs = append(rh.exprs, typedExprs...)
+
+		return r, nil
+
+	default:
+		return nil, pgerror.NewAssertionErrorf("unexpected ReturningClause type: %T", t)
 	}
-	return rh, nil
-}
-
-// cookResultRow prepares a row according to the ReturningExprs, with input values
-// from rowVals.
-func (rh *returningHelper) cookResultRow(rowVals parser.DTuple) (parser.DTuple, error) {
-	if rh.exprs == nil {
-		rh.rowCount++
-		return rowVals, nil
-	}
-	rh.curSourceRow = rowVals
-	resRow := make(parser.DTuple, len(rh.exprs))
-	for i, e := range rh.exprs {
-		d, err := e.Eval(&rh.p.evalCtx)
-		if err != nil {
-			return nil, err
-		}
-		resRow[i] = d
-	}
-	return resRow, nil
-}
-
-// IndexedVarEval implements the parser.IndexedVarContainer interface.
-func (rh *returningHelper) IndexedVarEval(idx int, ctx *parser.EvalContext) (parser.Datum, error) {
-	return rh.curSourceRow[idx].Eval(ctx)
-}
-
-// IndexedVarResolvedType implements the parser.IndexedVarContainer interface.
-func (rh *returningHelper) IndexedVarResolvedType(idx int) parser.Type {
-	return rh.source.sourceColumns[idx].Typ
-}
-
-// IndexedVarFormat implements the parser.IndexedVarContainer interface.
-func (rh *returningHelper) IndexedVarFormat(buf *bytes.Buffer, f parser.FmtFlags, idx int) {
-	rh.source.FormatVar(buf, f, idx)
 }

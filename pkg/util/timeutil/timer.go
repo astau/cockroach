@@ -11,12 +11,20 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Nathan VanBenschoten (nvanbenschoten@gmail.com)
 
 package timeutil
 
-import "time"
+import (
+	"sync"
+	"time"
+)
+
+var timerPool = sync.Pool{
+	New: func() interface{} {
+		return &Timer{}
+	},
+}
+var timeTimerPool sync.Pool
 
 // The Timer type represents a single event. When the Timer expires,
 // the current time will be sent on Timer.C.
@@ -46,25 +54,39 @@ import "time"
 // not begin counting down until Reset is called for the first time, as
 // there is no constructor function.
 type Timer struct {
-	*time.Timer
+	timer *time.Timer
+	// C is a local "copy" of timer.C that can be used in a select case before
+	// the timer has been initialized (via Reset).
+	C    <-chan time.Time
 	Read bool
+}
+
+// NewTimer allocates a new timer.
+func NewTimer() *Timer {
+	return timerPool.Get().(*Timer)
 }
 
 // Reset changes the timer to expire after duration d and returns
 // the new value of the timer. This method includes the fix proposed
 // in https://github.com/golang/go/issues/11513#issuecomment-157062583,
 // but requires users of Timer to set Timer.Read to true whenever
-// they successfully read from the Timer's channel. Reset operates on
-// and returns a value so that Timer can be stack allocated.
+// they successfully read from the Timer's channel.
 func (t *Timer) Reset(d time.Duration) {
-	if t.Timer == nil {
-		t.Timer = time.NewTimer(d)
+	if t.timer == nil {
+		switch timer := timeTimerPool.Get(); timer {
+		case nil:
+			t.timer = time.NewTimer(d)
+		default:
+			t.timer = timer.(*time.Timer)
+			t.timer.Reset(d)
+		}
+		t.C = t.timer.C
 		return
 	}
-	if !t.Timer.Stop() && !t.Read {
+	if !t.timer.Stop() && !t.Read {
 		<-t.C
 	}
-	t.Timer.Reset(d)
+	t.timer.Reset(d)
 	t.Read = false
 }
 
@@ -73,8 +95,16 @@ func (t *Timer) Reset(d time.Duration) {
 // or had never been initialized with a call to Timer.Reset. Stop does not
 // close the channel, to prevent a read from succeeding incorrectly.
 func (t *Timer) Stop() bool {
-	if t.Timer == nil {
-		return false
+	var res bool
+	if t.timer != nil {
+		res = t.timer.Stop()
+		if res {
+			// Only place the timer back in the pool if we successfully stopped
+			// it. Otherwise, we'd have to read from the channel if !t.Read.
+			timeTimerPool.Put(t.timer)
+		}
 	}
-	return t.Timer.Stop()
+	*t = Timer{}
+	timerPool.Put(t)
+	return res
 }

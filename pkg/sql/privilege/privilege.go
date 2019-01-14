@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
 
 package privilege
 
@@ -20,6 +18,8 @@ import (
 	"bytes"
 	"sort"
 	"strings"
+
+	"github.com/pkg/errors"
 )
 
 //go:generate stringer -type=Kind
@@ -58,6 +58,18 @@ var ByValue = [...]Kind{
 	ALL, CREATE, DROP, GRANT, SELECT, INSERT, DELETE, UPDATE,
 }
 
+// ByName is a map of string -> kind value.
+var ByName = map[string]Kind{
+	"ALL":    ALL,
+	"CREATE": CREATE,
+	"DROP":   DROP,
+	"GRANT":  GRANT,
+	"SELECT": SELECT,
+	"INSERT": INSERT,
+	"DELETE": DELETE,
+	"UPDATE": UPDATE,
+}
+
 // List is a list of privileges.
 type List []Kind
 
@@ -77,7 +89,7 @@ func (pl List) Less(i, j int) bool {
 // names returns a list of privilege names in the same
 // order as 'pl'.
 func (pl List) names() []string {
-	ret := make([]string, len(pl), len(pl))
+	ret := make([]string, len(pl))
 	for i, p := range pl {
 		ret[i] = p.String()
 	}
@@ -137,4 +149,19 @@ func ListFromBitField(m uint32) List {
 		}
 	}
 	return ret
+}
+
+// ListFromStrings takes a list of strings and attempts to build a list of Kind.
+// We convert each string to uppercase and search for it in the ByName map.
+// If an entry is not found in ByName, an error is returned.
+func ListFromStrings(strs []string) (List, error) {
+	ret := make(List, len(strs))
+	for i, s := range strs {
+		k, ok := ByName[strings.ToUpper(s)]
+		if !ok {
+			return nil, errors.Errorf("not a valid privilege: %q", s)
+		}
+		ret[i] = k
+	}
+	return ret, nil
 }

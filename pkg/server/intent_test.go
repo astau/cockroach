@@ -11,18 +11,15 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf
 
 package server
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"sort"
 	"testing"
-
-	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
@@ -36,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
 
+// TODO(benesch): move this test to somewhere more specific than package server.
 func TestIntentResolution(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -84,7 +82,7 @@ func TestIntentResolution(t *testing.T) {
 			var mu syncutil.Mutex
 			closer := make(chan struct{}, 2)
 			var done bool
-			storeKnobs.TestingCommandFilter =
+			storeKnobs.EvalKnobs.TestingEvalFilter =
 				func(filterArgs storagebase.FilterArgs) *roachpb.Error {
 					mu.Lock()
 					defer mu.Unlock()
@@ -114,16 +112,20 @@ func TestIntentResolution(t *testing.T) {
 					}
 					return nil
 				}
+			// Prevent the merge queue from immediately discarding our splits.
+			storeKnobs.DisableMergeQueue = true
 
+			// TODO(benesch): starting a test server for every test case is needlessly
+			// inefficient.
 			s, _, kvDB := serverutils.StartServer(t, base.TestServerArgs{
 				Knobs: base.TestingKnobs{Store: &storeKnobs}})
-			defer s.Stopper().Stop()
+			defer s.Stopper().Stop(context.TODO())
 			// Split the Range. This should not have any asynchronous intents.
-			if err := kvDB.AdminSplit(context.TODO(), splitKey); err != nil {
+			if err := kvDB.AdminSplit(context.TODO(), splitKey, splitKey); err != nil {
 				t.Fatal(err)
 			}
 
-			if err := kvDB.Txn(context.TODO(), func(txn *client.Txn) error {
+			if err := kvDB.Txn(context.TODO(), func(ctx context.Context, txn *client.Txn) error {
 				b := txn.NewBatch()
 				if tc.keys[0] >= string(splitKey) {
 					t.Fatalf("first key %s must be < split key %s", tc.keys[0], splitKey)
@@ -135,7 +137,7 @@ func TestIntentResolution(t *testing.T) {
 					log.Infof(context.Background(), "%d: %s: local: %t", i, key, local)
 					if local {
 						b.Put(key, "test")
-					} else if err := txn.Put(key, "test"); err != nil {
+					} else if err := txn.Put(ctx, key, "test"); err != nil {
 						return err
 					}
 				}
@@ -145,12 +147,12 @@ func TestIntentResolution(t *testing.T) {
 					log.Infof(context.Background(), "%d: [%s,%s): local: %t", i, kr[0], kr[1], local)
 					if local {
 						b.DelRange(kr[0], kr[1], false)
-					} else if err := txn.DelRange(kr[0], kr[1]); err != nil {
+					} else if err := txn.DelRange(ctx, kr[0], kr[1]); err != nil {
 						return err
 					}
 				}
 
-				return txn.CommitInBatch(b)
+				return txn.CommitInBatch(ctx, b)
 			}); err != nil {
 				t.Fatalf("%d: %s", i, err)
 			}

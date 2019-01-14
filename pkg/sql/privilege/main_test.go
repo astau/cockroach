@@ -11,14 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf (tobias.schottdorf@gmail.com)
 
 package privilege_test
 
-import
-
-// Needed for the -verbosity flag on circleci tests.
-_ "github.com/cockroachdb/cockroach/pkg/util/log"
+import _ "github.com/cockroachdb/cockroach/pkg/util/log"
 
 //go:generate ../../util/leaktest/add-leaktest.sh *_test.go

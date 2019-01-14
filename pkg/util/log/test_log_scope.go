@@ -11,25 +11,28 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
 
 package log
 
 import (
+	"fmt"
 	"io"
 	"io/ioutil"
 	"os"
-	"strings"
+	"runtime"
 
-	"github.com/cockroachdb/cockroach/pkg/util/caller"
+	"github.com/cockroachdb/cockroach/pkg/util/fileutil"
+	"github.com/pkg/errors"
 )
 
 // TestLogScope represents the lifetime of a logging output.  It
 // ensures that the log files are stored in a directory specific to a
 // test, and asserts that logging output is not written to this
 // directory beyond the lifetime of the scope.
-type TestLogScope string
+type TestLogScope struct {
+	logDir  string
+	cleanup func()
+}
 
 // tShim is the part of testing.T used by TestLogScope.
 // We can't use testing.T directly because we have
@@ -39,77 +42,145 @@ type tShim interface {
 	Failed() bool
 	Error(...interface{})
 	Errorf(fmt string, args ...interface{})
+	Name() string
+	Log(...interface{})
+	Logf(fmt string, args ...interface{})
 }
 
-// Scope creates a TestLogScope which corresponds to the lifetime of a
-// logging directory. If testName is empty, the logging directory is
-// named after the caller of Scope, up `skip` caller levels. It also
-// disables logging to stderr for severity levels below ERROR.
-func Scope(t tShim, testName string) TestLogScope {
-	if testName == "" {
-		testName = "logUnknown"
-		if _, _, f := caller.Lookup(1); f != "" {
-			parts := strings.Split(f, ".")
-			testName = "log" + parts[len(parts)-1]
-		}
+// showLogs is used for testing
+var showLogs bool
+
+// Scope creates a TestLogScope which corresponds to the lifetime of a logging
+// directory. The logging directory is named after the calling test. It also
+// disables logging to stderr.
+func Scope(t tShim) *TestLogScope {
+	if showLogs {
+		return (*TestLogScope)(nil)
 	}
-	tempDir, err := ioutil.TempDir("", testName)
+
+	scope := ScopeWithoutShowLogs(t)
+	t.Log("use -show-logs to present logs inline")
+	return scope
+}
+
+// ScopeWithoutShowLogs ignores the -show-logs flag and should be used for tests
+// that require the logs go to files.
+func ScopeWithoutShowLogs(t tShim) *TestLogScope {
+	tempDir, err := ioutil.TempDir("", "log"+fileutil.EscapeFilename(t.Name()))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := dirTestOverride(tempDir); err != nil {
+	if err := dirTestOverride("", tempDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := EnableLogFileOutput(tempDir, Severity_ERROR); err != nil {
+	undo, err := enableLogFileOutput(tempDir, Severity_NONE)
+	if err != nil {
+		undo()
 		t.Fatal(err)
 	}
-	return TestLogScope(tempDir)
+	t.Logf("test logs captured to: %s", tempDir)
+	return &TestLogScope{logDir: tempDir, cleanup: undo}
+}
+
+// enableLogFileOutput turns on logging using the specified directory.
+// For unittesting only.
+func enableLogFileOutput(dir string, stderrSeverity Severity) (func(), error) {
+	logging.mu.Lock()
+	defer logging.mu.Unlock()
+	oldStderrThreshold := logging.stderrThreshold
+	oldNoStderrRedirect := logging.noStderrRedirect
+
+	undo := func() {
+		logging.mu.Lock()
+		defer logging.mu.Unlock()
+		logging.stderrThreshold = oldStderrThreshold
+		logging.noStderrRedirect = oldNoStderrRedirect
+	}
+	logging.stderrThreshold = stderrSeverity
+	logging.noStderrRedirect = true
+	return undo, logging.logDir.Set(dir)
 }
 
 // Close cleans up a TestLogScope. The directory and its contents are
 // deleted, unless the test has failed and the directory is non-empty.
-func (l TestLogScope) Close(t tShim) {
+func (l *TestLogScope) Close(t tShim) {
+	// Ensure any remaining logs are written.
+	Flush()
+
+	if l == nil {
+		// Never initialized.
+		return
+	}
 	defer func() {
 		// Check whether there is something to remove.
-		emptyDir, err := isDirEmpty(string(l))
+		emptyDir, err := isDirEmpty(l.logDir)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if t.Failed() && !emptyDir {
-			// If the test failed, we keep the log files for further investigation,
-			// but only if there were any.
-			t.Errorf("test log files left over in: %s", l)
+		inPanic := calledDuringPanic()
+		if (t.Failed() && !emptyDir) || inPanic {
+			// If the test failed or there was a panic, we keep the log
+			// files for further investigation.
+			if inPanic {
+				fmt.Fprintln(OrigStderr, "\nERROR: a panic has occurred!\n"+
+					"Details cannot be printed yet because we are still unwinding.\n"+
+					"Hopefully the test harness prints the panic below, otherwise check the test logs.\n")
+			}
+			fmt.Fprintln(OrigStderr, "test logs left over in:", l.logDir)
 		} else {
 			// Clean up.
-			if err := os.RemoveAll(string(l)); err != nil {
+			if err := os.RemoveAll(l.logDir); err != nil {
 				t.Error(err)
 			}
 		}
 	}()
+	defer l.cleanup()
+
 	// Flush/Close the log files.
-	if err := dirTestOverride(""); err != nil {
+	if err := dirTestOverride(l.logDir, ""); err != nil {
 		t.Fatal(err)
 	}
 }
 
+// calledDuringPanic returns true if panic() is one of its callers.
+func calledDuringPanic() bool {
+	var pcs [40]uintptr
+	runtime.Callers(2, pcs[:])
+	frames := runtime.CallersFrames(pcs[:])
+
+	for {
+		f, more := frames.Next()
+		if f.Function == "runtime.gopanic" {
+			return true
+		}
+		if !more {
+			break
+		}
+	}
+	return false
+}
+
 // dirTestOverride sets the default value for the logging output directory
 // for use in tests.
-func dirTestOverride(dir string) error {
-	// Ensure any remaining logs are written.
-	Flush()
+func dirTestOverride(expected, newDir string) error {
+	logging.mu.Lock()
+	defer logging.mu.Unlock()
 
-	logDir.Lock()
-	logDir.name = dir
-	logDir.Unlock()
+	logging.logDir.Lock()
+	// The following check is intended to catch concurrent uses of
+	// Scope() or TestLogScope.Close(), which would be invalid.
+	if logging.logDir.name != expected {
+		logging.logDir.Unlock()
+		return errors.Errorf("unexpected logDir setting: set to %q, expected %q",
+			logging.logDir.name, expected)
+	}
+	logging.logDir.name = newDir
+	logging.logDir.Unlock()
 
 	// When we change the directory we close the current logging
 	// output, so that a rotation to the new directory is forced on
 	// the next logging event.
-	logging.mu.Lock()
-	err := logging.closeFilesLocked()
-	logging.mu.Unlock()
-
-	return err
+	return logging.closeFileLocked()
 }
 
 func isDirEmpty(dirname string) (bool, error) {

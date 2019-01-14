@@ -1,6 +1,9 @@
 # About
+
 This document is an updated version of the original design documents
-by Spencer Kimball from early 2014.
+by Spencer Kimball from early 2014. It may not always be completely up to date.
+For a more approachable explanation of how CockroachDB works, consider reading
+the [Architecture docs](https://www.cockroachlabs.com/docs/stable/architecture/overview.html).
 
 # Overview
 
@@ -63,16 +66,17 @@ CockroachDB achieves survivability:
   Japan }`, `{ Ireland, US-East, US-West}`, `{ Ireland, US-East,
   US-West, Japan, Australia }`).
 
-CockroachDB provides [snapshot isolation](http://en.wikipedia.org/wiki/Snapshot_isolation) (SI) and
+CockroachDB provides [snapshot
+isolation](http://en.wikipedia.org/wiki/Snapshot_isolation) (SI) and
 serializable snapshot isolation (SSI) semantics, allowing **externally
-consistent, lock-free reads and writes**--both from a historical
-snapshot timestamp and from the current wall clock time. SI provides
-lock-free reads and writes but still allows write skew. SSI eliminates
-write skew, but introduces a performance hit in the case of a
-contentious system. SSI is the default isolation; clients must
-consciously decide to trade correctness for performance. CockroachDB
-implements [a limited form of linearizability](#linearizability),
-providing ordering for any observer or chain of observers.
+consistent, lock-free reads and writes**--both from a historical snapshot
+timestamp and from the current wall clock time. SI provides lock-free reads
+and writes but still allows write skew. SSI eliminates write skew, but
+introduces a performance hit in the case of a contentious system. SSI is the
+default isolation; clients must consciously decide to trade correctness for
+performance. CockroachDB implements [a limited form of linearizability
+](#strict-serializability-linearizability), providing ordering for any
+observer or chain of observers.
 
 Similar to
 [Spanner](http://static.googleusercontent.com/media/research.google.com/en/us/archive/spanner-osdi2012.pdf)
@@ -151,7 +155,7 @@ System keys come in several subtypes:
 - **Replicated Range ID local** keys store range metadata that is
     present on all of the replicas for a range. These keys are updated
     via Raft operations. Examples include the range lease state and
-    abort cache entries.
+    abort span entries.
 - **Unreplicated Range ID local** keys store range metadata that is
     local to a replica. The primary examples of such keys are the Raft
     state and Raft log.
@@ -345,9 +349,7 @@ There are several scenarios in which transactions interact:
   to proceed; after all, it will be reading an older version of the
   value and so does not conflict. Recall that the write intent may
   be committed with a later timestamp than its candidate; it will
-  never commit with an earlier one. **Side note**: if a SI transaction
-  reader finds an intent with a newer timestamp which the reader’s own
-  transaction has written, the reader always returns that intent's value.
+  never commit with an earlier one. 
 
 - **Reader encounters write intent or value with newer timestamp in the
   near future:** In this case, we have to be careful. The newer
@@ -356,7 +358,7 @@ There are several scenarios in which transactions interact:
   In that case, we would need to take this value into account, but
   we just don't know. Hence the transaction restarts, using instead
   a future timestamp (but remembering a maximum timestamp used to
-  limit the uncertainty window to the maximum clock skew). In fact,
+  limit the uncertainty window to the maximum clock offset). In fact,
   this is optimized further; see the details under "choosing a time
   stamp" below.
 
@@ -468,7 +470,7 @@ Please see [pkg/roachpb/data.proto](https://github.com/cockroachdb/cockroach/blo
 
 **Choosing a Timestamp**
 
-A key challenge of reading data in a distributed system with clock skew
+A key challenge of reading data in a distributed system with clock offset
 is choosing a timestamp guaranteed to be greater than the latest
 timestamp of any committed transaction (in absolute time). No system can
 claim consistency and fail to read already-committed data.
@@ -481,7 +483,7 @@ existing timestamped data on the node.
 For multiple nodes, the timestamp of the node coordinating the
 transaction `t` is used. In addition, a maximum timestamp `t+ε` is
 supplied to provide an upper bound on timestamps for already-committed
-data (`ε` is the maximum clock skew). As the transaction progresses, any
+data (`ε` is the maximum clock offset). As the transaction progresses, any
 data read which have timestamps greater than `t` but less than `t+ε`
 cause the transaction to abort and retry with the conflicting timestamp
 t<sub>c</sub>, where t<sub>c</sub> \> t. The maximum timestamp `t+ε` remains
@@ -805,25 +807,41 @@ In particular, it is desirable to serve authoritative reads from a single
 Replica (ideally from more than one, but that is far more difficult).
 
 For these reasons, Cockroach introduces the concept of **Range Leases**:
-This is a lease held for a slice of (database, i.e. hybrid logical) time and is
-established by committing a special log entry through Raft containing the
-interval the lease is going to be active on, along with the Node:RaftID
-combination that uniquely describes the requesting replica. Reads and writes
-must generally be addressed to the replica holding the lease; if none does, any
-replica may be addressed, causing it to try to obtain the lease synchronously.
-Requests received by a non-lease holder (for the HLC timestamp specified in the
-request's header) fail with an error pointing at the replica's last known
-lease holder. These requests are retried transparently with the updated lease by the
-gateway node and never reach the client.
+This is a lease held for a slice of (database, i.e. hybrid logical) time.
+A replica establishes itself as owning the lease on a range by committing
+a special lease acquisition log entry through raft. The log entry contains
+the replica node's epoch from the node liveness table--a system
+table containing an epoch and an expiration time for each node. A node is
+responsible for continuously updating the expiration time for its entry
+in the liveness table. Once the lease has been committed through raft
+the replica becomes the lease holder as soon as it applies the lease
+acquisition command, guaranteeing that when it uses the lease it has
+already applied all prior writes on the replica and can see them locally.
 
-The replica holding the lease is in charge or involved in handling
-Range-specific maintenance tasks such as
+To prevent two nodes from acquiring the lease, the requestor includes a copy
+of the lease that it believes to be valid at the time it requests the lease.
+If that lease is still valid when the new lease is applied, it is granted,
+or another lease is granted in the interim and the requested lease is
+ignored. A lease can move from node A to node B only after node A's
+liveness record has expired and its epoch has been incremented.
 
-* gossiping the sentinel and/or first range information
-* splitting, merging and rebalancing
+Note: range leases for ranges within the node liveness table keyspace and
+all ranges that precede it, including meta1 and meta2, are not managed using
+the above mechanism to prevent circular dependencies.
 
-and, very importantly, may satisfy reads locally, without incurring the
-overhead of going through Raft.
+A replica holding a lease at a specific epoch can use the lease as long as
+the node epoch hasn't changed and the expiration time hasn't passed.
+The replica holding the lease may satisfy reads locally, without incurring the
+overhead of going through Raft, and is in charge or involved in handling
+Range-specific maintenance tasks such as splitting, merging and rebalancing
+
+All Reads and writes are generally addressed to the replica holding
+the lease; if none does, any replica may be addressed, causing it to try
+to obtain the lease synchronously. Requests received by a non-lease holder
+(for the HLC timestamp specified in the request's header) fail with an
+error pointing at the replica's last known lease holder. These requests
+are retried transparently with the updated lease by the gateway node and
+never reach the client.
 
 Since reads bypass Raft, a new lease holder will, among other things, ascertain
 that its timestamp cache does not report timestamps smaller than the previous
@@ -1045,118 +1063,20 @@ database which is stored in the replicated key-value map.
 
 Time series are stored at Store granularity and allow the admin dashboard
 to efficiently gain visibility into a universe of information at the Cluster,
-Node or Store level. A [periodic background process](RFCS/time_series_culling.md)
+Node or Store level. A [periodic background process](RFCS/20160901_time_series_culling.md)
 culls older timeseries data, downsampling and eventually discarding it.
 
-# Key-prefix Accounting and Zones
+# Zones
 
-Arbitrarily fine-grained accounting is specified via
-key prefixes. Key prefixes can overlap, as is necessary for capturing
-hierarchical relationships. For illustrative purposes, let’s say keys
-specifying rows in a set of databases have the following format:
-
-`<db>:<table>:<primary-key>[:<secondary-key>]`
-
-In this case, we might collect accounting with
-key prefixes:
-
-`db1`, `db1:user`, `db1:order`,
-
-Accounting is kept for the entire map by default.
-
-## Accounting
-to keep accounting for a range defined by a key prefix, an entry is created in
-the accounting system table. The format of accounting table keys is:
-
-`\0acct<key-prefix>`
-
-In practice, we assume each node is capable of caching the
-entire accounting table as it is likely to be relatively small.
-
-Accounting is kept for key prefix ranges with eventual consistency for
-efficiency. There are two types of values which comprise accounting:
-counts and occurrences, for lack of better terms. Counts describe
-system state, such as the total number of bytes, rows,
-etc. Occurrences include transient performance and load metrics. Both
-types of accounting are captured as time series with minute
-granularity. The length of time accounting metrics are kept is
-configurable. Below are examples of each type of accounting value.
-
-**System State Counters/Performance**
-
-- Count of items (e.g. rows)
-- Total bytes
-- Total key bytes
-- Total value length
-- Queued message count
-- Queued message total bytes
-- Count of values \< 16B
-- Count of values \< 64B
-- Count of values \< 256B
-- Count of values \< 1K
-- Count of values \< 4K
-- Count of values \< 16K
-- Count of values \< 64K
-- Count of values \< 256K
-- Count of values \< 1M
-- Count of values \> 1M
-- Total bytes of accounting
-
-
-**Load Occurrences**
-
-- Get op count
-- Get total MB
-- Put op count
-- Put total MB
-- Delete op count
-- Delete total MB
-- Delete range op count
-- Delete range total MB
-- Scan op count
-- Scan op MB
-- Split count
-- Merge count
-
-Because accounting information is kept as time series and over many
-possible metrics of interest, the data can become numerous. Accounting
-data are stored in the map near the key prefix described, in order to
-distribute load (for both aggregation and storage).
-
-Accounting keys for system state have the form:
-`<key-prefix>|acctd<metric-name>*`. Notice the leading ‘pipe’
-character. It’s meant to sort the root level account AFTER any other
-system tables. They must increment the same underlying values as they
-are permanent counts, and not transient activity. Logic at the
-node takes care of snapshotting the value into an appropriately
-suffixed (e.g. with timestamp hour) multi-value time series entry.
-
-Keys for perf/load metrics:
-`<key-prefix>acctd<metric-name><hourly-timestamp>`.
-
-`<hourly-timestamp>`-suffixed accounting entries are multi-valued,
-containing a varint64 entry for each minute with activity during the
-specified hour.
-
-To efficiently keep accounting over large key ranges, the task of
-aggregation must be distributed. If activity occurs within the same
-range as the key prefix for accounting, the updates are made as part
-of the consensus write. If the ranges differ, then a message is sent
-to the parent range to increment the accounting. If upon receiving the
-message, the parent range also does not include the key prefix, it in
-turn forwards it to its parent or left child in the balanced binary
-tree which is maintained to describe the range hierarchy. This limits
-the number of messages before an update is visible at the root to `2*log N`,
-where `N` is the number of ranges in the key prefix.
-
-## Zones
-zones are stored in the map with keys prefixed by
-`\0zone` followed by the key prefix to which the zone
-configuration applies. Zone values specify a protobuf containing
+Zones provide a method for configuring the replication of portions of the
+keyspace. Zone values specify a protobuf containing
 the datacenters from which replicas for ranges which fall under
 the zone must be chosen.
 
-Please see [pkg/config/config.proto](https://github.com/cockroachdb/cockroach/blob/master/pkg/config/config.proto) for up-to-date data structures used, the best entry point being `message ZoneConfig`.
+Please see
+[pkg/config/zone.proto](https://github.com/cockroachdb/cockroach/blob/master/pkg/config/zone.proto)
+for up-to-date data structures used, the best entry point being
+`message ZoneConfig`.
 
 If zones are modified in situ, each node verifies the
 existing zones for its ranges against the zone configuration. If
@@ -1188,7 +1108,7 @@ PostgreSQL, although it also diverges in significant ways:
   and SERIALIZABLE.  The other traditional SQL isolation levels are
   internally mapped to either SNAPSHOT or SERIALIZABLE.
 
-- CockroachDB implements its own [SQL type system](RFCS/typing.md)
+- CockroachDB implements its own [SQL type system](RFCS/20160203_typing.md)
   which only supports a limited form of implicit coercions between
   types compared to PostgreSQL. The rationale is to keep the
   implementation simple and efficient, capitalizing on the observation
@@ -1278,3 +1198,277 @@ by means of prefix compression.
 Finally, for SQL indexes, the KV key is formed using the SQL value of the
 indexed columns, and the KV value is the KV key prefix of the rest of
 the indexed row.
+
+## Distributed SQL
+
+Dist-SQL is a new execution framework being developed as of Q3 2016 with the
+goal of distributing the processing of SQL queries.
+See the [Distributed SQL
+RFC](RFCS/20160421_distributed_sql.md)
+for a detailed design of the subsystem; this section will serve as a summary.
+
+Distributing the processing is desirable for multiple reasons:
+- Remote-side filtering: when querying for a set of rows that match a filtering
+  expression, instead of querying all the keys in certain ranges and processing
+  the filters after receiving the data on the gateway node over the network,
+  we'd like the filtering expression to be processed by the lease holder or
+  remote node, saving on network traffic and related processing.
+- For statements like `UPDATE .. WHERE` and `DELETE .. WHERE` we want to
+  perform the query and the updates on the node which has the data (as opposed
+  to receiving results at the gateway over the network, and then performing the
+  update or deletion there, which involves additional round-trips).
+- Parallelize SQL computation: when significant computation is required, we
+  want to distribute it to multiple node, so that it scales with the amount of
+  data involved. This applies to `JOIN`s, aggregation, sorting.
+
+The approach we took  was originally inspired by
+[Sawzall](https://cloud.google.com/dataflow/model/programming-model) - a
+project by Rob Pike et al. at Google that proposes a "shell" (high-level
+language interpreter) to ease the exploitation of MapReduce. It provides a
+clear separation between "local" processes which process a limited amount of
+data and distributed computations, which are abstracted away behind a
+restricted set of conceptual constructs.
+
+To run SQL statements in a distributed fashion, we introduce a couple of concepts:
+- _logical plan_ - similar on the surface to the `planNode` tree described in
+  the [SQL](#sql) section, it represents the abstract (non-distributed) data flow
+  through computation stages.
+- _physical plan_ - a physical plan is conceptually a mapping of the _logical
+  plan_ nodes to CockroachDB nodes. Logical plan nodes are replicated and
+  specialized depending on the cluster topology. The components of the physical
+  plan are scheduled and run on the cluster.
+
+## Logical planning
+
+The logical plan is made up of _aggregators_. Each _aggregator_ consumes an
+_input stream_ of rows (or multiple streams for joins) and produces an _output
+stream_ of rows. Both the input and the output streams have a set schema. The
+streams are a logical concept and might not map to a single data stream in the
+actual computation. Aggregators will be potentially distributed when converting
+the *logical plan* to a *physical plan*; to express what distribution and
+parallelization is allowed, an aggregator defines a _grouping_ on the data that
+flows through it, expressing which rows need to be processed on the same node
+(this mechanism constraints rows matching in a subset of columns to be
+processed on the same node). This concept is useful for aggregators that need
+to see some set of rows for producing output - e.g. the SQL aggregation
+functions. An aggregator with no grouping is a special but important case in
+which we are not aggregating multiple pieces of data, but we may be filtering,
+transforming, or reordering individual pieces of data.
+
+Special **table reader** aggregators with no inputs are used as data sources; a
+table reader can be configured to output only certain columns, as needed.
+A special **final** aggregator with no outputs is used for the results of the
+query/statement.
+
+To reflect the result ordering that a query has to produce, some aggregators
+(`final`, `limit`) are configured with an **ordering requirement** on the input
+stream (a list of columns with corresponding ascending/descending
+requirements). Some aggregators (like `table readers`) can guarantee a certain
+ordering on their output stream, called an **ordering guarantee**. All
+aggregators have an associated **ordering characterization** function
+`ord(input_order) -> output_order` that maps `input_order` (an ordering
+guarantee on the input stream) into `output_order` (an ordering guarantee for
+the output stream) - meaning that if the rows in the input stream are ordered
+according to `input_order`, then the rows in the output stream will be ordered
+according to `output_order`.
+
+The ordering guarantee of the table readers along with the characterization
+functions can be used to propagate ordering information across the logical plan.
+When there is a mismatch (an aggregator has an ordering requirement that is not
+matched by a guarantee), we insert a **sorting aggregator**.
+
+### Types of aggregators
+
+- `TABLE READER` is a special aggregator, with no input stream. It's configured
+  with spans of a table or index and the schema that it needs to read.
+  Like every other aggregator, it can be configured with a programmable output
+  filter.
+- `JOIN` performs a join on two streams, with equality constraints between
+  certain columns. The aggregator is grouped on the columns that are
+  constrained to be equal.
+- `JOIN READER` performs point-lookups for rows with the keys indicated by the
+  input stream. It can do so by performing (potentially remote) KV reads, or by
+  setting up remote flows.
+- `SET OPERATION` takes several inputs and performs set arithmetic on them
+  (union, difference).
+- `AGGREGATOR` is the one that does "aggregation" in the SQL sense. It groups
+  rows and computes an aggregate for each group. The group is configured using
+  the group key. `AGGREGATOR` can be configured with one or more aggregation
+  functions:
+  - `SUM`
+  - `COUNT`
+  - `COUNT DISTINCT`
+  - `DISTINCT`
+
+  An optional output filter has access to the group key and all the
+  aggregated values (i.e. it can use even values that are not ultimately
+  outputted).
+- `SORT` sorts the input according to a configurable set of columns.
+  This is a no-grouping aggregator, hence it can be distributed arbitrarily to
+  the data producers. This means that it doesn't produce a global ordering,
+  instead it just guarantees an intra-stream ordering on each physical output
+  streams). The global ordering, when needed, is achieved by an input
+  synchronizer of a grouped processor (such as `LIMIT` or `FINAL`).
+- `LIMIT` is a single-group aggregator that stops after reading so many input
+  rows.
+- `FINAL` is a single-group aggregator, scheduled on the gateway, that collects
+  the results of the query. This aggregator will be hooked up to the pgwire
+  connection to the client.
+
+## Physical planning
+
+Logical plans are transformed into physical plans in a *physical planning
+phase*. See the [corresponding
+section](RFCS/20160421_distributed_sql.md#from-logical-to-physical) of the Distributed SQL RFC
+for details.  To summarize, each aggregator is planned as one or more
+*processors*, which we distribute starting from the data layout - `TABLE
+READER`s have multiple instances, split according to the ranges - each instance
+is planned on the lease holder of the relevant range. From that point on,
+subsequent processors are generally either colocated with their inputs, or
+planned as singletons, usually on the final destination node.
+
+### Processors
+
+When turning a _logical plan_ into a _physical plan_, its nodes are turned into
+_processors_. Processors are generally made up of three components:
+
+![Processor](RFCS/images/distributed_sql_processor.png?raw=true "Processor")
+
+1. The *input synchronizer* merges the input streams into a single stream of
+   data. Types:
+   * single-input (pass-through)
+   * unsynchronized: passes rows from all input streams, arbitrarily
+     interleaved.
+   * ordered: the input physical streams have an ordering guarantee (namely the
+     guarantee of the corresponding logical stream); the synchronizer is careful
+     to interleave the streams so that the merged stream has the same guarantee.
+
+2. The *data processor* core implements the data transformation or aggregation
+   logic (and in some cases performs KV operations).
+
+3. The *output router* splits the data processor's output to multiple streams;
+   types:
+   * single-output (pass-through)
+   * mirror: every row is sent to all output streams
+   * hashing: each row goes to a single output stream, chosen according
+     to a hash function applied on certain elements of the data tuples.
+   * by range: the router is configured with range information (relating to a
+     certain table) and is able to send rows to the nodes that are lease holders for
+     the respective ranges (useful for `JoinReader` nodes (taking index values
+     to the node responsible for the PK) and `INSERT` (taking new rows to their
+     lease holder-to-be)).
+
+To illustrate with an example from the Distributed SQL RFC, the query:
+```
+TABLE Orders (OId INT PRIMARY KEY, CId INT, Value DECIMAL, Date DATE)
+
+SELECT CID, SUM(VALUE) FROM Orders
+  WHERE DATE > 2015
+  GROUP BY CID
+  ORDER BY 1 - SUM(Value)
+```
+
+produces the following logical plan:
+
+![Logical plan](RFCS/images/distributed_sql_logical_plan.png?raw=true "Logical Plan")
+
+This logical plan above could be transformed into either one of the following
+physical plans:
+
+![Physical plan](RFCS/images/distributed_sql_physical_plan.png?raw=true "Physical Plan")
+
+or
+
+![Alternate physical plan](RFCS/images/distributed_sql_physical_plan_2.png?raw=true "Alternate physical Plan")
+
+
+## Execution infrastructure
+
+Once a physical plan has been generated, the system needs to divvy it up
+between the nodes and send it around for execution. Each node is responsible
+for locally scheduling data processors and input synchronizers. Nodes also
+communicate with each other for connecting output routers to input
+synchronizers through a streaming interface.
+
+### Creating a local plan: the `ScheduleFlows` RPC
+
+Distributed execution starts with the gateway making a request to every node
+that's supposed to execute part of the plan asking the node to schedule the
+sub-plan(s) it's responsible for (except for "on-the-fly" flows, see design
+doc). A node might be responsible for multiple disparate pieces of the overall
+DAG - let's call each of them a *flow*. A flow is described by the sequence of
+physical plan nodes in it, the connections between them (input synchronizers,
+output routers) plus identifiers for the input streams of the top node in the
+plan and the output streams of the (possibly multiple) bottom nodes. A node
+might be responsible for multiple heterogeneous flows. More commonly, when a
+node is the lease holder for multiple ranges from the same table involved in
+the query, it will run a `TableReader` configured with all the spans to be
+read across all the ranges local to the node.
+
+A node therefore implements a `ScheduleFlows` RPC which takes a set of flows,
+sets up the input and output [mailboxes](#mailboxes), creates the local
+processors and starts their execution.
+
+### Local scheduling of flows
+
+The simplest way to schedule the different processors locally on a node is
+concurrently: each data processor, synchronizer and router runs as a goroutine,
+with channels between them. The channels are buffered to synchronize producers
+and consumers to a controllable degree.
+
+### Mailboxes
+
+Flows on different nodes communicate with each other over gRPC streams. To
+allow the producer and the consumer to start at different times,
+`ScheduleFlows` creates named mailboxes for all the input and output streams.
+These message boxes will hold some number of tuples in an internal queue until
+a gRPC stream is established for transporting them. From that moment on, gRPC
+flow control is used to synchronize the producer and consumer. A gRPC stream is
+established by the consumer using the `StreamMailbox` RPC, taking a mailbox id
+(the same one that's been already used in the flows passed to `ScheduleFlows`).
+
+A diagram of a simple query using mailboxes for its execution:
+![Mailboxes](RFCS/images/distributed_sql_mailboxes.png?raw=true)
+
+## A complex example: Daily Promotion
+
+To give a visual intuition of all the concepts presented, we draw the physical plan of a relatively involved query. The
+point of the query is to help with a promotion that goes out daily, targeting
+customers that have spent over $1000 in the last year. We'll insert into the
+`DailyPromotion` table rows representing each such customer and the sum of her
+recent orders.
+
+```SQL
+TABLE DailyPromotion (
+  Email TEXT,
+  Name TEXT,
+  OrderCount INT
+)
+
+TABLE Customers (
+  CustomerID INT PRIMARY KEY,
+  Email TEXT,
+  Name TEXT
+)
+
+TABLE Orders (
+  CustomerID INT,
+  Date DATETIME,
+  Value INT,
+
+  PRIMARY KEY (CustomerID, Date),
+  INDEX date (Date)
+)
+
+INSERT INTO DailyPromotion
+(SELECT c.Email, c.Name, os.OrderCount FROM
+      Customers AS c
+    INNER JOIN
+      (SELECT CustomerID, COUNT(*) as OrderCount FROM Orders
+        WHERE Date >= '2015-01-01'
+        GROUP BY CustomerID HAVING SUM(Value) >= 1000) AS os
+    ON c.CustomerID = os.CustomerID)
+```
+
+A possible physical plan:
+![Physical plan](RFCS/images/distributed_sql_daily_promotion_physical_plan.png?raw=true)

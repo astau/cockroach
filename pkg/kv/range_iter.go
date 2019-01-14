@@ -11,13 +11,11 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package kv
 
 import (
-	"golang.org/x/net/context"
+	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -74,14 +72,18 @@ func (ri *RangeIterator) Desc() *roachpb.RangeDescriptor {
 	return ri.desc
 }
 
-// LeaseHolder returns the lease holder of the iterator's current range, if that
+// LeaseHolderStoreID returns the lease holder's StoreID of the iterator's current range, if that
 // information is present in the DistSender's LeaseHolderCache. The second
 // return val is true if the descriptor has been found.
 // The iterator must be valid.
-func (ri *RangeIterator) LeaseHolder(ctx context.Context) (roachpb.ReplicaDescriptor, bool) {
+func (ri *RangeIterator) LeaseHolderStoreID(ctx context.Context) (roachpb.StoreID, bool) {
 	if !ri.Valid() {
 		panic(ri.Error())
 	}
+	// TODO(andrei): The leaseHolderCache might have a replica that's not part of
+	// the RangeDescriptor that the iterator is currently positioned on. IOW, the
+	// leaseHolderCache can be inconsistent with the RangeDescriptorCache, and
+	// with reality. We should attempt to fix-up caches when this is encountered.
 	return ri.ds.leaseHolderCache.Lookup(ctx, ri.Desc().RangeID)
 }
 
@@ -126,6 +128,11 @@ func (ri *RangeIterator) Error() *roachpb.Error {
 	return ri.pErr
 }
 
+// Reset resets the RangeIterator to its initial state.
+func (ri *RangeIterator) Reset() {
+	*ri = RangeIterator{ds: ri.ds}
+}
+
 // Next advances the iterator to the next range. The direction of
 // advance is dependent on whether the iterator is reversed. The
 // iterator must be valid.
@@ -143,11 +150,23 @@ func (ri *RangeIterator) Next(ctx context.Context) {
 
 // Seek positions the iterator at the specified key.
 func (ri *RangeIterator) Seek(ctx context.Context, key roachpb.RKey, scanDir ScanDirection) {
-	log.Eventf(ctx, "querying next range at %s", key)
+	if log.HasSpanOrEvent(ctx) {
+		rev := ""
+		if scanDir == Descending {
+			rev = " (rev)"
+		}
+		log.Eventf(ctx, "querying next range at %s%s", key, rev)
+	}
 	ri.scanDir = scanDir
 	ri.init = true // the iterator is now initialized
 	ri.pErr = nil  // clear any prior error
 	ri.key = key   // set the key
+
+	if (scanDir == Ascending && key.Equal(roachpb.RKeyMax)) ||
+		(scanDir == Descending && key.Equal(roachpb.RKeyMin)) {
+		ri.pErr = roachpb.NewErrorf("RangeIterator seek to invalid key %s", key)
+		return
+	}
 
 	// Retry loop for looking up next range in the span. The retry loop
 	// deals with retryable range descriptor lookups.
@@ -155,6 +174,10 @@ func (ri *RangeIterator) Seek(ctx context.Context, key roachpb.RKey, scanDir Sca
 		var err error
 		ri.desc, ri.token, err = ri.ds.getDescriptor(
 			ctx, ri.key, ri.token, ri.scanDir == Descending)
+
+		if log.V(2) {
+			log.Infof(ctx, "key: %s, desc: %s err: %v", ri.key, ri.desc, err)
+		}
 
 		// getDescriptor may fail retryably if, for example, the first
 		// range isn't available via Gossip. Assume that all errors at
@@ -174,7 +197,7 @@ func (ri *RangeIterator) Seek(ctx context.Context, key roachpb.RKey, scanDir Sca
 		// TODO: this code is subject to removal. See
 		// https://groups.google.com/d/msg/cockroach-db/DebjQEgU9r4/_OhMe7atFQAJ
 		reverse := ri.scanDir == Descending
-		if (reverse && !ri.desc.ContainsExclusiveEndKey(ri.key)) ||
+		if (reverse && !ri.desc.ContainsKeyInverted(ri.key)) ||
 			(!reverse && !ri.desc.ContainsKey(ri.key)) {
 			log.Eventf(ctx, "addressing error: %s does not include key %s", ri.desc, ri.key)
 			if err := ri.token.Evict(ctx); err != nil {
@@ -184,6 +207,9 @@ func (ri *RangeIterator) Seek(ctx context.Context, key roachpb.RKey, scanDir Sca
 			// On addressing errors, don't backoff; retry immediately.
 			r.Reset()
 			continue
+		}
+		if log.V(2) {
+			log.Infof(ctx, "returning; key: %s, desc: %s", ri.key, ri.desc)
 		}
 		return
 	}

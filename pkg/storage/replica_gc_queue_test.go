@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf (tobias@cockroachlabs.com)
 
 package storage
 
@@ -28,7 +26,7 @@ func TestReplicaGCShouldQueue(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	ts := func(t time.Duration) hlc.Timestamp {
-		return hlc.ZeroTimestamp.Add(t.Nanoseconds(), 0)
+		return hlc.Timestamp{WallTime: t.Nanoseconds()}
 	}
 
 	base := 2 * (ReplicaGCQueueCandidateTimeout + ReplicaGCQueueInactivityThreshold)

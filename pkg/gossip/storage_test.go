@@ -11,19 +11,16 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package gossip_test
 
 import (
+	"context"
 	"reflect"
 	"sort"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/gossip/resolver"
@@ -34,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/pkg/errors"
 )
 
 type testStorage struct {
@@ -100,7 +98,7 @@ func (s unresolvedAddrSlice) Swap(i, j int) {
 func TestGossipStorage(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 
 	network := simulation.NewNetwork(stopper, 3, true)
 
@@ -169,7 +167,7 @@ func TestGossipStorage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	node.Gossip.SetResolvers([]resolver.Resolver{r})
+	node.Resolvers = []resolver.Resolver{r}
 	if err := network.StartNode(node); err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +215,7 @@ func TestGossipStorage(t *testing.T) {
 func TestGossipStorageCleanup(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 
 	const numNodes = 3
 	network := simulation.NewNetwork(stopper, numNodes, false)
@@ -265,7 +263,7 @@ func TestGossipStorageCleanup(t *testing.T) {
 			}
 			for _, addr := range p.Info().Addresses {
 				if addr.String() == invalidAddr {
-					return errors.Errorf("node %d still needs bootstrap cleanup", i)
+					return errors.Errorf("n%d still needs bootstrap cleanup", i)
 				}
 			}
 		}

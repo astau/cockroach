@@ -11,62 +11,67 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis
 
 package storage_test
 
 import (
+	"context"
+	gosql "database/sql"
+	"encoding/json"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/pkg/errors"
-	"golang.org/x/net/context"
-
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/pkg/errors"
 )
 
 func TestReplicateQueueRebalance(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	// Set the gossip stores interval lower to speed up rebalancing. With the
-	// default of 5s we have to wait ~5s for the rebalancing to start.
-	defer func(v time.Duration) {
-		gossip.GossipStoresInterval = v
-	}(gossip.GossipStoresInterval)
-	gossip.GossipStoresInterval = 100 * time.Millisecond
-
-	// TODO(peter): Remove when lease rebalancing is the default.
-	defer func(v bool) {
-		storage.EnableLeaseRebalancing = v
-	}(storage.EnableLeaseRebalancing)
-	storage.EnableLeaseRebalancing = true
+	if testing.Short() {
+		t.Skip("short flag")
+	}
 
 	const numNodes = 5
 	tc := testcluster.StartTestCluster(t, numNodes,
-		base.TestClusterArgs{ReplicationMode: base.ReplicationAuto},
+		base.TestClusterArgs{
+			ReplicationMode: base.ReplicationAuto,
+			ServerArgs: base.TestServerArgs{
+				ScanMinIdleTime: time.Millisecond,
+				ScanMaxIdleTime: time.Millisecond,
+				Knobs: base.TestingKnobs{
+					Store: &storage.StoreTestingKnobs{
+						// Prevent the merge queue from immediately discarding our splits.
+						DisableMergeQueue: true,
+					},
+				},
+			},
+		},
 	)
-	defer tc.Stopper().Stop()
+	defer tc.Stopper().Stop(context.TODO())
+
+	for _, server := range tc.Servers {
+		st := server.ClusterSettings()
+		st.Manual.Store(true)
+		storage.LoadBasedRebalancingMode.Override(&st.SV, int64(storage.LBRebalancingOff))
+	}
 
 	const newRanges = 5
 	for i := 0; i < newRanges; i++ {
-		tableID := keys.MaxReservedDescID + i + 1
-		splitKey := keys.MakeRowSentinelKey(keys.MakeTablePrefix(uint32(tableID)))
+		tableID := keys.MinUserDescID + i
+		splitKey := keys.MakeTablePrefix(uint32(tableID))
 		if _, _, err := tc.SplitRange(splitKey); err != nil {
-			// TODO(peter): Remove when #11592 is fixed.
-			if testutils.IsError(err, "range is already split at key") {
-				continue
-			}
 			t.Fatal(err)
 		}
 	}
@@ -85,7 +90,11 @@ func TestReplicateQueueRebalance(t *testing.T) {
 		return counts
 	}
 
-	numRanges := newRanges + server.ExpectedInitialRangeCount()
+	initialRanges, err := server.ExpectedInitialRangeCount(tc.Servers[0].DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	numRanges := newRanges + initialRanges
 	numReplicas := numRanges * 3
 	const minThreshold = 0.9
 	minReplicas := int(math.Floor(minThreshold * (float64(numReplicas) / numNodes)))
@@ -94,7 +103,8 @@ func TestReplicateQueueRebalance(t *testing.T) {
 		counts := countReplicas()
 		for _, c := range counts {
 			if c < minReplicas {
-				err := errors.Errorf("not balanced: %d", counts)
+				err := errors.Errorf(
+					"not balanced (want at least %d replicas on all stores): %d", minReplicas, counts)
 				log.Info(context.Background(), err)
 				return err
 			}
@@ -103,17 +113,101 @@ func TestReplicateQueueRebalance(t *testing.T) {
 	})
 }
 
-// TestReplicateQueueDownReplicate verifies that the replication queue will notice
-// over-replicated ranges and remove replicas from them.
-func TestReplicateQueueDownReplicate(t *testing.T) {
+// Test that up-replication only proceeds if there are a good number of
+// candidates to up-replicate to. Specifically, we won't up-replicate to an
+// even number of replicas unless there is an additional candidate that will
+// allow a subsequent up-replication to an odd number.
+func TestReplicateQueueUpReplicate(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-
 	const replicaCount = 3
 
-	tc := testcluster.StartTestCluster(t, replicaCount+2,
+	tc := testcluster.StartTestCluster(t, 1,
 		base.TestClusterArgs{ReplicationMode: base.ReplicationAuto},
 	)
-	defer tc.Stopper().Stop()
+	defer tc.Stopper().Stop(context.Background())
+
+	testKey := keys.MetaMin
+	desc, err := tc.LookupRange(testKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(desc.Replicas) != 1 {
+		t.Fatalf("replica count, want 1, current %d", len(desc.Replicas))
+	}
+
+	tc.AddServer(t, base.TestServerArgs{})
+
+	if err := tc.Servers[0].Stores().VisitStores(func(s *storage.Store) error {
+		return s.ForceReplicationScanAndProcess()
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// After the initial splits have been performed, all of the resulting ranges
+	// should be present in replicate queue purgatory (because we only have a
+	// single store in the test and thus replication cannot succeed).
+	expected, err := tc.Servers[0].ExpectedInitialRangeCount()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var store *storage.Store
+	_ = tc.Servers[0].Stores().VisitStores(func(s *storage.Store) error {
+		store = s
+		return nil
+	})
+
+	if n := store.ReplicateQueuePurgatoryLength(); expected != n {
+		t.Fatalf("expected %d replicas in purgatory, but found %d", expected, n)
+	}
+
+	tc.AddServer(t, base.TestServerArgs{})
+
+	// Now wait until the replicas have been up-replicated to the
+	// desired number.
+	testutils.SucceedsSoon(t, func() error {
+		desc, err := tc.LookupRange(testKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(desc.Replicas) != replicaCount {
+			return errors.Errorf("replica count, want %d, current %d", replicaCount, len(desc.Replicas))
+		}
+		return nil
+	})
+
+	if err := verifyRangeLog(
+		tc.Conns[0], storagepb.RangeLogEventType_add, storagepb.ReasonRangeUnderReplicated,
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestReplicateQueueDownReplicate verifies that the replication queue will
+// notice over-replicated ranges and remove replicas from them.
+func TestReplicateQueueDownReplicate(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	const replicaCount = 3
+
+	// The goal of this test is to ensure that down replication occurs correctly
+	// using the replicate queue, and to ensure that's the case, the test
+	// cluster needs to be kept in auto replication mode.
+	tc := testcluster.StartTestCluster(t, replicaCount+2,
+		base.TestClusterArgs{
+			ReplicationMode: base.ReplicationAuto,
+			ServerArgs: base.TestServerArgs{
+				ScanMinIdleTime: 10 * time.Millisecond,
+				ScanMaxIdleTime: 10 * time.Millisecond,
+				Knobs: base.TestingKnobs{
+					Store: &storage.StoreTestingKnobs{
+						// Prevent the merge queue from immediately discarding our splits.
+						DisableMergeQueue: true,
+					},
+				},
+			},
+		},
+	)
+	defer tc.Stopper().Stop(context.Background())
 
 	// Split off a range from the initial range for testing; there are
 	// complications if the metadata ranges are moved.
@@ -122,51 +216,90 @@ func TestReplicateQueueDownReplicate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	desc, err := tc.LookupRange(testKey)
-	if err != nil {
+	allowedErrs := strings.Join([]string{
+		// If a node is already present, we expect this error.
+		"unable to add replica .* which is already present",
+		// If a replica for this range was previously present on this store and
+		// it has already been removed but has not yet been GCed, this error
+		// is expected.
+		storage.IntersectingSnapshotMsg,
+	}, "|")
+
+	// Up-replicate the new range to all nodes to create redundant replicas.
+	// Every time a new replica is added, there's a very good chance that
+	// another one is removed. So all the replicas can't be added at once and
+	// instead need to be added one at a time ensuring that the replica did
+	// indeed make it to the desired target.
+	for _, server := range tc.Servers {
+		nodeID := server.NodeID()
+		// If this is not wrapped in a SucceedsSoon, then other temporary
+		// failures unlike the ones listed below, such as rejected reservations
+		// can cause the test to fail. When encountering those failures, a
+		// retry is in order.
+		testutils.SucceedsSoon(t, func() error {
+			_, err := tc.AddReplicas(testKey, roachpb.ReplicationTarget{
+				NodeID:  nodeID,
+				StoreID: server.GetFirstStoreID(),
+			})
+			if testutils.IsError(err, allowedErrs) {
+				return nil
+			}
+			return err
+		})
+	}
+
+	// Now wait until the replicas have been down-replicated back to the
+	// desired number.
+	testutils.SucceedsSoon(t, func() error {
+		desc, err := tc.LookupRange(testKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(desc.Replicas) != replicaCount {
+			return errors.Errorf("replica count, want %d, current %d", replicaCount, len(desc.Replicas))
+		}
+		return nil
+	})
+
+	if err := verifyRangeLog(
+		tc.Conns[0], storagepb.RangeLogEventType_remove, storagepb.ReasonRangeOverReplicated,
+	); err != nil {
 		t.Fatal(err)
 	}
-	rangeID := desc.RangeID
+}
 
-	countReplicas := func() int {
-		count := 0
-		for _, s := range tc.Servers {
-			if err := s.Stores().VisitStores(func(store *storage.Store) error {
-				if _, err := store.GetReplica(rangeID); err == nil {
-					count++
-				}
-				return nil
-			}); err != nil {
-				t.Fatal(err)
-			}
-		}
-		return count
+func verifyRangeLog(
+	conn *gosql.DB, eventType storagepb.RangeLogEventType, reason storagepb.RangeLogEventReason,
+) error {
+	rows, err := conn.Query(
+		"SELECT info FROM system.rangelog WHERE \"eventType\" = $1;", eventType.String())
+	if err != nil {
+		return err
 	}
-
-	// Up-replicate the new range to all servers to create redundant replicas.
-	// Add replicas to all of the nodes. Only 2 of these calls will succeed
-	// because the range is already replicated to the other 3 nodes.
-	testutils.SucceedsSoon(t, func() error {
-		for i := 0; i < tc.NumServers(); i++ {
-			_, err := tc.AddReplicas(testKey, tc.Target(i))
-			if err != nil {
-				if testutils.IsError(err, "unable to add replica .* which is already present") {
-					continue
-				}
-				return err
-			}
+	defer rows.Close()
+	var numEntries int
+	for rows.Next() {
+		numEntries++
+		var infoStr string
+		if err := rows.Scan(&infoStr); err != nil {
+			return err
 		}
-		if c := countReplicas(); c != tc.NumServers() {
-			return errors.Errorf("replica count = %d", c)
+		var info storagepb.RangeLogEvent_Info
+		if err := json.Unmarshal([]byte(infoStr), &info); err != nil {
+			return errors.Errorf("error unmarshalling info string %q: %s", infoStr, err)
 		}
-		return nil
-	})
-
-	// Ensure that the replicas for the new range down replicate.
-	testutils.SucceedsSoon(t, func() error {
-		if c := countReplicas(); c != replicaCount {
-			return errors.Errorf("replica count = %d", c)
+		if a, e := info.Reason, reason; a != e {
+			return errors.Errorf("expected range log event reason %s, got %s from info %v", e, a, info)
 		}
-		return nil
-	})
+		if info.Details == "" {
+			return errors.Errorf("got empty range log event details: %v", info)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if numEntries == 0 {
+		return errors.New("no range log entries found for up-replication events")
+	}
+	return nil
 }

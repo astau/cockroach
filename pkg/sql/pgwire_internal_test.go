@@ -11,20 +11,16 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Andrei Matei (andreimatei1@gmail.com)
 
 // This file contains tests for pgwire that need to be in the sql package.
 
 package sql
 
 import (
+	"context"
 	"database/sql/driver"
 	"net/url"
 	"testing"
-
-	"github.com/lib/pq"
-	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/security"
@@ -33,6 +29,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/lib/pq"
+	"github.com/pkg/errors"
 )
 
 // Test that abruptly closing a pgwire connection releases all leases held by
@@ -40,26 +38,27 @@ import (
 func TestPGWireConnectionCloseReleasesLeases(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	ctx := context.TODO()
+	defer s.Stopper().Stop(ctx)
 	url, cleanupConn := sqlutils.PGUrl(t, s.ServingAddr(), "SetupServer", url.User(security.RootUser))
 	defer cleanupConn()
 	conn, err := pq.Open(url.String())
 	if err != nil {
 		t.Fatal(err)
 	}
-	ex := conn.(driver.Execer)
-	if _, err := ex.Exec("CREATE DATABASE test", nil); err != nil {
+	ex := conn.(driver.ExecerContext)
+	if _, err := ex.ExecContext(ctx, "CREATE DATABASE test", nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ex.Exec("CREATE TABLE test.t (i INT PRIMARY KEY)", nil); err != nil {
+	if _, err := ex.ExecContext(ctx, "CREATE TABLE test.t (i INT PRIMARY KEY)", nil); err != nil {
 		t.Fatal(err)
 	}
 	// Start a txn so leases are accumulated by queries.
-	if _, err := ex.Exec("BEGIN", nil); err != nil {
+	if _, err := ex.ExecContext(ctx, "BEGIN", nil); err != nil {
 		t.Fatal(err)
 	}
 	// Get a table lease.
-	if _, err := ex.Exec("SELECT * FROM test.t", nil); err != nil {
+	if _, err := ex.ExecContext(ctx, "SELECT * FROM test.t", nil); err != nil {
 		t.Fatal(err)
 	}
 	// Abruptly close the connection.
@@ -76,7 +75,7 @@ func TestPGWireConnectionCloseReleasesLeases(t *testing.T) {
 		t.Fatal("table state not found")
 	}
 	ts.mu.Lock()
-	leases := ts.active.data
+	leases := ts.mu.active.data
 	ts.mu.Unlock()
 	if len(leases) != 1 {
 		t.Fatalf("expected one lease, found: %d", len(leases))
@@ -84,8 +83,11 @@ func TestPGWireConnectionCloseReleasesLeases(t *testing.T) {
 	// Wait for the lease to be released.
 	testutils.SucceedsSoon(t, func() error {
 		ts.mu.Lock()
-		refcount := ts.active.data[0].refcount
-		ts.mu.Unlock()
+		defer ts.mu.Unlock()
+		tv := ts.mu.active.data[0]
+		tv.mu.Lock()
+		defer tv.mu.Unlock()
+		refcount := tv.mu.refcount
 		if refcount != 0 {
 			return errors.Errorf(
 				"expected lease to be unused, found refcount: %d", refcount)

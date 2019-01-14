@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Tracy (matt.r.tracy@gmail.com)
 
 package ts
 
@@ -24,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/pkg/errors"
 )
 
@@ -121,10 +120,12 @@ func decodeDataKeySuffix(key roachpb.Key) (string, string, Resolution, int64, er
 func prettyPrintKey(key roachpb.Key) string {
 	name, source, resolution, timestamp, err := decodeDataKeySuffix(key)
 	if err != nil {
-		return "/" + err.Error()
+		// Not a valid timeseries key, fall back to doing the best we can to display
+		// it.
+		return encoding.PrettyPrintValue(nil /* dirs */, key, "/")
 	}
 	return fmt.Sprintf("/%s/%s/%s/%s", name, source, resolution,
-		time.Unix(0, timestamp).UTC().Format(time.RFC3339Nano))
+		timeutil.Unix(0, timestamp).Format(time.RFC3339Nano))
 }
 
 func init() {

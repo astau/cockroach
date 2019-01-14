@@ -11,14 +11,13 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package cli
 
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -32,19 +31,22 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/net/context"
-
-	"github.com/pkg/errors"
-
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
 	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/sql/lex"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	// register some workloads for TestWorkload
+	_ "github.com/cockroachdb/cockroach/pkg/workload/examples"
+	"github.com/pkg/errors"
 )
 
 type cliTest struct {
@@ -57,94 +59,169 @@ type cliTest struct {
 	t *testing.T
 	// logScope binds the lifetime of the log files to this test, when t
 	// is not nil
-	logScope log.TestLogScope
+	logScope *log.TestLogScope
+	// if true, doesn't print args during RunWithArgs
+	omitArgs bool
 }
 
-func newCLITest(t *testing.T, insecure bool) (cliTest, error) {
-	c := cliTest{t: t}
+type cliTestParams struct {
+	t          *testing.T
+	insecure   bool
+	noServer   bool
+	storeSpecs []base.StoreSpec
+	locality   roachpb.Locality
+}
+
+func (c *cliTest) fail(err interface{}) {
+	if c.t != nil {
+		defer c.logScope.Close(c.t)
+		c.t.Fatal(err)
+	} else {
+		panic(err)
+	}
+}
+
+func createTestCerts(certsDir string) (cleanup func() error) {
+	// Copy these assets to disk from embedded strings, so this test can
+	// run from a standalone binary.
+	// Disable embedded certs, or the security library will try to load
+	// our real files as embedded assets.
+	security.ResetAssetLoader()
+
+	assets := []string{
+		filepath.Join(security.EmbeddedCertsDir, security.EmbeddedCACert),
+		filepath.Join(security.EmbeddedCertsDir, security.EmbeddedCAKey),
+		filepath.Join(security.EmbeddedCertsDir, security.EmbeddedNodeCert),
+		filepath.Join(security.EmbeddedCertsDir, security.EmbeddedNodeKey),
+		filepath.Join(security.EmbeddedCertsDir, security.EmbeddedRootCert),
+		filepath.Join(security.EmbeddedCertsDir, security.EmbeddedRootKey),
+	}
+
+	for _, a := range assets {
+		securitytest.RestrictedCopy(nil, a, certsDir, filepath.Base(a))
+	}
+
+	return func() error {
+		security.SetAssetLoader(securitytest.EmbeddedAssets)
+		return os.RemoveAll(certsDir)
+	}
+}
+
+func newCLITest(params cliTestParams) cliTest {
+	c := cliTest{t: params.t}
 
 	certsDir, err := ioutil.TempDir("", "cli-test")
 	if err != nil {
-		return cliTest{}, err
+		c.fail(err)
 	}
 	c.certsDir = certsDir
 
-	// Reset the client context for each test. We don't reset the
-	// pointer (because they are tied into the flags), but instead
-	// overwrite the existing struct's values.
-	baseCfg.InitDefaults()
-	InitCLIDefaults()
-
-	if t != nil {
-		c.logScope = log.Scope(t, "")
+	if c.t != nil {
+		c.logScope = log.Scope(c.t)
 	}
 
-	s, err := serverutils.StartServerRaw(base.TestServerArgs{Insecure: insecure})
-	if err != nil {
-		if t != nil {
-			c.logScope.Close(t)
-		}
-		return cliTest{}, err
-	}
-	c.TestServer = s.(*server.TestServer)
+	c.cleanupFunc = func() error { return nil }
 
-	if insecure {
-		c.cleanupFunc = func() error { return nil }
-	} else {
-		// Copy these assets to disk from embedded strings, so this test can
-		// run from a standalone binary.
-		// Disable embedded certs, or the security library will try to load
-		// our real files as embedded assets.
-		security.ResetReadFileFn()
-
-		assets := []string{
-			filepath.Join(security.EmbeddedCertsDir, security.EmbeddedCACert),
-			filepath.Join(security.EmbeddedCertsDir, security.EmbeddedCAKey),
-			filepath.Join(security.EmbeddedCertsDir, security.EmbeddedNodeCert),
-			filepath.Join(security.EmbeddedCertsDir, security.EmbeddedNodeKey),
-			filepath.Join(security.EmbeddedCertsDir, security.EmbeddedRootCert),
-			filepath.Join(security.EmbeddedCertsDir, security.EmbeddedRootKey),
+	if !params.noServer {
+		if !params.insecure {
+			c.cleanupFunc = createTestCerts(certsDir)
+			baseCfg.SSLCertsDir = certsDir
 		}
 
-		for _, a := range assets {
-			securitytest.RestrictedCopy(nil, a, certsDir, filepath.Base(a))
+		s, err := serverutils.StartServerRaw(base.TestServerArgs{
+			Insecure:    params.insecure,
+			SSLCertsDir: c.certsDir,
+			StoreSpecs:  params.storeSpecs,
+			Locality:    params.locality,
+		})
+		if err != nil {
+			c.fail(err)
 		}
+		c.TestServer = s.(*server.TestServer)
 
-		c.cleanupFunc = func() error {
-			security.SetReadFileFn(securitytest.Asset)
-			return os.RemoveAll(certsDir)
-		}
+		log.Infof(context.TODO(), "server started at %s", c.ServingAddr())
 	}
 
-	// Ensure that CLI error messages are logged to stdout, where they
-	// can be captured.
-	osStderr = os.Stdout
+	baseCfg.User = security.NodeUser
 
-	return c, nil
+	// Ensure that CLI error messages and anything meant for the
+	// original stderr is redirected to stdout, where it can be
+	// captured.
+	stderr = os.Stdout
+
+	return c
 }
 
-// stop cleans up after the test.
-// It also stops the test server is runStopper is true.
+// setCLIDefaultsForTests invokes initCLIDefaults but pretends the
+// output is not a terminal, even if it happens to be. This ensures
+// e.g. that tests ran with -v have the same output as those without.
+func setCLIDefaultsForTests() {
+	initCLIDefaults()
+	cliCtx.terminalOutput = false
+	sqlCtx.showTimes = false
+	// Even though we pretend there is no terminal, most tests want
+	// pretty tables.
+	cliCtx.tableDisplayFormat = tableDisplayTable
+}
+
+// stopServer stops the test server.
+func (c *cliTest) stopServer() {
+	if c.TestServer != nil {
+		log.Infof(context.TODO(), "stopping server at %s", c.ServingAddr())
+		select {
+		case <-c.Stopper().ShouldStop():
+			// If ShouldStop() doesn't block, that means someone has already
+			// called Stop(). We just need to wait.
+			<-c.Stopper().IsStopped()
+		default:
+			c.Stopper().Stop(context.TODO())
+		}
+	}
+}
+
+// restartServer stops and restarts the test server. The ServingAddr() may
+// have changed after this method returns.
+func (c *cliTest) restartServer(params cliTestParams) {
+	c.stopServer()
+	log.Info(context.TODO(), "restarting server")
+	s, err := serverutils.StartServerRaw(base.TestServerArgs{
+		Insecure:    params.insecure,
+		SSLCertsDir: c.certsDir,
+		StoreSpecs:  params.storeSpecs,
+	})
+	if err != nil {
+		c.fail(err)
+	}
+	c.TestServer = s.(*server.TestServer)
+	log.Infof(context.TODO(), "restarted server at %s", c.ServingAddr())
+}
+
+// cleanup cleans up after the test, stopping the server if necessary.
 // The log files are removed if the test has succeeded.
-func (c cliTest) stop(runStopper bool) {
+func (c *cliTest) cleanup() {
 	if c.t != nil {
 		defer c.logScope.Close(c.t)
 	}
 
 	// Restore stderr.
-	osStderr = os.Stderr
+	stderr = log.OrigStderr
 
-	if runStopper {
-		c.Stopper().Stop()
-	}
+	log.Info(context.TODO(), "stopping server and cleaning up CLI test")
+
+	c.stopServer()
+
 	if err := c.cleanupFunc(); err != nil {
 		panic(err)
 	}
 }
 
 func (c cliTest) Run(line string) {
+	redirectOutput(func() { c.runUnredirected(line) })
+}
+
+func (c cliTest) runUnredirected(line string) {
 	a := strings.Fields(line)
-	c.RunWithArgs(a)
+	c.runWithArgsUnredirected(a)
 }
 
 // RunWithCapture runs c and returns a string containing the output of c
@@ -153,8 +230,76 @@ func (c cliTest) Run(line string) {
 // the output of c.
 func (c cliTest) RunWithCapture(line string) (out string, err error) {
 	return captureOutput(func() {
-		c.Run(line)
+		c.runUnredirected(line)
 	})
+}
+
+func (c cliTest) RunWithCaptureArgs(args []string) (string, error) {
+	return captureOutput(func() {
+		c.runWithArgsUnredirected(args)
+	})
+}
+
+// stripWhitespaces removes whitespaces before each newline character.
+// We need to strip whitespace because otherwise we get test failures
+// in Example_tests: some tests produce whitespace at the end of each
+// line, the reference output is in Go comments here, and most text
+// editor remove trailing whitespaces in source files.
+func stripWhitespaces(s string) string {
+	start := 0
+	var res strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] != '\n' {
+			continue
+		}
+		end := i
+		for ; end > start && s[end-1] == ' '; end-- {
+		}
+		res.WriteString(s[start:end])
+		res.WriteByte('\n')
+		start = i + 1
+	}
+	end := len(s)
+	for ; end > start && s[end-1] == ' '; end-- {
+	}
+	res.WriteString(s[start:end])
+	return res.String()
+}
+
+func TestStripWhitespaces(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	testData := []struct {
+		in, out string
+	}{
+		{" ", ""},
+		{" \n", "\n"},
+		{"abc", "abc"},
+		{"abc  ", "abc"},
+		{"abc  \n", "abc\n"},
+		{"abc  \nxyz", "abc\nxyz"},
+	}
+	for _, test := range testData {
+		t.Run(test.in, func(t *testing.T) {
+			res := stripWhitespaces(test.in)
+			if res != test.out {
+				t.Errorf("%q: got %q, expected %q", test.in, res, test.out)
+			}
+		})
+	}
+}
+
+// redirectOutput runs f and prints out either its output, or the
+// error if one was produed. We use redirectOutput for the various
+// Run functions because this ensures that trailing whitespace
+// on each line is properly stripped out; otherwise Example_ tests
+// don't work properly.
+func redirectOutput(f func()) {
+	out, err := captureOutput(f)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+	} else {
+		fmt.Print(out)
+	}
 }
 
 // captureOutput runs f and returns a string containing the output and any
@@ -163,12 +308,13 @@ func captureOutput(f func()) (out string, err error) {
 	// Heavily inspired by Go's testing/example.go:runExample().
 
 	// Funnel stdout into a pipe.
-	stdout := os.Stdout
+	stdoutSave, stderrRedirSave := os.Stdout, stderr
 	r, w, err := os.Pipe()
 	if err != nil {
 		return "", err
 	}
 	os.Stdout = w
+	stderr = w
 
 	// Send all bytes from piped stdout through the output channel.
 	type captureResult struct {
@@ -180,14 +326,16 @@ func captureOutput(f func()) (out string, err error) {
 		var buf bytes.Buffer
 		_, err := io.Copy(&buf, r)
 		r.Close()
-		outC <- captureResult{buf.String(), err}
+		s := stripWhitespaces(buf.String())
+		outC <- captureResult{s, err}
 	}()
 
 	// Clean up and record output in separate function to handle panics.
 	defer func() {
 		// Close pipe and restore normal stdout.
 		w.Close()
-		os.Stdout = stdout
+		os.Stdout = stdoutSave
+		stderr = stderrRedirSave
 		outResult := <-outC
 		out, err = outResult.out, outResult.err
 		if x := recover(); x != nil {
@@ -201,26 +349,53 @@ func captureOutput(f func()) (out string, err error) {
 }
 
 func (c cliTest) RunWithArgs(origArgs []string) {
-	sqlCtx.execStmts = nil
-	zoneConfig = ""
-	zoneDisableReplication = false
+	redirectOutput(func() { c.runWithArgsUnredirected(origArgs) })
+}
+
+func (c cliTest) runWithArgsUnredirected(origArgs []string) {
+	TestingReset()
 
 	if err := func() error {
-		h, p, err := net.SplitHostPort(c.ServingAddr())
-		if err != nil {
-			return err
-		}
 		args := append([]string(nil), origArgs[:1]...)
-		if c.Cfg.Insecure {
-			args = append(args, "--insecure")
-		} else {
-			args = append(args, "--insecure=false")
-			args = append(args, fmt.Sprintf("--ca-cert=%s", filepath.Join(c.certsDir, security.EmbeddedCACert)))
-			args = append(args, fmt.Sprintf("--cert=%s", filepath.Join(c.certsDir, security.EmbeddedNodeCert)))
-			args = append(args, fmt.Sprintf("--key=%s", filepath.Join(c.certsDir, security.EmbeddedNodeKey)))
+		if c.TestServer != nil {
+			h, p, err := net.SplitHostPort(c.ServingAddr())
+			if err != nil {
+				return err
+			}
+			if c.Cfg.Insecure {
+				args = append(args, "--insecure")
+			} else {
+				args = append(args, "--insecure=false")
+				args = append(args, fmt.Sprintf("--certs-dir=%s", c.certsDir))
+			}
+			args = append(args, fmt.Sprintf("--host=%s:%s", h, p))
 		}
-		args = append(args, fmt.Sprintf("--host=%s", h))
-		args = append(args, fmt.Sprintf("--port=%s", p))
+		args = append(args, origArgs[1:]...)
+
+		if !c.omitArgs {
+			fmt.Fprintf(os.Stderr, "%s\n", args)
+			fmt.Println(strings.Join(origArgs, " "))
+		}
+
+		return Run(args)
+	}(); err != nil {
+		fmt.Println(err)
+	}
+}
+
+func (c cliTest) RunWithCAArgs(origArgs []string) {
+	redirectOutput(func() { c.runWithCAArgsUnredirected(origArgs) })
+}
+
+func (c cliTest) runWithCAArgsUnredirected(origArgs []string) {
+	TestingReset()
+
+	if err := func() error {
+		args := append([]string(nil), origArgs[:1]...)
+		if c.TestServer != nil {
+			args = append(args, fmt.Sprintf("--ca-key=%s", filepath.Join(c.certsDir, security.EmbeddedCAKey)))
+			args = append(args, fmt.Sprintf("--certs-dir=%s", c.certsDir))
+		}
 		args = append(args, origArgs[1:]...)
 
 		fmt.Fprintf(os.Stderr, "%s\n", args)
@@ -235,536 +410,954 @@ func (c cliTest) RunWithArgs(origArgs []string) {
 func TestQuit(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	c, err := newCLITest(t, false)
-	if err != nil {
-		panic(err)
+	if testing.Short() {
+		t.Skip("short flag")
 	}
-	// This test does not need to invoke the stopper because
-	// "quit" will have taken care of this.
-	defer c.stop(false)
+
+	c := newCLITest(cliTestParams{t: t})
+	defer c.cleanup()
 
 	c.Run("quit")
-	// Wait until this async command stops the server.
+	// Wait until this async command cleanups the server.
 	<-c.Stopper().IsStopped()
-
-	// NB: if this test is ever flaky due to port reuse, we could run against
-	// :0 (which however changes some of the errors we get).
-	// One way of getting that is:
-	//	c.Cfg.AdvertiseAddr = "127.0.0.1:0"
-
-	styled := func(s string) string {
-		const preamble = `unable to connect or connection lost.
-
-Please check the address and credentials such as certificates \(if attempting to
-communicate with a secure cluster\).
-
-`
-		return preamble + s
-	}
-
-	for i, test := range []struct {
-		cmd, expOutPattern string
-	}{
-		// Error returned from GRPC to internal/client (which has to pass it
-		// up the stack as a roachpb.NewError(roachpb.NewSendError(.)).
-		{`debug kv inc a`, styled(
-			`increment failed: failed to send RPC: rpc error: code = 14 desc = grpc: the connection is unavailable`),
-		},
-		// Error returned directly from GRPC.
-		{`quit`, styled(
-			`rpc error: code = 14 desc = grpc: the connection is unavailable`),
-		},
-		// Going through the SQL client libraries gives a *net.OpError which
-		// we also handle.
-		{`zone ls`, styled(
-			`dial tcp .*: getsockopt: connection refused`),
-		},
-		// A real error before we hit any networking ones.
-		{`debug kv scan b a`, `start key must be smaller than end key`},
-		{`debug kv inc`, `invalid arguments`},
-	} {
-		out, err := c.RunWithCapture(test.cmd)
-		if err != nil {
-			t.Fatal(errors.Wrap(err, strconv.Itoa(i)))
-		}
-		exp := test.cmd + "\n" + test.expOutPattern
-		re := regexp.MustCompile(exp)
-		if !re.MatchString(out) {
-			t.Errorf("expected '%s' to match pattern\n%s\ngot:\n%s", test.cmd, exp, out)
-		}
-	}
-}
-
-func Example_basic() {
-	c, err := newCLITest(nil, false)
-	if err != nil {
-		panic(err)
-	}
-	defer c.stop(true)
-
-	c.Run("debug kv put a 1 b 2 c 3")
-	c.Run("debug kv scan")
-	c.Run("debug kv revscan")
-	c.Run("debug kv del a c")
-	c.Run("debug kv get a")
-	c.Run("debug kv get b")
-	c.Run("debug kv inc c 1")
-	c.Run("debug kv inc c 10")
-	c.Run("debug kv inc c 100")
-	c.Run("debug kv inc c -- -60")
-	c.Run("debug kv inc c -- -9")
-	c.Run("debug kv scan")
-	c.Run("debug kv revscan")
-	c.Run("debug kv inc c b")
-
-	// Output:
-	// debug kv put a 1 b 2 c 3
-	// debug kv scan
-	// "a"	"1"
-	// "b"	"2"
-	// "c"	"3"
-	// 3 result(s)
-	// debug kv revscan
-	// "c"	"3"
-	// "b"	"2"
-	// "a"	"1"
-	// 3 result(s)
-	// debug kv del a c
-	// debug kv get a
-	// "a" not found
-	// debug kv get b
-	// "2"
-	// debug kv inc c 1
-	// 1
-	// debug kv inc c 10
-	// 11
-	// debug kv inc c 100
-	// 111
-	// debug kv inc c -- -60
-	// 51
-	// debug kv inc c -- -9
-	// 42
-	// debug kv scan
-	// "b"	"2"
-	// "c"	42
-	// 2 result(s)
-	// debug kv revscan
-	// "c"	42
-	// "b"	"2"
-	// 2 result(s)
-	// debug kv inc c b
-	// invalid increment: strconv.ParseInt: parsing "b": invalid syntax
-}
-
-func Example_quoted() {
-	c, err := newCLITest(nil, false)
-	if err != nil {
-		panic(err)
-	}
-	defer c.stop(true)
-
-	c.Run(`debug kv put a\x00 日本語`)                                  // UTF-8 input text
-	c.Run(`debug kv put a\x01 \u65e5\u672c\u8a9e`)                   // explicit Unicode code points
-	c.Run(`debug kv put a\x02 \U000065e5\U0000672c\U00008a9e`)       // explicit Unicode code points
-	c.Run(`debug kv put a\x03 \xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e`) // explicit UTF-8 bytes
-	c.Run(`debug kv scan`)
-	c.Run(`debug kv get a\x00`)
-	c.Run(`debug kv del a\x00`)
-	c.Run(`debug kv inc 1\x01`)
-	c.Run(`debug kv get 1\x01`)
-
-	// Output:
-	// debug kv put a\x00 日本語
-	// debug kv put a\x01 \u65e5\u672c\u8a9e
-	// debug kv put a\x02 \U000065e5\U0000672c\U00008a9e
-	// debug kv put a\x03 \xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e
-	// debug kv scan
-	// "a\x00"	"日本語"
-	// "a\x01"	"日本語"
-	// "a\x02"	"日本語"
-	// "a\x03"	"日本語"
-	// 4 result(s)
-	// debug kv get a\x00
-	// "日本語"
-	// debug kv del a\x00
-	// debug kv inc 1\x01
-	// 1
-	// debug kv get 1\x01
-	// 1
-}
-
-func Example_insecure() {
-	c, err := newCLITest(nil, true)
-	if err != nil {
-		panic(err)
-	}
-	defer c.stop(true)
-
-	c.Run("debug kv put a 1 b 2")
-	c.Run("debug kv scan")
-
-	// Output:
-	// debug kv put a 1 b 2
-	// debug kv scan
-	// "a"	"1"
-	// "b"	"2"
-	// 2 result(s)
-}
-
-func Example_ranges() {
-	c, err := newCLITest(nil, false)
-	if err != nil {
-		panic(err)
-	}
-	defer c.stop(true)
-
-	c.Run("debug kv put a 1 b 2 c 3 d 4")
-	c.Run("debug kv scan")
-	c.Run("debug kv revscan")
-	c.Run("debug range split c")
-	c.Run("debug range ls")
-	c.Run("debug kv scan")
-	c.Run("debug kv revscan")
-	c.Run("debug kv delrange a c")
-	c.Run("debug kv scan")
-
-	// Output:
-	// debug kv put a 1 b 2 c 3 d 4
-	// debug kv scan
-	// "a"	"1"
-	// "b"	"2"
-	// "c"	"3"
-	// "d"	"4"
-	// 4 result(s)
-	// debug kv revscan
-	// "d"	"4"
-	// "c"	"3"
-	// "b"	"2"
-	// "a"	"1"
-	// 4 result(s)
-	// debug range split c
-	// debug range ls
-	// /Min-"c" [1]
-	// 	0: node-id=1 store-id=1
-	// "c"-/Table/11 [6]
-	// 	0: node-id=1 store-id=1
-	// /Table/11-/Table/12 [2]
-	// 	0: node-id=1 store-id=1
-	// /Table/12-/Table/13 [3]
-	//	0: node-id=1 store-id=1
-	// /Table/13-/Table/14 [4]
-	//	0: node-id=1 store-id=1
-	// /Table/14-/Max [5]
-	//	0: node-id=1 store-id=1
-	// 6 result(s)
-	// debug kv scan
-	// "a"	"1"
-	// "b"	"2"
-	// "c"	"3"
-	// "d"	"4"
-	// 4 result(s)
-	// debug kv revscan
-	// "d"	"4"
-	// "c"	"3"
-	// "b"	"2"
-	// "a"	"1"
-	// 4 result(s)
-	// debug kv delrange a c
-	// debug kv scan
-	// "c"	"3"
-	// "d"	"4"
-	// 2 result(s)
 }
 
 func Example_logging() {
-	c, err := newCLITest(nil, false)
-	if err != nil {
-		panic(err)
-	}
-	defer c.stop(true)
+	c := newCLITest(cliTestParams{})
+	defer c.cleanup()
 
-	c.RunWithArgs([]string{"sql", "--alsologtostderr=false", "-e", "select 1"})
-	c.RunWithArgs([]string{"sql", "--log-backtrace-at=foo.go:1", "-e", "select 1"})
-	c.RunWithArgs([]string{"sql", "--log-dir=", "-e", "select 1"})
-	c.RunWithArgs([]string{"sql", "--logtostderr=true", "-e", "select 1"})
-	c.RunWithArgs([]string{"sql", "--verbosity=0", "-e", "select 1"})
-	c.RunWithArgs([]string{"sql", "--vmodule=foo=1", "-e", "select 1"})
+	c.RunWithArgs([]string{`sql`, `--logtostderr=false`, `-e`, `select 1 as "1"`})
+	c.RunWithArgs([]string{`sql`, `--logtostderr=true`, `-e`, `select 1 as "1"`})
+	c.RunWithArgs([]string{`sql`, `--vmodule=foo=1`, `-e`, `select 1 as "1"`})
 
 	// Output:
-	// sql --alsologtostderr=false -e select 1
-	// 1 row
+	// sql --logtostderr=false -e select 1 as "1"
 	// 1
 	// 1
-	// sql --log-backtrace-at=foo.go:1 -e select 1
-	// 1 row
+	// sql --logtostderr=true -e select 1 as "1"
 	// 1
 	// 1
-	// sql --log-dir= -e select 1
-	// 1 row
+	// sql --vmodule=foo=1 -e select 1 as "1"
 	// 1
 	// 1
-	// sql --logtostderr=true -e select 1
-	// 1 row
-	// 1
-	// 1
-	// sql --verbosity=0 -e select 1
-	// 1 row
-	// 1
-	// 1
-	// sql --vmodule=foo=1 -e select 1
-	// 1 row
-	// 1
-	// 1
-}
-
-func Example_cput() {
-	c, err := newCLITest(nil, false)
-	if err != nil {
-		panic(err)
-	}
-	defer c.stop(true)
-
-	c.Run("debug kv put a 1 b 2 c 3 d 4")
-	c.Run("debug kv scan")
-	c.Run("debug kv cput e 5")
-	c.Run("debug kv cput b 3 2")
-	c.Run("debug kv scan")
-
-	// Output:
-	// debug kv put a 1 b 2 c 3 d 4
-	// debug kv scan
-	// "a"	"1"
-	// "b"	"2"
-	// "c"	"3"
-	// "d"	"4"
-	// 4 result(s)
-	// debug kv cput e 5
-	// debug kv cput b 3 2
-	// debug kv scan
-	// "a"	"1"
-	// "b"	"3"
-	// "c"	"3"
-	// "d"	"4"
-	// "e"	"5"
-	// 5 result(s)
-}
-
-func Example_max_results() {
-	c, err := newCLITest(nil, false)
-	if err != nil {
-		panic(err)
-	}
-	defer c.stop(true)
-
-	c.Run("debug kv put a 1 b 2 c 3 d 4")
-	c.Run("debug kv scan --max-results=3")
-	c.Run("debug kv revscan --max-results=2")
-	c.Run("debug range split c")
-	c.Run("debug range split d")
-	c.Run("debug range ls --max-results=2")
-
-	// Output:
-	// debug kv put a 1 b 2 c 3 d 4
-	// debug kv scan --max-results=3
-	// "a"	"1"
-	// "b"	"2"
-	// "c"	"3"
-	// 3 result(s)
-	// debug kv revscan --max-results=2
-	// "d"	"4"
-	// "c"	"3"
-	// 2 result(s)
-	// debug range split c
-	// debug range split d
-	// debug range ls --max-results=2
-	// /Min-"c" [1]
-	// 	0: node-id=1 store-id=1
-	// "c"-"d" [6]
-	// 	0: node-id=1 store-id=1
-	// 2 result(s)
 }
 
 func Example_zone() {
-	c, err := newCLITest(nil, false)
-	if err != nil {
-		panic(err)
-	}
-	defer c.stop(true)
+	storeSpec := base.DefaultTestStoreSpec
+	storeSpec.Attributes = roachpb.Attributes{Attrs: []string{"ssd"}}
+	c := newCLITest(cliTestParams{
+		storeSpecs: []base.StoreSpec{storeSpec},
+		locality: roachpb.Locality{
+			Tiers: []roachpb.Tier{
+				{Key: "region", Value: "us-east-1"},
+				{Key: "zone", Value: "us-east-1a"},
+			},
+		},
+	})
+	defer c.cleanup()
 
 	c.Run("zone ls")
 	c.Run("zone set system --file=./testdata/zone_attrs.yaml")
 	c.Run("zone ls")
+	c.Run("zone get .liveness")
+	c.Run("zone get .meta")
 	c.Run("zone get system.nonexistent")
-	c.Run("zone get system.lease")
+	c.Run("zone get system.descriptor")
+	c.Run("zone set system.descriptor --file=./testdata/zone_attrs.yaml")
+	c.Run("zone set system.namespace --file=./testdata/zone_attrs.yaml")
+	c.Run("zone set system.nonexistent --file=./testdata/zone_attrs.yaml")
 	c.Run("zone set system --file=./testdata/zone_range_max_bytes.yaml")
 	c.Run("zone get system")
 	c.Run("zone rm system")
 	c.Run("zone ls")
 	c.Run("zone rm .default")
+	c.Run("zone set .liveness --file=./testdata/zone_range_max_bytes.yaml")
+	c.Run("zone set .meta --file=./testdata/zone_range_max_bytes.yaml")
+	c.Run("zone set .system --file=./testdata/zone_range_max_bytes.yaml")
+	c.Run("zone set .timeseries --file=./testdata/zone_range_max_bytes.yaml")
+	c.Run("zone get .system")
+	c.Run("zone ls")
 	c.Run("zone set .default --file=./testdata/zone_range_max_bytes.yaml")
 	c.Run("zone get system")
 	c.Run("zone set .default --disable-replication")
 	c.Run("zone get system")
+	c.Run("zone rm .liveness")
+	c.Run("zone rm .meta")
+	c.Run("zone rm .system")
+	c.Run("zone ls")
+	c.Run("zone rm .timeseries")
+	c.Run("zone ls")
+	c.Run("zone rm .liveness")
+	c.Run("zone rm .meta")
+	c.Run("zone rm .system")
+	c.Run("zone rm .timeseries")
+	c.Run("zone set system.jobs@primary --file=./testdata/zone_attrs.yaml")
+	c.Run("zone set system --file=./testdata/zone_attrs_advanced.yaml")
+	c.Run("zone set system --file=./testdata/zone_attrs_experimental.yaml")
+	c.RunWithArgs([]string{"sql", "-e", "create database t; create table t.f (x int, y int)"})
+	c.Run("zone set t --file=./testdata/zone_range_max_bytes.yaml")
+	c.Run("zone ls")
+	c.Run("zone set t.f --file=./testdata/zone_range_max_bytes.yaml")
+	c.Run("zone ls")
+	c.RunWithArgs([]string{"sql", "-e", "drop database t cascade"})
+	c.Run("zone ls")
 
 	// Output:
 	// zone ls
 	// .default
+	// .liveness
+	// .meta
+	// .system
+	// system
+	// system.jobs
 	// zone set system --file=./testdata/zone_attrs.yaml
-	// range_min_bytes: 1048576
+	// range_min_bytes: 16777216
 	// range_max_bytes: 67108864
 	// gc:
-	//   ttlseconds: 86400
+	//   ttlseconds: 90000
 	// num_replicas: 1
-	// constraints: [us-east-1a, ssd]
+	// constraints: [+zone=us-east-1a, +ssd]
+	// lease_preferences: []
+	//
 	// zone ls
 	// .default
+	// .liveness
+	// .meta
+	// .system
 	// system
+	// system.jobs
+	// zone get .liveness
+	// .liveness
+	// range_min_bytes: 16777216
+	// range_max_bytes: 67108864
+	// gc:
+	//   ttlseconds: 600
+	// num_replicas: 5
+	// constraints: []
+	// lease_preferences: []
+	// zone get .meta
+	// .meta
+	// range_min_bytes: 16777216
+	// range_max_bytes: 67108864
+	// gc:
+	//   ttlseconds: 3600
+	// num_replicas: 5
+	// constraints: []
+	// lease_preferences: []
 	// zone get system.nonexistent
-	// system.nonexistent not found
-	// zone get system.lease
+	// pq: relation "system.public.nonexistent" does not exist
+	// zone get system.descriptor
 	// system
-	// range_min_bytes: 1048576
+	// range_min_bytes: 16777216
 	// range_max_bytes: 67108864
 	// gc:
-	//   ttlseconds: 86400
+	//   ttlseconds: 90000
 	// num_replicas: 1
-	// constraints: [us-east-1a, ssd]
+	// constraints: [+zone=us-east-1a, +ssd]
+	// lease_preferences: []
+	// zone set system.descriptor --file=./testdata/zone_attrs.yaml
+	// pq: cannot set zone configs for system config tables; try setting your config on the entire "system" database instead
+	// zone set system.namespace --file=./testdata/zone_attrs.yaml
+	// pq: cannot set zone configs for system config tables; try setting your config on the entire "system" database instead
+	// zone set system.nonexistent --file=./testdata/zone_attrs.yaml
+	// pq: relation "system.public.nonexistent" does not exist
 	// zone set system --file=./testdata/zone_range_max_bytes.yaml
-	// range_min_bytes: 1048576
+	// range_min_bytes: 16777216
 	// range_max_bytes: 134217728
 	// gc:
-	//   ttlseconds: 86400
+	//   ttlseconds: 90000
 	// num_replicas: 3
-	// constraints: [us-east-1a, ssd]
+	// constraints: [+zone=us-east-1a, +ssd]
+	// lease_preferences: []
+	//
 	// zone get system
 	// system
-	// range_min_bytes: 1048576
+	// range_min_bytes: 16777216
 	// range_max_bytes: 134217728
 	// gc:
-	//   ttlseconds: 86400
+	//   ttlseconds: 90000
 	// num_replicas: 3
-	// constraints: [us-east-1a, ssd]
+	// constraints: [+zone=us-east-1a, +ssd]
+	// lease_preferences: []
 	// zone rm system
-	// DELETE 1
 	// zone ls
 	// .default
+	// .liveness
+	// .meta
+	// .system
+	// system.jobs
 	// zone rm .default
-	// unable to remove .default
+	// pq: cannot remove default zone
+	// zone set .liveness --file=./testdata/zone_range_max_bytes.yaml
+	// range_min_bytes: 16777216
+	// range_max_bytes: 134217728
+	// gc:
+	//   ttlseconds: 600
+	// num_replicas: 3
+	// constraints: []
+	// lease_preferences: []
+	//
+	// zone set .meta --file=./testdata/zone_range_max_bytes.yaml
+	// range_min_bytes: 16777216
+	// range_max_bytes: 134217728
+	// gc:
+	//   ttlseconds: 3600
+	// num_replicas: 3
+	// constraints: []
+	// lease_preferences: []
+	//
+	// zone set .system --file=./testdata/zone_range_max_bytes.yaml
+	// range_min_bytes: 16777216
+	// range_max_bytes: 134217728
+	// gc:
+	//   ttlseconds: 90000
+	// num_replicas: 3
+	// constraints: []
+	// lease_preferences: []
+	//
+	// zone set .timeseries --file=./testdata/zone_range_max_bytes.yaml
+	// range_min_bytes: 16777216
+	// range_max_bytes: 134217728
+	// gc:
+	//   ttlseconds: 90000
+	// num_replicas: 3
+	// constraints: []
+	// lease_preferences: []
+	//
+	// zone get .system
+	// .system
+	// range_min_bytes: 16777216
+	// range_max_bytes: 134217728
+	// gc:
+	//   ttlseconds: 90000
+	// num_replicas: 3
+	// constraints: []
+	// lease_preferences: []
+	// zone ls
+	// .default
+	// .liveness
+	// .meta
+	// .system
+	// .timeseries
+	// system.jobs
 	// zone set .default --file=./testdata/zone_range_max_bytes.yaml
-	// range_min_bytes: 1048576
+	// range_min_bytes: 16777216
 	// range_max_bytes: 134217728
 	// gc:
-	//   ttlseconds: 86400
+	//   ttlseconds: 90000
 	// num_replicas: 3
 	// constraints: []
+	// lease_preferences: []
+	//
 	// zone get system
 	// .default
-	// range_min_bytes: 1048576
+	// range_min_bytes: 16777216
 	// range_max_bytes: 134217728
 	// gc:
-	//   ttlseconds: 86400
+	//   ttlseconds: 90000
 	// num_replicas: 3
 	// constraints: []
+	// lease_preferences: []
 	// zone set .default --disable-replication
-	// range_min_bytes: 1048576
+	// range_min_bytes: 16777216
 	// range_max_bytes: 134217728
 	// gc:
-	//   ttlseconds: 86400
+	//   ttlseconds: 90000
 	// num_replicas: 1
 	// constraints: []
+	// lease_preferences: []
+	//
 	// zone get system
 	// .default
-	// range_min_bytes: 1048576
+	// range_min_bytes: 16777216
 	// range_max_bytes: 134217728
 	// gc:
-	//   ttlseconds: 86400
+	//   ttlseconds: 90000
 	// num_replicas: 1
 	// constraints: []
+	// lease_preferences: []
+	// zone rm .liveness
+	// zone rm .meta
+	// zone rm .system
+	// zone ls
+	// .default
+	// .timeseries
+	// system.jobs
+	// zone rm .timeseries
+	// zone ls
+	// .default
+	// system.jobs
+	// zone rm .liveness
+	// zone rm .meta
+	// zone rm .system
+	// zone rm .timeseries
+	// zone set system.jobs@primary --file=./testdata/zone_attrs.yaml
+	// pq: setting zone configs on indexes or partitions requires a CCL binary
+	// zone set system --file=./testdata/zone_attrs_advanced.yaml
+	// range_min_bytes: 16777216
+	// range_max_bytes: 134217728
+	// gc:
+	//   ttlseconds: 90000
+	// num_replicas: 3
+	// constraints: {+region=us-east-1: 1, '+zone=us-east-1a,+ssd': 1}
+	// lease_preferences: [[+region=us-east-1], [+zone=us-east-1a]]
+	//
+	// zone set system --file=./testdata/zone_attrs_experimental.yaml
+	// range_min_bytes: 16777216
+	// range_max_bytes: 134217728
+	// gc:
+	//   ttlseconds: 90000
+	// num_replicas: 3
+	// constraints: {+region=us-east-1: 1, '+zone=us-east-1a,+ssd': 1}
+	// lease_preferences: [[+zone=us-east-1a]]
+	//
+	// sql -e create database t; create table t.f (x int, y int)
+	// CREATE TABLE
+	// zone set t --file=./testdata/zone_range_max_bytes.yaml
+	// range_min_bytes: 16777216
+	// range_max_bytes: 134217728
+	// gc:
+	//   ttlseconds: 90000
+	// num_replicas: 3
+	// constraints: []
+	// lease_preferences: []
+	//
+	// zone ls
+	// .default
+	// system
+	// system.jobs
+	// t
+	// zone set t.f --file=./testdata/zone_range_max_bytes.yaml
+	// range_min_bytes: 16777216
+	// range_max_bytes: 134217728
+	// gc:
+	//   ttlseconds: 90000
+	// num_replicas: 3
+	// constraints: []
+	// lease_preferences: []
+	//
+	// zone ls
+	// .default
+	// system
+	// system.jobs
+	// t
+	// t.f
+	// sql -e drop database t cascade
+	// DROP DATABASE
+	// zone ls
+	// .default
+	// system
+	// system.jobs
+}
+
+func Example_demo() {
+	c := newCLITest(cliTestParams{noServer: true})
+	defer c.cleanup()
+
+	testData := [][]string{
+		{`demo`, `-e`, `show database`},
+		{`demo`, `-e`, `show application_name`},
+		{`demo`, `--format=table`, `-e`, `show database`},
+		{`demo`, `-e`, `select 1 as "1"`, `-e`, `select 3 as "3"`},
+		{`demo`, `--echo-sql`, `-e`, `select 1 as "1"`},
+		{`demo`, `--set=errexit=0`, `-e`, `select nonexistent`, `-e`, `select 123 as "123"`},
+		{`demo`, `startrek`, `-e`, `show databases`},
+		{`demo`, `startrek`, `-e`, `show databases`, `--format=table`},
+	}
+	for _, cmd := range testData {
+		c.RunWithArgs(cmd)
+	}
+
+	// Output:
+	// demo -e show database
+	// database
+	// defaultdb
+	// demo -e show application_name
+	// application_name
+	// $ cockroach demo
+	// demo --format=table -e show database
+	//   database
+	// +-----------+
+	//   defaultdb
+	// (1 row)
+	// demo -e select 1 as "1" -e select 3 as "3"
+	// 1
+	// 1
+	// 3
+	// 3
+	// demo --echo-sql -e select 1 as "1"
+	// > select 1 as "1"
+	// 1
+	// 1
+	// demo --set=errexit=0 -e select nonexistent -e select 123 as "123"
+	// pq: column "nonexistent" does not exist
+	// 123
+	// 123
+	// demo startrek -e show databases
+	// database_name
+	// defaultdb
+	// postgres
+	// startrek
+	// system
+	// demo startrek -e show databases --format=table
+	//   database_name
+	// +---------------+
+	//   defaultdb
+	//   postgres
+	//   startrek
+	//   system
+	// (4 rows)
 }
 
 func Example_sql() {
-	c, err := newCLITest(nil, false)
-	if err != nil {
-		panic(err)
-	}
-	defer c.stop(true)
+	c := newCLITest(cliTestParams{})
+	defer c.cleanup()
 
-	c.RunWithArgs([]string{"sql", "-e", "create database t; create table t.f (x int, y int); insert into t.f values (42, 69)"})
-	c.RunWithArgs([]string{"sql", "-e", "select 3", "-e", "select * from t.f"})
-	c.RunWithArgs([]string{"sql", "-e", "begin", "-e", "select 3", "-e", "commit"})
-	c.RunWithArgs([]string{"sql", "-e", "select * from t.f"})
-	c.RunWithArgs([]string{"sql", "--execute=show databases"})
-	c.RunWithArgs([]string{"sql", "-e", "explain select 3"})
-	c.RunWithArgs([]string{"sql", "-e", "select 1; select 2"})
+	c.RunWithArgs([]string{`sql`, `-e`, `show application_name`})
+	c.RunWithArgs([]string{`sql`, `-e`, `create database t; create table t.f (x int, y int); insert into t.f values (42, 69)`})
+	c.RunWithArgs([]string{`sql`, `-e`, `select 3 as "3"`, `-e`, `select * from t.f`})
+	c.RunWithArgs([]string{`sql`, `-e`, `begin`, `-e`, `select 3 as "3"`, `-e`, `commit`})
+	c.RunWithArgs([]string{`sql`, `-e`, `select * from t.f`})
+	c.RunWithArgs([]string{`sql`, `--execute=show databases`})
+	c.RunWithArgs([]string{`sql`, `-e`, `select 1 as "1"; select 2 as "2"`})
+	c.RunWithArgs([]string{`sql`, `-e`, `select 1 as "1"; select 2 as "@" where false`})
+	// CREATE TABLE AS returns a SELECT tag with a row count, check this.
+	c.RunWithArgs([]string{`sql`, `-e`, `create table t.g1 (x int)`})
+	c.RunWithArgs([]string{`sql`, `-e`, `create table t.g2 as select * from generate_series(1,10)`})
+	// It must be possible to access pre-defined/virtual tables even if the current database
+	// does not exist yet.
+	c.RunWithArgs([]string{`sql`, `-d`, `nonexistent`, `-e`, `select count(*) from "".information_schema.tables limit 0`})
+	// It must be possible to create the current database after the
+	// connection was established.
+	c.RunWithArgs([]string{`sql`, `-d`, `nonexistent`, `-e`, `create database nonexistent; create table foo(x int); select * from foo`})
+	// COPY should return an intelligible error message.
+	c.RunWithArgs([]string{`sql`, `-e`, `copy t.f from stdin`})
+	// --echo-sql should print out the SQL statements.
+	c.RunWithArgs([]string{`user`, `ls`, `--echo-sql`})
+	// --set changes client-side variables before executing commands.
+	c.RunWithArgs([]string{`sql`, `--set=errexit=0`, `-e`, `select nonexistent`, `-e`, `select 123 as "123"`})
+	c.RunWithArgs([]string{`sql`, `--set`, `echo=true`, `-e`, `select 123 as "123"`})
+	c.RunWithArgs([]string{`sql`, `--set`, `unknownoption`, `-e`, `select 123 as "123"`})
 
 	// Output:
+	// sql -e show application_name
+	// application_name
+	// $ cockroach sql
 	// sql -e create database t; create table t.f (x int, y int); insert into t.f values (42, 69)
 	// INSERT 1
-	// sql -e select 3 -e select * from t.f
-	// 1 row
+	// sql -e select 3 as "3" -e select * from t.f
 	// 3
 	// 3
-	// 1 row
 	// x	y
 	// 42	69
-	// sql -e begin -e select 3 -e commit
+	// sql -e begin -e select 3 as "3" -e commit
 	// BEGIN
-	// 1 row
 	// 3
 	// 3
 	// COMMIT
 	// sql -e select * from t.f
-	// 1 row
 	// x	y
 	// 42	69
 	// sql --execute=show databases
-	// 4 rows
-	// Database
-	// information_schema
-	// pg_catalog
+	// database_name
+	// defaultdb
+	// postgres
 	// system
 	// t
-	// sql -e explain select 3
-	// 1 row
-	// Level	Type	Field	Description
-	// 0	nullrow
-	// sql -e select 1; select 2
-	// 1 row
+	// sql -e select 1 as "1"; select 2 as "2"
 	// 1
 	// 1
-	// 1 row
 	// 2
 	// 2
+	// sql -e select 1 as "1"; select 2 as "@" where false
+	// 1
+	// 1
+	// @
+	// sql -e create table t.g1 (x int)
+	// CREATE TABLE
+	// sql -e create table t.g2 as select * from generate_series(1,10)
+	// SELECT 10
+	// sql -d nonexistent -e select count(*) from "".information_schema.tables limit 0
+	// count
+	// sql -d nonexistent -e create database nonexistent; create table foo(x int); select * from foo
+	// x
+	// sql -e copy t.f from stdin
+	// woops! COPY has confused this client! Suggestion: use 'psql' for COPY
+	// user ls --echo-sql
+	// > SHOW USERS
+	// user_name
+	// root
+	// sql --set=errexit=0 -e select nonexistent -e select 123 as "123"
+	// pq: column "nonexistent" does not exist
+	// 123
+	// 123
+	// sql --set echo=true -e select 123 as "123"
+	// > select 123 as "123"
+	// 123
+	// 123
+	// sql --set unknownoption -e select 123 as "123"
+	// invalid syntax: \set unknownoption. Try \? for help.
+	// invalid syntax
 }
 
-func Example_sql_escape() {
-	c, err := newCLITest(nil, false)
-	if err != nil {
-		panic(err)
-	}
-	defer c.stop(true)
+func Example_sql_format() {
+	c := newCLITest(cliTestParams{})
+	defer c.cleanup()
 
-	c.RunWithArgs([]string{"sql", "-e", "create database t; create table t.t (s string, d string);"})
-	c.RunWithArgs([]string{"sql", "-e", "insert into t.t values (e'foo', 'printable ASCII')"})
-	c.RunWithArgs([]string{"sql", "-e", "insert into t.t values (e'\"foo', 'printable ASCII with quotes')"})
-	c.RunWithArgs([]string{"sql", "-e", "insert into t.t values (e'\\\\foo', 'printable ASCII with backslash')"})
-	c.RunWithArgs([]string{"sql", "-e", "insert into t.t values (e'foo\\x0abar', 'non-printable ASCII')"})
-	c.RunWithArgs([]string{"sql", "-e", "insert into t.t values ('κόσμε', 'printable UTF8')"})
-	c.RunWithArgs([]string{"sql", "-e", "insert into t.t values (e'\\xc3\\xb1', 'printable UTF8 using escapes')"})
-	c.RunWithArgs([]string{"sql", "-e", "insert into t.t values (e'\\x01', 'non-printable UTF8 string')"})
-	c.RunWithArgs([]string{"sql", "-e", "insert into t.t values (e'\\xdc\\x88\\x38\\x35', 'UTF8 string with RTL char')"})
-	c.RunWithArgs([]string{"sql", "-e", "insert into t.t values (e'\\xc3\\x28', 'non-UTF8 string')"})
-	c.RunWithArgs([]string{"sql", "-e", "insert into t.t values (e'a\\tb\\tc\\n12\\t123123213\\t12313', 'tabs')"})
-	c.RunWithArgs([]string{"sql", "-e", "select * from t.t"})
-	c.RunWithArgs([]string{"sql", "-e", "create table t.u (\"\"\"foo\" int, \"\\foo\" int, \"foo\nbar\" int, \"κόσμε\" int, \"܈85\" int)"})
-	c.RunWithArgs([]string{"sql", "-e", "insert into t.u values (0, 0, 0, 0, 0)"})
+	c.RunWithArgs([]string{"sql", "-e", "create database t; create table t.times (bare timestamp, withtz timestamptz)"})
+	c.RunWithArgs([]string{"sql", "-e", "insert into t.times values ('2016-01-25 10:10:10', '2016-01-25 10:10:10-05:00')"})
+	c.RunWithArgs([]string{"sql", "-e", "select * from t.times"})
+
+	// Output:
+	// sql -e create database t; create table t.times (bare timestamp, withtz timestamptz)
+	// CREATE TABLE
+	// sql -e insert into t.times values ('2016-01-25 10:10:10', '2016-01-25 10:10:10-05:00')
+	// INSERT 1
+	// sql -e select * from t.times
+	// bare	withtz
+	// 2016-01-25 10:10:10+00:00	2016-01-25 15:10:10+00:00
+}
+
+func Example_sql_column_labels() {
+	c := newCLITest(cliTestParams{})
+	defer c.cleanup()
+
+	testData := []string{
+		`f"oo`,
+		`f'oo`,
+		`f\oo`,
+		`short
+very very long
+not much`,
+		`very very long
+thenshort`,
+		`κόσμε`,
+		`a|b`,
+		`܈85`,
+	}
+
+	tdef := make([]string, len(testData))
+	var vals bytes.Buffer
+	for i, col := range testData {
+		tdef[i] = tree.NameString(col) + " int"
+		if i > 0 {
+			vals.WriteString(", ")
+		}
+		vals.WriteByte('0')
+	}
+	c.RunWithArgs([]string{"sql", "-e", "create database t; create table t.u (" + strings.Join(tdef, ", ") + ")"})
+	c.RunWithArgs([]string{"sql", "-e", "insert into t.u values (" + vals.String() + ")"})
 	c.RunWithArgs([]string{"sql", "-e", "show columns from t.u"})
 	c.RunWithArgs([]string{"sql", "-e", "select * from t.u"})
-	c.RunWithArgs([]string{"sql", "--pretty", "-e", "select * from t.t"})
-	c.RunWithArgs([]string{"sql", "--pretty", "-e", "show columns from t.u"})
-	c.RunWithArgs([]string{"sql", "--pretty", "-e", "select * from t.u"})
-	c.RunWithArgs([]string{"sql", "--pretty", "-e", "select '  hai' as x"})
-	c.RunWithArgs([]string{"sql", "--pretty", "-e", "explain(indent) select s from t.t union all select s from t.t"})
+	c.RunWithArgs([]string{"sql", "--format=table", "-e", "show columns from t.u"})
+	for i := tableDisplayFormat(0); i < tableDisplayLastFormat; i++ {
+		c.RunWithArgs([]string{"sql", "--format=" + i.String(), "-e", "select * from t.u"})
+	}
+
+	// Output
+	// sql -e create database t; create table t.u ("f""oo" int, "f'oo" int, "f\oo" int, "short
+	// very very long
+	// not much" int, "very very long
+	// thenshort" int, "κόσμε" int, "a|b" int, ܈85 int)
+	// CREATE TABLE
+	// sql -e insert into t.u values (0, 0, 0, 0, 0, 0, 0, 0)
+	// INSERT 1
+	// sql -e show columns from t.u
+	// column_name	data_type	is_nullable	column_default	generation_expression	indices
+	// "f""oo"	INT	true	NULL		{}
+	// f'oo	INT	true	NULL		{}
+	// f\oo	INT	true	NULL		{}
+	// "short
+	// very very long
+	// not much"	INT	true	NULL		{}
+	// "very very long
+	// thenshort"	INT	true	NULL		{}
+	// κόσμε	INT	true	NULL		{}
+	// a|b	INT	true	NULL		{}
+	// ܈85	INT	true	NULL		{}
+	// sql -e select * from t.u
+	// "f""oo"	f'oo	f\oo	"short
+	// very very long
+	// not much"	"very very long
+	// thenshort"	κόσμε	a|b	܈85
+	// 0	0	0	0	0	0	0	0
+	// sql --format=table -e show columns from t.u
+	//    column_name   | data_type | is_nullable | column_default | generation_expression | indices
+	// +----------------+-----------+-------------+----------------+-----------------------+---------+
+	//   f"oo           | INT       |    true     | NULL           |                       | {}
+	//   f'oo           | INT       |    true     | NULL           |                       | {}
+	//   f\oo           | INT       |    true     | NULL           |                       | {}
+	//   short          | INT       |    true     | NULL           |                       | {}
+	//   very very long |           |             |                |                       |
+	//   not much       |           |             |                |                       |
+	//   very very long | INT       |    true     | NULL           |                       | {}
+	//   thenshort      |           |             |                |                       |
+	//   κόσμε          | INT       |    true     | NULL           |                       | {}
+	//   a|b            | INT       |    true     | NULL           |                       | {}
+	//   ܈85            | INT       |    true     | NULL           |                       | {}
+	// (8 rows)
+	// sql --format=tsv -e select * from t.u
+	// "f""oo"	f'oo	f\oo	"short
+	// very very long
+	// not much"	"very very long
+	// thenshort"	κόσμε	a|b	܈85
+	// 0	0	0	0	0	0	0	0
+	// sql --format=csv -e select * from t.u
+	// "f""oo",f'oo,f\oo,"short
+	// very very long
+	// not much","very very long
+	// thenshort",κόσμε,a|b,܈85
+	// 0,0,0,0,0,0,0,0
+	// sql --format=table -e select * from t.u
+	//   f"oo | f'oo | f\oo |     short      | very very long | κόσμε | a|b | ܈85
+	//        |      |      | very very long |   thenshort    |       |     |
+	//        |      |      |    not much    |                |       |     |
+	// +------+------+------+----------------+----------------+-------+-----+-----+
+	//      0 |    0 |    0 |              0 |              0 |     0 |   0 |   0
+	// (1 row)
+	// sql --format=records -e select * from t.u
+	// -[ RECORD 1 ]
+	// f"oo           | 0
+	// f'oo           | 0
+	// f\oo           | 0
+	// short         +| 0
+	// very very long+|
+	// not much       |
+	// very very long+| 0
+	// thenshort      |
+	// κόσμε          | 0
+	// a|b            | 0
+	// ܈85            | 0
+	// sql --format=sql -e select * from t.u
+	// CREATE TABLE results (
+	//   "f""oo" STRING,
+	//   "f'oo" STRING,
+	//   "f\oo" STRING,
+	//   "short
+	// very very long
+	// not much" STRING,
+	//   "very very long
+	// thenshort" STRING,
+	//   "κόσμε" STRING,
+	//   "a|b" STRING,
+	//   ܈85 STRING
+	// );
+	//
+	// INSERT INTO results VALUES ('0', '0', '0', '0', '0', '0', '0', '0');
+	// -- 1 row
+	// sql --format=html -e select * from t.u
+	// <table>
+	// <thead><tr><th>row</th><th>f&#34;oo</th><th>f&#39;oo</th><th>f\oo</th><th>short<br/>very very long<br/>not much</th><th>very very long<br/>thenshort</th><th>κόσμε</th><th>a|b</th><th>܈85</th></tr></thead>
+	// <tbody>
+	// <tr><td>1</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td></tr>
+	// </tbody>
+	// <tfoot><tr><td colspan=9>1 row</td></tr></tfoot></table>
+	// sql --format=raw -e select * from t.u
+	// # 8 columns
+	// # row 1
+	// ## 1
+	// 0
+	// ## 1
+	// 0
+	// ## 1
+	// 0
+	// ## 1
+	// 0
+	// ## 1
+	// 0
+	// ## 1
+	// 0
+	// ## 1
+	// 0
+	// ## 1
+	// 0
+	// # 1 row
+}
+
+func Example_sql_empty_table() {
+	c := newCLITest(cliTestParams{})
+	defer c.cleanup()
+
+	c.RunWithArgs([]string{"sql", "-e", "create database t;" +
+		"create table t.norows(x int);" +
+		"create table t.nocolsnorows();" +
+		"create table t.nocols(); insert into t.nocols(rowid) values (1),(2),(3);"})
+	for _, table := range []string{"norows", "nocols", "nocolsnorows"} {
+		for format := tableDisplayFormat(0); format < tableDisplayLastFormat; format++ {
+			c.RunWithArgs([]string{"sql", "--format=" + format.String(), "-e", "select * from t." + table})
+		}
+	}
+
+	// Output:
+	// sql -e create database t;create table t.norows(x int);create table t.nocolsnorows();create table t.nocols(); insert into t.nocols(rowid) values (1),(2),(3);
+	// INSERT 3
+	// sql --format=tsv -e select * from t.norows
+	// x
+	// sql --format=csv -e select * from t.norows
+	// x
+	// sql --format=table -e select * from t.norows
+	//   x
+	// +---+
+	// (0 rows)
+	// sql --format=records -e select * from t.norows
+	// sql --format=sql -e select * from t.norows
+	// CREATE TABLE results (
+	//   x STRING
+	// );
+	//
+	// -- 0 rows
+	// sql --format=html -e select * from t.norows
+	// <table>
+	// <thead><tr><th>row</th><th>x</th></tr></thead>
+	// </tbody>
+	// <tfoot><tr><td colspan=2>0 rows</td></tr></tfoot></table>
+	// sql --format=raw -e select * from t.norows
+	// # 1 column
+	// # 0 rows
+	// sql --format=tsv -e select * from t.nocols
+	// # no columns
+	// # empty
+	// # empty
+	// # empty
+	// sql --format=csv -e select * from t.nocols
+	// # no columns
+	// # empty
+	// # empty
+	// # empty
+	// sql --format=table -e select * from t.nocols
+	// --
+	// (3 rows)
+	// sql --format=records -e select * from t.nocols
+	// (3 rows)
+	// sql --format=sql -e select * from t.nocols
+	// CREATE TABLE results (
+	// );
+	//
+	// INSERT INTO results(rowid) VALUES (DEFAULT);
+	// INSERT INTO results(rowid) VALUES (DEFAULT);
+	// INSERT INTO results(rowid) VALUES (DEFAULT);
+	// -- 3 rows
+	// sql --format=html -e select * from t.nocols
+	// <table>
+	// <thead><tr><th>row</th></tr></thead>
+	// <tbody>
+	// <tr><td>1</td></tr>
+	// <tr><td>2</td></tr>
+	// <tr><td>3</td></tr>
+	// </tbody>
+	// <tfoot><tr><td colspan=1>3 rows</td></tr></tfoot></table>
+	// sql --format=raw -e select * from t.nocols
+	// # 0 columns
+	// # row 1
+	// # row 2
+	// # row 3
+	// # 3 rows
+	// sql --format=tsv -e select * from t.nocolsnorows
+	// # no columns
+	// sql --format=csv -e select * from t.nocolsnorows
+	// # no columns
+	// sql --format=table -e select * from t.nocolsnorows
+	// --
+	// (0 rows)
+	// sql --format=records -e select * from t.nocolsnorows
+	// (0 rows)
+	// sql --format=sql -e select * from t.nocolsnorows
+	// CREATE TABLE results (
+	// );
+	//
+	// -- 0 rows
+	// sql --format=html -e select * from t.nocolsnorows
+	// <table>
+	// <thead><tr><th>row</th></tr></thead>
+	// </tbody>
+	// <tfoot><tr><td colspan=1>0 rows</td></tr></tfoot></table>
+	// sql --format=raw -e select * from t.nocolsnorows
+	// # 0 columns
+	// # 0 rows
+}
+
+func Example_csv_tsv_quoting() {
+	c := newCLITest(cliTestParams{})
+	defer c.cleanup()
+
+	testData := []string{
+		`ab`,
+		`a b`,
+		`a
+bc
+def`,
+		`a, b`,
+		`"a", "b"`,
+		`'a', 'b'`,
+		`a\,b`,
+		`a	b`,
+	}
+
+	for _, sqlStr := range testData {
+		escaped := lex.EscapeSQLString(sqlStr)
+		sql := "select " + escaped + " as s, " + escaped + " as t"
+		c.RunWithArgs([]string{"sql", "--format=csv", "-e", sql})
+		c.RunWithArgs([]string{"sql", "--format=tsv", "-e", sql})
+	}
+
+	for _, identStr := range testData {
+		escaped1 := tree.NameString(identStr + "1")
+		escaped2 := tree.NameString(identStr + "2")
+		sql := "select 1 as " + escaped1 + ", 2 as " + escaped2
+		c.RunWithArgs([]string{"sql", "--format=csv", "-e", sql})
+		c.RunWithArgs([]string{"sql", "--format=tsv", "-e", sql})
+	}
+
+	// Output:
+	// sql --format=csv -e select 'ab' as s, 'ab' as t
+	// s,t
+	// ab,ab
+	// sql --format=tsv -e select 'ab' as s, 'ab' as t
+	// s	t
+	// ab	ab
+	// sql --format=csv -e select 'a b' as s, 'a b' as t
+	// s,t
+	// a b,a b
+	// sql --format=tsv -e select 'a b' as s, 'a b' as t
+	// s	t
+	// a b	a b
+	// sql --format=csv -e select e'a\nbc\ndef' as s, e'a\nbc\ndef' as t
+	// s,t
+	// "a
+	// bc
+	// def","a
+	// bc
+	// def"
+	// sql --format=tsv -e select e'a\nbc\ndef' as s, e'a\nbc\ndef' as t
+	// s	t
+	// "a
+	// bc
+	// def"	"a
+	// bc
+	// def"
+	// sql --format=csv -e select 'a, b' as s, 'a, b' as t
+	// s,t
+	// "a, b","a, b"
+	// sql --format=tsv -e select 'a, b' as s, 'a, b' as t
+	// s	t
+	// a, b	a, b
+	// sql --format=csv -e select '"a", "b"' as s, '"a", "b"' as t
+	// s,t
+	// """a"", ""b""","""a"", ""b"""
+	// sql --format=tsv -e select '"a", "b"' as s, '"a", "b"' as t
+	// s	t
+	// """a"", ""b"""	"""a"", ""b"""
+	// sql --format=csv -e select e'\'a\', \'b\'' as s, e'\'a\', \'b\'' as t
+	// s,t
+	// "'a', 'b'","'a', 'b'"
+	// sql --format=tsv -e select e'\'a\', \'b\'' as s, e'\'a\', \'b\'' as t
+	// s	t
+	// 'a', 'b'	'a', 'b'
+	// sql --format=csv -e select e'a\\,b' as s, e'a\\,b' as t
+	// s,t
+	// "a\,b","a\,b"
+	// sql --format=tsv -e select e'a\\,b' as s, e'a\\,b' as t
+	// s	t
+	// a\,b	a\,b
+	// sql --format=csv -e select e'a\tb' as s, e'a\tb' as t
+	// s,t
+	// a	b,a	b
+	// sql --format=tsv -e select e'a\tb' as s, e'a\tb' as t
+	// s	t
+	// "a	b"	"a	b"
+	// sql --format=csv -e select 1 as ab1, 2 as ab2
+	// ab1,ab2
+	// 1,2
+	// sql --format=tsv -e select 1 as ab1, 2 as ab2
+	// ab1	ab2
+	// 1	2
+	// sql --format=csv -e select 1 as "a b1", 2 as "a b2"
+	// a b1,a b2
+	// 1,2
+	// sql --format=tsv -e select 1 as "a b1", 2 as "a b2"
+	// a b1	a b2
+	// 1	2
+	// sql --format=csv -e select 1 as "a
+	// bc
+	// def1", 2 as "a
+	// bc
+	// def2"
+	// "a
+	// bc
+	// def1","a
+	// bc
+	// def2"
+	// 1,2
+	// sql --format=tsv -e select 1 as "a
+	// bc
+	// def1", 2 as "a
+	// bc
+	// def2"
+	// "a
+	// bc
+	// def1"	"a
+	// bc
+	// def2"
+	// 1	2
+	// sql --format=csv -e select 1 as "a, b1", 2 as "a, b2"
+	// "a, b1","a, b2"
+	// 1,2
+	// sql --format=tsv -e select 1 as "a, b1", 2 as "a, b2"
+	// a, b1	a, b2
+	// 1	2
+	// sql --format=csv -e select 1 as """a"", ""b""1", 2 as """a"", ""b""2"
+	// """a"", ""b""1","""a"", ""b""2"
+	// 1,2
+	// sql --format=tsv -e select 1 as """a"", ""b""1", 2 as """a"", ""b""2"
+	// """a"", ""b""1"	"""a"", ""b""2"
+	// 1	2
+	// sql --format=csv -e select 1 as "'a', 'b'1", 2 as "'a', 'b'2"
+	// "'a', 'b'1","'a', 'b'2"
+	// 1,2
+	// sql --format=tsv -e select 1 as "'a', 'b'1", 2 as "'a', 'b'2"
+	// 'a', 'b'1	'a', 'b'2
+	// 1	2
+	// sql --format=csv -e select 1 as "a\,b1", 2 as "a\,b2"
+	// "a\,b1","a\,b2"
+	// 1,2
+	// sql --format=tsv -e select 1 as "a\,b1", 2 as "a\,b2"
+	// a\,b1	a\,b2
+	// 1	2
+	// sql --format=csv -e select 1 as "a	b1", 2 as "a	b2"
+	// a	b1,a	b2
+	// 1,2
+	// sql --format=tsv -e select 1 as "a	b1", 2 as "a	b2"
+	// "a	b1"	"a	b2"
+	// 1	2
+}
+
+func Example_sql_table() {
+	c := newCLITest(cliTestParams{})
+	defer c.cleanup()
+
+	testData := []struct {
+		str, desc string
+	}{
+		{"e'foo'", "printable ASCII"},
+		{"e'\"foo'", "printable ASCII with quotes"},
+		{"e'\\\\foo'", "printable ASCII with backslash"},
+		{"e'foo\\x0abar'", "non-printable ASCII"},
+		{"'κόσμε'", "printable UTF8"},
+		{"e'\\xc3\\xb1'", "printable UTF8 using escapes"},
+		{"e'\\x01'", "non-printable UTF8 string"},
+		{"e'\\xdc\\x88\\x38\\x35'", "UTF8 string with RTL char"},
+		{"e'a\\tb\\tc\\n12\\t123123213\\t12313'", "tabs"},
+		{"e'\\xc3\\x28'", "non-UTF8 string"}, // This expects an insert error.
+	}
+
+	c.RunWithArgs([]string{"sql", "-e", "create database t; create table t.t (s string, d string);"})
+	for _, t := range testData {
+		c.RunWithArgs([]string{"sql", "-e", "insert into t.t values (" + t.str + ", '" + t.desc + "')"})
+	}
+	c.RunWithArgs([]string{"sql", "-e", "select * from t.t"})
+	for format := tableDisplayFormat(0); format < tableDisplayLastFormat; format++ {
+		c.RunWithArgs([]string{"sql", "--format=" + format.String(), "-e", "select * from t.t"})
+	}
 
 	// Output:
 	// sql -e create database t; create table t.t (s string, d string);
@@ -785,145 +1378,418 @@ func Example_sql_escape() {
 	// INSERT 1
 	// sql -e insert into t.t values (e'\xdc\x88\x38\x35', 'UTF8 string with RTL char')
 	// INSERT 1
-	// sql -e insert into t.t values (e'\xc3\x28', 'non-UTF8 string')
-	// pq: invalid UTF-8 byte sequence
-	// insert into t.t values (e'\xc3\x28', 'non-UTF8 string')
-	//                         ^
-	//
 	// sql -e insert into t.t values (e'a\tb\tc\n12\t123123213\t12313', 'tabs')
 	// INSERT 1
+	// sql -e insert into t.t values (e'\xc3\x28', 'non-UTF8 string')
+	// pq: invalid UTF-8 byte sequence
+	// DETAIL: source SQL:
+	// insert into t.t values (e'\xc3\x28', 'non-UTF8 string')
+	//                         ^
+	// HINT: try \h VALUES
 	// sql -e select * from t.t
-	// 9 rows
 	// s	d
 	// foo	printable ASCII
-	// "\"foo"	printable ASCII with quotes
-	// "\\foo"	printable ASCII with backslash
-	// "foo\nbar"	non-printable ASCII
-	// "\u03ba\u1f79\u03c3\u03bc\u03b5"	printable UTF8
-	// "\u00f1"	printable UTF8 using escapes
-	// "\x01"	non-printable UTF8 string
-	// "\u070885"	UTF8 string with RTL char
-	// "a\tb\tc\n12\t123123213\t12313"	tabs
-	// sql -e create table t.u ("""foo" int, "\foo" int, "foo
-	// bar" int, "κόσμε" int, "܈85" int)
-	// CREATE TABLE
-	// sql -e insert into t.u values (0, 0, 0, 0, 0)
-	// INSERT 1
-	// sql -e show columns from t.u
-	// 5 rows
-	// Field	Type	Null	Default
-	// "\"foo"	INT	true	NULL
-	// "\\foo"	INT	true	NULL
-	// "foo\nbar"	INT	true	NULL
-	// "\u03ba\u1f79\u03c3\u03bc\u03b5"	INT	true	NULL
-	// "\u070885"	INT	true	NULL
-	// sql -e select * from t.u
-	// 1 row
-	// "\"foo"	"\\foo"	"foo\nbar"	"\u03ba\u1f79\u03c3\u03bc\u03b5"	"\u070885"
-	// 0	0	0	0	0
-	// sql --pretty -e select * from t.t
-	// +--------------------------------+--------------------------------+
-	// |               s                |               d                |
-	// +--------------------------------+--------------------------------+
-	// | foo                            | printable ASCII                |
-	// | "foo                           | printable ASCII with quotes    |
-	// | \foo                           | printable ASCII with backslash |
-	// | foo␤                           | non-printable ASCII            |
-	// | bar                            |                                |
-	// | κόσμε                          | printable UTF8                 |
-	// | ñ                              | printable UTF8 using escapes   |
-	// | "\x01"                         | non-printable UTF8 string      |
-	// | ܈85                            | UTF8 string with RTL char      |
-	// | a   b         c␤               | tabs                           |
-	// | 12  123123213 12313            |                                |
-	// +--------------------------------+--------------------------------+
+	// """foo"	printable ASCII with quotes
+	// \foo	printable ASCII with backslash
+	// "foo
+	// bar"	non-printable ASCII
+	// κόσμε	printable UTF8
+	// ñ	printable UTF8 using escapes
+	// \x01	non-printable UTF8 string
+	// ܈85	UTF8 string with RTL char
+	// "a	b	c
+	// 12	123123213	12313"	tabs
+	// sql --format=tsv -e select * from t.t
+	// s	d
+	// foo	printable ASCII
+	// """foo"	printable ASCII with quotes
+	// \foo	printable ASCII with backslash
+	// "foo
+	// bar"	non-printable ASCII
+	// κόσμε	printable UTF8
+	// ñ	printable UTF8 using escapes
+	// \x01	non-printable UTF8 string
+	// ܈85	UTF8 string with RTL char
+	// "a	b	c
+	// 12	123123213	12313"	tabs
+	// sql --format=csv -e select * from t.t
+	// s,d
+	// foo,printable ASCII
+	// """foo",printable ASCII with quotes
+	// \foo,printable ASCII with backslash
+	// "foo
+	// bar",non-printable ASCII
+	// κόσμε,printable UTF8
+	// ñ,printable UTF8 using escapes
+	// \x01,non-printable UTF8 string
+	// ܈85,UTF8 string with RTL char
+	// "a	b	c
+	// 12	123123213	12313",tabs
+	// sql --format=table -e select * from t.t
+	//            s          |               d
+	// +---------------------+--------------------------------+
+	//   foo                 | printable ASCII
+	//   "foo                | printable ASCII with quotes
+	//   \foo                | printable ASCII with backslash
+	//   foo                 | non-printable ASCII
+	//   bar                 |
+	//   κόσμε               | printable UTF8
+	//   ñ                   | printable UTF8 using escapes
+	//   \x01                | non-printable UTF8 string
+	//   ܈85                 | UTF8 string with RTL char
+	//   a   b         c     | tabs
+	//   12  123123213 12313 |
 	// (9 rows)
-	// sql --pretty -e show columns from t.u
-	// +----------+------+------+---------+
-	// |  Field   | Type | Null | Default |
-	// +----------+------+------+---------+
-	// | "foo     | INT  | true | NULL    |
-	// | \foo     | INT  | true | NULL    |
-	// | foo␤     | INT  | true | NULL    |
-	// | bar      |      |      |         |
-	// | κόσμε    | INT  | true | NULL    |
-	// | ܈85      | INT  | true | NULL    |
-	// +----------+------+------+---------+
-	// (5 rows)
-	// sql --pretty -e select * from t.u
-	// +------+------+------------+-------+-----+
-	// | "foo | \foo | "foo\nbar" | κόσμε | ܈85 |
-	// +------+------+------------+-------+-----+
-	// |    0 |    0 |          0 |     0 |   0 |
-	// +------+------+------------+-------+-----+
+	// sql --format=records -e select * from t.t
+	// -[ RECORD 1 ]
+	// s | foo
+	// d | printable ASCII
+	// -[ RECORD 2 ]
+	// s | "foo
+	// d | printable ASCII with quotes
+	// -[ RECORD 3 ]
+	// s | \foo
+	// d | printable ASCII with backslash
+	// -[ RECORD 4 ]
+	// s | foo+
+	//   | bar
+	// d | non-printable ASCII
+	// -[ RECORD 5 ]
+	// s | κόσμε
+	// d | printable UTF8
+	// -[ RECORD 6 ]
+	// s | ñ
+	// d | printable UTF8 using escapes
+	// -[ RECORD 7 ]
+	// s | \x01
+	// d | non-printable UTF8 string
+	// -[ RECORD 8 ]
+	// s | ܈85
+	// d | UTF8 string with RTL char
+	// -[ RECORD 9 ]
+	// s | a	b	c+
+	//   | 12	123123213	12313
+	// d | tabs
+	// sql --format=sql -e select * from t.t
+	// CREATE TABLE results (
+	//   s STRING,
+	//   d STRING
+	// );
+	//
+	// INSERT INTO results VALUES ('foo', 'printable ASCII');
+	// INSERT INTO results VALUES ('"foo', 'printable ASCII with quotes');
+	// INSERT INTO results VALUES (e'\\foo', 'printable ASCII with backslash');
+	// INSERT INTO results VALUES (e'foo\nbar', 'non-printable ASCII');
+	// INSERT INTO results VALUES (e'\u03BA\U00001F79\u03C3\u03BC\u03B5', 'printable UTF8');
+	// INSERT INTO results VALUES (e'\u00F1', 'printable UTF8 using escapes');
+	// INSERT INTO results VALUES (e'\\x01', 'non-printable UTF8 string');
+	// INSERT INTO results VALUES (e'\u070885', 'UTF8 string with RTL char');
+	// INSERT INTO results VALUES (e'a\tb\tc\n12\t123123213\t12313', 'tabs');
+	// -- 9 rows
+	// sql --format=html -e select * from t.t
+	// <table>
+	// <thead><tr><th>row</th><th>s</th><th>d</th></tr></thead>
+	// <tbody>
+	// <tr><td>1</td><td>foo</td><td>printable ASCII</td></tr>
+	// <tr><td>2</td><td>&#34;foo</td><td>printable ASCII with quotes</td></tr>
+	// <tr><td>3</td><td>\foo</td><td>printable ASCII with backslash</td></tr>
+	// <tr><td>4</td><td>foo<br/>bar</td><td>non-printable ASCII</td></tr>
+	// <tr><td>5</td><td>κόσμε</td><td>printable UTF8</td></tr>
+	// <tr><td>6</td><td>ñ</td><td>printable UTF8 using escapes</td></tr>
+	// <tr><td>7</td><td>\x01</td><td>non-printable UTF8 string</td></tr>
+	// <tr><td>8</td><td>܈85</td><td>UTF8 string with RTL char</td></tr>
+	// <tr><td>9</td><td>a	b	c<br/>12	123123213	12313</td><td>tabs</td></tr>
+	// </tbody>
+	// <tfoot><tr><td colspan=3>9 rows</td></tr></tfoot></table>
+	// sql --format=raw -e select * from t.t
+	// # 2 columns
+	// # row 1
+	// ## 3
+	// foo
+	// ## 15
+	// printable ASCII
+	// # row 2
+	// ## 4
+	// "foo
+	// ## 27
+	// printable ASCII with quotes
+	// # row 3
+	// ## 4
+	// \foo
+	// ## 30
+	// printable ASCII with backslash
+	// # row 4
+	// ## 7
+	// foo
+	// bar
+	// ## 19
+	// non-printable ASCII
+	// # row 5
+	// ## 11
+	// κόσμε
+	// ## 14
+	// printable UTF8
+	// # row 6
+	// ## 2
+	// ñ
+	// ## 28
+	// printable UTF8 using escapes
+	// # row 7
+	// ## 4
+	// \x01
+	// ## 25
+	// non-printable UTF8 string
+	// # row 8
+	// ## 4
+	// ܈85
+	// ## 25
+	// UTF8 string with RTL char
+	// # row 9
+	// ## 24
+	// a	b	c
+	// 12	123123213	12313
+	// ## 4
+	// tabs
+	// # 9 rows
+}
+
+func TestRenderHTML(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	cols := []string{"colname"}
+	align := "d"
+	rows := [][]string{
+		{"<b>foo</b>"},
+		{"bar"},
+	}
+
+	type testCase struct {
+		reporter htmlReporter
+		out      string
+	}
+
+	testCases := []testCase{
+		{
+			reporter: htmlReporter{},
+			out: `<table>
+<thead><tr><th>colname</th></tr></thead>
+<tbody>
+<tr><td><b>foo</b></td></tr>
+<tr><td>bar</td></tr>
+</tbody>
+</table>
+`,
+		},
+		{
+			reporter: htmlReporter{escape: true},
+			out: `<table>
+<thead><tr><th>colname</th></tr></thead>
+<tbody>
+<tr><td>&lt;b&gt;foo&lt;/b&gt;</td></tr>
+<tr><td>bar</td></tr>
+</tbody>
+</table>
+`,
+		},
+		{
+			reporter: htmlReporter{rowStats: true},
+			out: `<table>
+<thead><tr><th>row</th><th>colname</th></tr></thead>
+<tbody>
+<tr><td>1</td><td><b>foo</b></td></tr>
+<tr><td>2</td><td>bar</td></tr>
+</tbody>
+<tfoot><tr><td colspan=2>2 rows</td></tr></tfoot></table>
+`,
+		},
+		{
+			reporter: htmlReporter{escape: true, rowStats: true},
+			out: `<table>
+<thead><tr><th>row</th><th>colname</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>&lt;b&gt;foo&lt;/b&gt;</td></tr>
+<tr><td>2</td><td>bar</td></tr>
+</tbody>
+<tfoot><tr><td colspan=2>2 rows</td></tr></tfoot></table>
+`,
+		},
+	}
+
+	for _, tc := range testCases {
+		name := fmt.Sprintf("escape=%v/rowStats=%v", tc.reporter.escape, tc.reporter.rowStats)
+		t.Run(name, func(t *testing.T) {
+			var buf bytes.Buffer
+			err := render(&tc.reporter, &buf,
+				cols, newRowSliceIter(rows, align),
+				nil /* completedHook */, nil /* noRowsHook */)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.out != buf.String() {
+				t.Errorf("expected:\n%s\ngot:\n%s", tc.out, buf.String())
+			}
+		})
+	}
+}
+
+func Example_misc_table() {
+	c := newCLITest(cliTestParams{})
+	defer c.cleanup()
+
+	c.RunWithArgs([]string{"sql", "-e", "create database t; create table t.t (s string, d string);"})
+	c.RunWithArgs([]string{"sql", "--format=table", "-e", "select '  hai' as x"})
+	c.RunWithArgs([]string{"sql", "--format=table", "-e", "explain select s, 'foo' from t.t"})
+
+	// Output:
+	// sql -e create database t; create table t.t (s string, d string);
+	// CREATE TABLE
+	// sql --format=table -e select '  hai' as x
+	//     x
+	// +-------+
+	//     hai
 	// (1 row)
-	// sql --pretty -e select '  hai' as x
-	// +-------+
-	// |   x   |
-	// +-------+
-	// | ‌  hai |
-	// +-------+
-	// (1 row)
-	// sql --pretty -e explain(indent) select s from t.t union all select s from t.t
-	// +-------+--------+-------+-----------------+
-	// | Level |  Type  | Field |   Description   |
-	// +-------+--------+-------+-----------------+
-	// |     0 | append |       | ‌ -> append      |
-	// |     1 | scan   |       | ‌   -> scan      |
-	// |     1 |        | table | ‌      t@primary |
-	// |     1 | scan   |       | ‌   -> scan      |
-	// |     1 |        | table | ‌      t@primary |
-	// +-------+--------+-------+-----------------+
-	// (5 rows)
+	// sql --format=table -e explain select s, 'foo' from t.t
+	//     tree    | field | description
+	// +-----------+-------+-------------+
+	//   render    |       |
+	//    └── scan |       |
+	//             | table | t@primary
+	//             | spans | ALL
+	// (4 rows)
 }
 
 func Example_user() {
-	c, err := newCLITest(nil, false)
-	if err != nil {
-		panic(err)
-	}
-	defer c.stop(true)
+	c := newCLITest(cliTestParams{})
+	defer c.cleanup()
 
 	c.Run("user ls")
-	c.Run("user ls --pretty")
-	c.Run("user ls --pretty=false")
+	c.Run("user ls --format=table")
+	c.Run("user ls --format=tsv")
+	c.Run("user set FOO")
+	c.RunWithArgs([]string{"sql", "-e", "create user if not exists 'FOO'"})
+	c.Run("user set Foo")
+	c.Run("user set fOo")
+	c.Run("user set foO")
 	c.Run("user set foo")
+	c.Run("user set _foo")
+	c.Run("user set f_oo")
+	c.Run("user set foo_")
+	c.Run("user set ,foo")
+	c.Run("user set f,oo")
+	c.Run("user set foo,")
+	c.Run("user set 0foo")
+	c.Run("user set foo0")
+	c.Run("user set f0oo")
+	c.Run("user set foofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoof")
+	c.Run("user set foofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoo")
+	c.Run("user set Ομηρος")
+	// Try some reserved keywords.
+	c.Run("user set and")
+	c.Run("user set table")
 	// Don't use get, since the output of hashedPassword is random.
 	// c.Run("user get foo")
-	c.Run("user ls --pretty")
+	c.Run("user ls --format=table")
 	c.Run("user rm foo")
-	c.Run("user ls --pretty")
+	c.Run("user ls --format=table")
 
 	// Output:
 	// user ls
-	// 0 rows
-	// username
-	// user ls --pretty
-	// +----------+
-	// | username |
-	// +----------+
-	// +----------+
-	// (0 rows)
-	// user ls --pretty=false
-	// 0 rows
-	// username
-	// user set foo
-	// INSERT 1
-	// user ls --pretty
-	// +----------+
-	// | username |
-	// +----------+
-	// | foo      |
-	// +----------+
+	// user_name
+	// root
+	// user ls --format=table
+	//   user_name
+	// +-----------+
+	//   root
 	// (1 row)
+	// user ls --format=tsv
+	// user_name
+	// root
+	// user set FOO
+	// CREATE USER 1
+	// sql -e create user if not exists 'FOO'
+	// CREATE USER 0
+	// user set Foo
+	// CREATE USER 0
+	// user set fOo
+	// CREATE USER 0
+	// user set foO
+	// CREATE USER 0
+	// user set foo
+	// CREATE USER 0
+	// user set _foo
+	// CREATE USER 1
+	// user set f_oo
+	// CREATE USER 1
+	// user set foo_
+	// CREATE USER 1
+	// user set ,foo
+	// pq: username ",foo" invalid; usernames are case insensitive, must start with a letter or underscore, may contain letters, digits, dashes, or underscores, and must not exceed 63 characters
+	// user set f,oo
+	// pq: username "f,oo" invalid; usernames are case insensitive, must start with a letter or underscore, may contain letters, digits, dashes, or underscores, and must not exceed 63 characters
+	// user set foo,
+	// pq: username "foo," invalid; usernames are case insensitive, must start with a letter or underscore, may contain letters, digits, dashes, or underscores, and must not exceed 63 characters
+	// user set 0foo
+	// pq: username "0foo" invalid; usernames are case insensitive, must start with a letter or underscore, may contain letters, digits, dashes, or underscores, and must not exceed 63 characters
+	// user set foo0
+	// CREATE USER 1
+	// user set f0oo
+	// CREATE USER 1
+	// user set foofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoof
+	// pq: username "foofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoof" invalid; usernames are case insensitive, must start with a letter or underscore, may contain letters, digits, dashes, or underscores, and must not exceed 63 characters
+	// user set foofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoo
+	// CREATE USER 1
+	// user set Ομηρος
+	// CREATE USER 1
+	// user set and
+	// CREATE USER 1
+	// user set table
+	// CREATE USER 1
+	// user ls --format=table
+	//                              user_name
+	// +-----------------------------------------------------------------+
+	//   _foo
+	//   and
+	//   f0oo
+	//   f_oo
+	//   foo
+	//   foo0
+	//   foo_
+	//   foofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoo
+	//   root
+	//   table
+	//   ομηρος
+	// (11 rows)
 	// user rm foo
-	// DELETE 1
-	// user ls --pretty
-	// +----------+
-	// | username |
-	// +----------+
-	// +----------+
-	// (0 rows)
+	// DROP USER 1
+	// user ls --format=table
+	//                              user_name
+	// +-----------------------------------------------------------------+
+	//   _foo
+	//   and
+	//   f0oo
+	//   f_oo
+	//   foo0
+	//   foo_
+	//   foofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoo
+	//   root
+	//   table
+	//   ομηρος
+	// (10 rows)
+}
+
+func Example_cert() {
+	c := newCLITest(cliTestParams{})
+	defer c.cleanup()
+
+	c.RunWithCAArgs([]string{"cert", "create-client", "foo"})
+	c.RunWithCAArgs([]string{"cert", "create-client", "Ομηρος"})
+	c.RunWithCAArgs([]string{"cert", "create-client", "0foo"})
+
+	// Output:
+	// cert create-client foo
+	// cert create-client Ομηρος
+	// cert create-client 0foo
+	// failed to generate client certificate and key: username "0foo" invalid; usernames are case insensitive, must start with a letter or underscore, may contain letters, digits, dashes, or underscores, and must not exceed 63 characters
 }
 
 // TestFlagUsage is a basic test to make sure the fragile
@@ -931,85 +1797,98 @@ func Example_user() {
 func TestFlagUsage(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	// Override os.Stdout with our own.
-	old := os.Stdout
-	defer func() {
-		os.Stdout = old
-	}()
-
-	r, w, _ := os.Pipe()
-	os.Stdout = w
-
-	done := make(chan struct{})
-	var buf bytes.Buffer
-	// copy the output in a separate goroutine so printing can't block indefinitely.
-	go func() {
-		// Copy reads 'r' until EOF is reached.
-		_, _ = io.Copy(&buf, r)
-		close(done)
-	}()
-
-	if err := Run([]string{"help"}); err != nil {
-		fmt.Println(err)
-	}
-
-	// back to normal state
-	w.Close()
-	<-done
-
-	// Filter out all test flags.
-	testFlagRE := regexp.MustCompile(`--(test\.|verbosity|vmodule)`)
-	lines := strings.Split(buf.String(), "\n")
-	final := []string{}
-	for _, l := range lines {
-		if testFlagRE.MatchString(l) {
-			continue
-		}
-		final = append(final, l)
-	}
-	got := strings.Join(final, "\n")
-	expected := `CockroachDB command-line interface and server.
-
-Usage:
+	expUsage := `Usage:
   cockroach [command]
 
 Available Commands:
-  start          start a node
-  cert           create ca, node, and client certs
-  freeze-cluster freeze the cluster in preparation for an update
-  quit           drain and shutdown node
+  start       start a node
+  init        initialize a cluster
+  cert        create ca, node, and client certs
+  quit        drain and shutdown node
 
-  sql            open a sql shell
-  user           get, set, list and remove users
-  zone           get, set, list and remove zones
-  node           list nodes and show their status
-  dump           dump sql tables
+  sql         open a sql shell
+  user        get, set, list and remove users
+  node        list, inspect or remove nodes
+  dump        dump sql tables
 
-  gen            generate auxiliary files
-  version        output version information
-  debug          debugging commands
+  demo        open a demo sql shell
+  gen         generate auxiliary files
+  version     output version information
+  debug       debugging commands
+  sqlfmt      format SQL statements
+  workload    [experimental] generators for data and query loads
+  systembench Run systembench
+  help        Help about any command
 
 Flags:
-      --alsologtostderr Severity[=INFO]   logs at or above this threshold go to stderr (default INFO)
-      --log-backtrace-at traceLocation    when logging hits line file:N, emit a stack trace (default :0)
-      --log-dir string                    if non-empty, write log files in this directory
-      --logtostderr                       log to standard error instead of files
-      --no-color                          disable standard error log colorization
+  -h, --help                             help for cockroach
+      --logtostderr Severity[=DEFAULT]   logs at or above this threshold go to stderr (default NONE)
+      --no-color                         disable standard error log colorization
 
 Use "cockroach [command] --help" for more information about a command.
 `
+	helpExpected := fmt.Sprintf("CockroachDB command-line interface and server.\n\n%s", expUsage)
+	badFlagExpected := fmt.Sprintf("%s\nError: unknown flag: --foo\n", expUsage)
 
-	if got != expected {
-		t.Errorf("got:\n%s\n----\nexpected:\n%s", got, expected)
+	testCases := []struct {
+		flags    []string
+		expErr   bool
+		expected string
+	}{
+		{[]string{"help"}, false, helpExpected},    // request help specifically
+		{[]string{"--foo"}, true, badFlagExpected}, // unknown flag
+	}
+	for _, test := range testCases {
+		t.Run(strings.Join(test.flags, ","), func(t *testing.T) {
+			// Override os.Stdout or os.Stderr with our own.
+			r, w, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			cockroachCmd.SetOutput(w)
+			defer cockroachCmd.SetOutput(nil)
+
+			done := make(chan error)
+			var buf bytes.Buffer
+			// copy the output in a separate goroutine so printing can't block indefinitely.
+			go func() {
+				// Copy reads 'r' until EOF is reached.
+				_, err := io.Copy(&buf, r)
+				done <- err
+			}()
+
+			if err := Run(test.flags); err != nil && !test.expErr {
+				t.Error(err)
+			}
+
+			// back to normal state
+			w.Close()
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+
+			// Filter out all test flags.
+			testFlagRE := regexp.MustCompile(`--(test\.|vmodule|rewrite)`)
+			lines := strings.Split(buf.String(), "\n")
+			final := []string{}
+			for _, l := range lines {
+				if testFlagRE.MatchString(l) {
+					continue
+				}
+				final = append(final, l)
+			}
+			got := strings.Join(final, "\n")
+
+			if got != test.expected {
+				t.Errorf("got:\n%s\n----\nexpected:\n%s", got, test.expected)
+			}
+		})
 	}
 }
 
 func Example_node() {
-	c, err := newCLITest(nil, false)
-	if err != nil {
-		panic(err)
-	}
-	defer c.stop(true)
+	c := newCLITest(cliTestParams{})
+	defer c.cleanup()
 
 	// Refresh time series data, which is required to retrieve stats.
 	if err := c.WriteSummaries(); err != nil {
@@ -1017,78 +1896,105 @@ func Example_node() {
 	}
 
 	c.Run("node ls")
-	c.Run("node ls --pretty")
+	c.Run("node ls --format=table")
 	c.Run("node status 10000")
 
 	// Output:
 	// node ls
-	// 1 row
 	// id
 	// 1
-	// node ls --pretty
+	// node ls --format=table
+	//   id
 	// +----+
-	// | id |
-	// +----+
-	// |  1 |
-	// +----+
+	//    1
 	// (1 row)
 	// node status 10000
 	// Error: node 10000 doesn't exist
 }
 
-func TestFreeze(t *testing.T) {
+func TestCLITimeout(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	c, err := newCLITest(t, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.stop(true)
+	c := newCLITest(cliTestParams{})
+	defer c.cleanup()
 
-	assertOutput := func(msg string) {
-		if !strings.HasSuffix(strings.TrimSpace(msg), "ok") {
-			t.Fatal(errors.Errorf("expected trailing 'ok':\n%s", msg))
-		}
-	}
-
-	{
-		out, err := c.RunWithCapture("freeze-cluster")
+	// Wrap the meat of the test in a retry loop. Setting a timeout like this is
+	// racy as the operation may have succeeded by the time the scheduler gives
+	// the timeout a chance to have an effect. We specify --all to include some
+	// slower to access virtual tables in the query.
+	testutils.SucceedsSoon(t, func() error {
+		out, err := c.RunWithCapture("node status 1 --all --timeout 1ns")
 		if err != nil {
 			t.Fatal(err)
 		}
-		assertOutput(out)
-	}
-	{
-		out, err := c.RunWithCapture("freeze-cluster --undo")
-		if err != nil {
-			t.Fatal(err)
+
+		const exp = `node status 1 --all --timeout 1ns
+pq: query execution canceled due to statement timeout
+`
+		if out != exp {
+			err := errors.Errorf("unexpected output:\n%q\nwanted:\n%q", out, exp)
+			t.Log(err)
+			return err
 		}
-		assertOutput(out)
-	}
+		return nil
+	})
 }
 
 func TestNodeStatus(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	start := timeutil.Now()
-	c, err := newCLITest(t, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.stop(true)
+	c := newCLITest(cliTestParams{})
+	defer c.cleanup()
 
 	// Refresh time series data, which is required to retrieve stats.
 	if err := c.WriteSummaries(); err != nil {
 		t.Fatalf("couldn't write stats summaries: %s", err)
 	}
 
-	out, err := c.RunWithCapture("node status 1 --pretty")
+	out, err := c.RunWithCapture("node status 1 --format=table")
 	if err != nil {
 		t.Fatal(err)
 	}
 	checkNodeStatus(t, c, out, start)
 
-	out, err = c.RunWithCapture("node status --pretty")
+	out, err = c.RunWithCapture("node status --ranges --format=table")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkNodeStatus(t, c, out, start)
+
+	out, err = c.RunWithCapture("node status --stats --format=table")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkNodeStatus(t, c, out, start)
+
+	out, err = c.RunWithCapture("node status --ranges --stats --format=table")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkNodeStatus(t, c, out, start)
+
+	out, err = c.RunWithCapture("node status --decommission --format=table")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkNodeStatus(t, c, out, start)
+
+	out, err = c.RunWithCapture("node status --ranges --stats --decommission --format=table")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkNodeStatus(t, c, out, start)
+
+	out, err = c.RunWithCapture("node status --all --format=table")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkNodeStatus(t, c, out, start)
+
+	out, err = c.RunWithCapture("node status --format=table")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1099,12 +2005,16 @@ func checkNodeStatus(t *testing.T, c cliTest, output string, start time.Time) {
 	buf := bytes.NewBufferString(output)
 	s := bufio.NewScanner(buf)
 
+	type testCase struct {
+		name   string
+		idx    int
+		maxval int64
+	}
+
 	// Skip command line.
 	if !s.Scan() {
 		t.Fatalf("Couldn't skip command line: %s", s.Err())
 	}
-
-	checkSeparatorLine(t, s)
 
 	// check column names.
 	if !s.Scan() {
@@ -1114,8 +2024,8 @@ func checkNodeStatus(t *testing.T, c cliTest, output string, start time.Time) {
 	if err != nil {
 		t.Fatalf("%s", err)
 	}
-	if !reflect.DeepEqual(cols, nodesColumnHeaders) {
-		t.Fatalf("columns (%s) don't match expected (%s)", cols, nodesColumnHeaders)
+	if !reflect.DeepEqual(cols, getStatusNodeHeaders()) {
+		t.Fatalf("columns (%s) don't match expected (%s)", cols, getStatusNodeHeaders())
 	}
 
 	checkSeparatorLine(t, s)
@@ -1153,21 +2063,48 @@ func checkNodeStatus(t *testing.T, c cliTest, output string, start time.Time) {
 	checkTimeElapsed(t, fields[3], 15*time.Second, start)
 	checkTimeElapsed(t, fields[4], 15*time.Second, start)
 
-	// Verify all byte/range metrics.
-	testcases := []struct {
-		name   string
-		idx    int
-		maxval int64
-	}{
-		{"live_bytes", 5, 40000},
-		{"key_bytes", 6, 30000},
-		{"value_bytes", 7, 40000},
-		{"intent_bytes", 8, 30000},
-		{"system_bytes", 9, 30000},
-		{"leader_ranges", 10, 3},
-		{"repl_ranges", 11, 3},
-		{"avail_ranges", 12, 3},
+	testcases := []testCase{}
+
+	// We're skipping over the first 5 default fields such as node id and
+	// address. They don't need closer checks.
+	baseIdx := len(baseNodeColumnHeaders)
+
+	// Adding fields that need verification for --ranges flag.
+	// We have to allow up to 1 unavailable/underreplicated range because
+	// sometimes we run the `node status` command before the server has fully
+	// initialized itself and it doesn't consider itself live yet. In such cases,
+	// there will only be one range covering the entire keyspace because it won't
+	// have been able to do any splits yet.
+	if nodeCtx.statusShowRanges || nodeCtx.statusShowAll {
+		testcases = append(testcases,
+			testCase{"leader_ranges", baseIdx, 22},
+			testCase{"leaseholder_ranges", baseIdx + 1, 22},
+			testCase{"ranges", baseIdx + 2, 22},
+			testCase{"unavailable_ranges", baseIdx + 3, 1},
+			testCase{"underreplicated_ranges", baseIdx + 4, 1},
+		)
+		baseIdx += len(statusNodesColumnHeadersForRanges)
 	}
+
+	// Adding fields that need verification for --stats flag.
+	if nodeCtx.statusShowStats || nodeCtx.statusShowAll {
+		testcases = append(testcases,
+			testCase{"live_bytes", baseIdx, 100000},
+			testCase{"key_bytes", baseIdx + 1, 50000},
+			testCase{"value_bytes", baseIdx + 2, 100000},
+			testCase{"intent_bytes", baseIdx + 3, 50000},
+			testCase{"system_bytes", baseIdx + 4, 50000},
+		)
+		baseIdx += len(statusNodesColumnHeadersForStats)
+	}
+
+	if nodeCtx.statusShowDecommission || nodeCtx.statusShowAll {
+		testcases = append(testcases,
+			testCase{"gossiped_replicas", baseIdx, 30},
+		)
+		baseIdx++
+	}
+
 	for _, tc := range testcases {
 		val, err := strconv.ParseInt(fields[tc.idx], 10, 64)
 		if err != nil {
@@ -1183,7 +2120,15 @@ func checkNodeStatus(t *testing.T, c cliTest, output string, start time.Time) {
 		}
 	}
 
-	checkSeparatorLine(t, s)
+	if nodeCtx.statusShowDecommission || nodeCtx.statusShowAll {
+		names := []string{"is_decommissioning", "is_draining"}
+		for i := range names {
+			if fields[baseIdx] != "false" {
+				t.Errorf("value for %s (%s) should be false", names[i], fields[baseIdx])
+			}
+			baseIdx++
+		}
+	}
 }
 
 var separatorLineExp = regexp.MustCompile(`[\+-]+$`)
@@ -1221,10 +2166,9 @@ func extractFields(line string) ([]string, error) {
 	// fields has two extra entries, one for the empty token to the left of the first
 	// |, and another empty one to the right of the final |. So, we need to take those
 	// out.
-	if a, e := len(fields), len(nodesColumnHeaders)+2; a != e {
+	if a, e := len(fields), len(getStatusNodeHeaders()); a != e {
 		return nil, errors.Errorf("can't extract fields: # of fields (%d) != expected (%d)", a, e)
 	}
-	fields = fields[1 : len(fields)-1]
 	var r []string
 	for _, f := range fields {
 		r = append(r, strings.TrimSpace(f))
@@ -1279,17 +2223,262 @@ func TestGenAutocomplete(t *testing.T) {
 		}
 	}()
 
-	const minsize = 25000
-	acpath := filepath.Join(acdir, "cockroach.bash")
+	for _, tc := range []struct {
+		shell  string
+		expErr string
+	}{
+		{shell: ""},
+		{shell: "bash"},
+		{shell: "zsh"},
+		{shell: "bad", expErr: `invalid argument "bad" for "cockroach gen autocomplete"`},
+	} {
+		t.Run("shell="+tc.shell, func(t *testing.T) {
+			const minsize = 1000
+			acpath := filepath.Join(acdir, "output-"+tc.shell)
 
-	if err := Run([]string{"gen", "autocomplete", "--out=" + acpath}); err != nil {
-		t.Fatal(err)
+			args := []string{"gen", "autocomplete", "--out=" + acpath}
+			if len(tc.shell) > 0 {
+				args = append(args, tc.shell)
+			}
+			err := Run(args)
+			if tc.expErr == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if !testutils.IsError(err, tc.expErr) {
+					t.Fatalf("expected error %s, found %v", tc.expErr, err)
+				}
+				return
+			}
+
+			info, err := os.Stat(acpath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if size := info.Size(); size < minsize {
+				t.Fatalf("autocomplete file size (%d) < minimum (%d)", size, minsize)
+			}
+		})
 	}
-	info, err := os.Stat(acpath)
+}
+
+func TestJunkPositionalArguments(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	c := newCLITest(cliTestParams{t: t, noServer: true})
+	defer c.cleanup()
+
+	for i, test := range []string{
+		"start",
+		"sql",
+		"gen man",
+		"gen example-data intro",
+	} {
+		const junk = "junk"
+		line := test + " " + junk
+		out, err := c.RunWithCapture(line)
+		if err != nil {
+			t.Fatal(errors.Wrap(err, strconv.Itoa(i)))
+		}
+		exp := fmt.Sprintf("%s\nunknown command %q for \"cockroach %s\"\n", line, junk, test)
+		if exp != out {
+			t.Errorf("expected:\n%s\ngot:\n%s", exp, out)
+		}
+	}
+}
+
+func TestZip(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	c := newCLITest(cliTestParams{})
+	defer c.cleanup()
+
+	out, err := c.RunWithCapture("debug zip " + os.DevNull)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if size := info.Size(); size < minsize {
-		t.Fatalf("autocomplete file size (%d) < minimum (%d)", size, minsize)
+
+	const expected = `debug zip ` + os.DevNull + `
+writing ` + os.DevNull + `
+  debug/events
+  debug/rangelog
+  debug/liveness
+  debug/settings
+  debug/gossip/liveness
+  debug/gossip/network
+  debug/gossip/nodes
+  debug/metrics
+  debug/alerts
+  debug/nodes/1/status
+  debug/nodes/1/details
+  debug/nodes/1/gossip
+  debug/nodes/1/stacks
+  debug/nodes/1/heap
+  debug/nodes/1/ranges/1
+  debug/nodes/1/ranges/2
+  debug/nodes/1/ranges/3
+  debug/nodes/1/ranges/4
+  debug/nodes/1/ranges/5
+  debug/nodes/1/ranges/6
+  debug/nodes/1/ranges/7
+  debug/nodes/1/ranges/8
+  debug/nodes/1/ranges/9
+  debug/nodes/1/ranges/10
+  debug/nodes/1/ranges/11
+  debug/nodes/1/ranges/12
+  debug/nodes/1/ranges/13
+  debug/nodes/1/ranges/14
+  debug/nodes/1/ranges/15
+  debug/nodes/1/ranges/16
+  debug/nodes/1/ranges/17
+  debug/nodes/1/ranges/18
+  debug/nodes/1/ranges/19
+  debug/nodes/1/ranges/20
+  debug/reports/problemranges
+  debug/schema/defaultdb@details
+  debug/schema/postgres@details
+  debug/schema/system@details
+  debug/schema/system/comments
+  debug/schema/system/descriptor
+  debug/schema/system/eventlog
+  debug/schema/system/jobs
+  debug/schema/system/lease
+  debug/schema/system/locations
+  debug/schema/system/namespace
+  debug/schema/system/rangelog
+  debug/schema/system/role_members
+  debug/schema/system/settings
+  debug/schema/system/table_statistics
+  debug/schema/system/ui
+  debug/schema/system/users
+  debug/schema/system/web_sessions
+  debug/schema/system/zones
+`
+
+	if out != expected {
+		t.Errorf("expected:\n%s\ngot:\n%s", expected, out)
 	}
+}
+
+func TestWorkload(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	c := newCLITest(cliTestParams{noServer: true})
+	defer c.cleanup()
+
+	out, err := c.RunWithCapture("workload init --help")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.Contains(out, `startrek`) {
+		t.Fatalf(`startrek workload failed to register got: %s`, out)
+	}
+}
+
+func Example_in_memory() {
+	spec, err := base.NewStoreSpec("type=mem,size=1GiB")
+	if err != nil {
+		panic(err)
+	}
+	c := newCLITest(cliTestParams{
+		storeSpecs: []base.StoreSpec{spec},
+	})
+	defer c.cleanup()
+
+	// Test some sql to ensure that the in memory store is working.
+	c.RunWithArgs([]string{"sql", "-e", "create database t; create table t.f (x int, y int); insert into t.f values (42, 69)"})
+	c.RunWithArgs([]string{"node", "ls"})
+
+	// Output:
+	// sql -e create database t; create table t.f (x int, y int); insert into t.f values (42, 69)
+	// INSERT 1
+	// node ls
+	// id
+	// 1
+	//
+}
+
+func Example_pretty_print_numerical_strings() {
+	c := newCLITest(cliTestParams{})
+	defer c.cleanup()
+
+	// All strings in pretty-print output should be aligned to left regardless of their contents
+	c.RunWithArgs([]string{"sql", "-e", "create database t; create table t.t (s string, d string);"})
+	c.RunWithArgs([]string{"sql", "-e", "insert into t.t values (e'0', 'positive numerical string')"})
+	c.RunWithArgs([]string{"sql", "-e", "insert into t.t values (e'-1', 'negative numerical string')"})
+	c.RunWithArgs([]string{"sql", "-e", "insert into t.t values (e'1.0', 'decimal numerical string')"})
+	c.RunWithArgs([]string{"sql", "-e", "insert into t.t values (e'aaaaa', 'non-numerical string')"})
+	c.RunWithArgs([]string{"sql", "--format=table", "-e", "select * from t.t"})
+
+	// Output:
+	// sql -e create database t; create table t.t (s string, d string);
+	// CREATE TABLE
+	// sql -e insert into t.t values (e'0', 'positive numerical string')
+	// INSERT 1
+	// sql -e insert into t.t values (e'-1', 'negative numerical string')
+	// INSERT 1
+	// sql -e insert into t.t values (e'1.0', 'decimal numerical string')
+	// INSERT 1
+	// sql -e insert into t.t values (e'aaaaa', 'non-numerical string')
+	// INSERT 1
+	// sql --format=table -e select * from t.t
+	//     s   |             d
+	// +-------+---------------------------+
+	//   0     | positive numerical string
+	//   -1    | negative numerical string
+	//   1.0   | decimal numerical string
+	//   aaaaa | non-numerical string
+	// (4 rows)
+}
+
+func Example_sqlfmt() {
+	c := newCLITest(cliTestParams{noServer: true})
+	defer c.cleanup()
+
+	c.RunWithArgs([]string{"sqlfmt", "-e", ";"})
+	c.RunWithArgs([]string{"sqlfmt", "-e", "delete from t"})
+	c.RunWithArgs([]string{"sqlfmt", "-e", "delete from t", "-e", "update t set a = 1"})
+	c.RunWithArgs([]string{"sqlfmt", "--print-width=10", "-e", "select 1,2,3 from a,b,c;;;select 4"})
+	c.RunWithArgs([]string{"sqlfmt", "--print-width=10", "--align", "-e", "select 1,2,3 from a,b,c;;;select 4"})
+	c.RunWithArgs([]string{"sqlfmt", "--print-width=10", "--tab-width=2", "--use-spaces", "-e", "select 1,2,3 from a,b,c;;;select 4"})
+	c.RunWithArgs([]string{"sqlfmt", "-e", "select (1+2)+3"})
+	c.RunWithArgs([]string{"sqlfmt", "--no-simplify", "-e", "select (1+2)+3"})
+
+	// Output:
+	// sqlfmt -e ;
+	// sqlfmt -e delete from t
+	// DELETE FROM t
+	// sqlfmt -e delete from t -e update t set a = 1
+	// DELETE FROM t;
+	// UPDATE t SET a = 1;
+	// sqlfmt --print-width=10 -e select 1,2,3 from a,b,c;;;select 4
+	// SELECT
+	// 	1,
+	// 	2,
+	// 	3
+	// FROM
+	// 	a,
+	// 	b,
+	// 	c;
+	// SELECT 4;
+	// sqlfmt --print-width=10 --align -e select 1,2,3 from a,b,c;;;select 4
+	// SELECT 1,
+	//        2,
+	//        3
+	//   FROM a,
+	//        b,
+	//        c;
+	// SELECT 4;
+	// sqlfmt --print-width=10 --tab-width=2 --use-spaces -e select 1,2,3 from a,b,c;;;select 4
+	// SELECT
+	//   1, 2, 3
+	// FROM
+	//   a, b, c;
+	// SELECT 4;
+	// sqlfmt -e select (1+2)+3
+	// SELECT 1 + 2 + 3
+	// sqlfmt --no-simplify -e select (1+2)+3
+	// SELECT (1 + 2) + 3
 }

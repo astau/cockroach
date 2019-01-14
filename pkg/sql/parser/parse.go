@@ -1,3 +1,10 @@
+// Copyright 2012, Google Inc. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in licenses/BSD-vitess.txt.
+
+// Portions of this file are additionally subject to the following
+// license and copyright.
+//
 // Copyright 2015 The Cockroach Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -11,189 +18,302 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 // This code was derived from https://github.com/youtube/vitess.
-//
-// Copyright 2012, Google Inc. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file
 
 package parser
 
 import (
-	"bytes"
 	"fmt"
 	"strings"
 
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
-//go:generate make
+// Statement is the result of parsing a single statement. It contains the AST
+// node along with other information.
+type Statement struct {
+	// AST is the root of the AST tree for the parsed statement.
+	AST tree.Statement
 
-// StatementList is a list of statements.
-type StatementList []Statement
+	// SQL is the original SQL from which the statement was parsed. Note that this
+	// is not appropriate for use in logging, as it may contain passwords and
+	// other sensitive data.
+	SQL string
 
-// Format implements the NodeFormatter interface.
-func (l StatementList) Format(buf *bytes.Buffer, f FmtFlags) {
-	for i, s := range l {
-		if i > 0 {
-			buf.WriteString("; ")
-		}
-		FormatNode(buf, f, s)
-	}
+	// NumPlaceholders indicates the number of arguments to the statement (which
+	// are referenced through placeholders). This corresponds to the highest
+	// argument position (i.e. the x in "$x") that appears in the query.
+	//
+	// Note: where there are "gaps" in the placeholder positions, this number is
+	// based on the highest position encountered. For example, for `SELECT $3`,
+	// NumPlaceholders is 3. These cases are malformed and will result in a
+	// type-check error.
+	NumPlaceholders int
 }
 
-// Syntax is an enum of the various syntax types.
-type Syntax int
+// Statements is a list of parsed statements.
+type Statements []Statement
 
-//go:generate stringer -type=Syntax
-const (
-	// Implicit default, must stay in the zero-value position.
-	Traditional Syntax = iota
-	Modern
-)
+// String returns the AST formatted as a string.
+func (stmts Statements) String() string {
+	return stmts.StringWithFlags(tree.FmtSimple)
+}
+
+// StringWithFlags returns the AST formatted as a string (with the given flags).
+func (stmts Statements) StringWithFlags(flags tree.FmtFlags) string {
+	ctx := tree.NewFmtCtxWithBuf(flags)
+	for i, s := range stmts {
+		if i > 0 {
+			ctx.WriteString("; ")
+		}
+		ctx.FormatNode(s.AST)
+	}
+	return ctx.CloseAndGetString()
+}
 
 // Parser wraps a scanner, parser and other utilities present in the parser
 // package.
 type Parser struct {
-	scanner               Scanner
-	parserImpl            sqlParserImpl
-	normalizeVisitor      normalizeVisitor
-	isAggregateVisitor    IsAggregateVisitor
-	containsWindowVisitor ContainsWindowVisitor
+	scanner    scanner
+	lexer      lexer
+	parserImpl sqlParserImpl
+	tokBuf     [8]sqlSymType
+	stmtBuf    [1]Statement
 }
+
+// INT8 is the historical interpretation of INT. This should be left
+// alone in the future, since there are many sql fragments stored
+// in various descriptors.  Any user input that was created after
+// INT := INT4 will simply use INT4 in any resulting code.
+var defaultNakedIntType = coltypes.Int8
+var defaultNakedSerialType = coltypes.Serial8
 
 // Parse parses the sql and returns a list of statements.
-func (p *Parser) Parse(sql string, syntax Syntax) (stmts StatementList, err error) {
-	p.scanner.init(sql, syntax)
-	if p.parserImpl.Parse(&p.scanner) != 0 {
-		return nil, errors.New(p.scanner.lastError)
-	}
-	return p.scanner.stmts, nil
+func (p *Parser) Parse(sql string) (Statements, error) {
+	return p.parseWithDepth(1, sql, defaultNakedIntType, defaultNakedSerialType)
 }
 
-// TypeCheck performs type checking on the provided expression tree, returning
-// the new typed expression tree, which additionally permits evaluation and type
-// introspection globally and on each sub-tree.
-//
-// While doing so, it will fold numeric constants and bind placeholder names to
-// their inferred types in the provided context. The optional desired parameter can
-// be used to hint the desired type for the root of the resulting typed expression
-// tree. Like with Expr.TypeCheck, it is not valid to provide a nil desired
-// type. Instead, call it with the wildcard type TypeAny if no specific type is
-// desired.
-func TypeCheck(expr Expr, ctx *SemaContext, desired Type) (TypedExpr, error) {
-	if desired == nil {
-		panic("the desired type for parser.TypeCheck cannot be nil, use TypeAny instead")
+// ParseWithInt parses a sql statement string and returns a list of
+// Statements. The INT token will result in the specified TInt type.
+func (p *Parser) ParseWithInt(sql string, nakedIntType *coltypes.TInt) (Statements, error) {
+	nakedSerialType := coltypes.Serial8
+	if nakedIntType == coltypes.Int4 {
+		nakedSerialType = coltypes.Serial4
 	}
-	expr, err := foldConstantLiterals(expr)
+	return p.parseWithDepth(1, sql, nakedIntType, nakedSerialType)
+}
+
+func (p *Parser) parseOneWithDepth(depth int, sql string) (Statement, error) {
+	stmts, err := p.parseWithDepth(1, sql, defaultNakedIntType, defaultNakedSerialType)
 	if err != nil {
-		return nil, err
-	}
-	return expr.TypeCheck(ctx, desired)
-}
-
-// TypeCheckAndRequire performs type checking on the provided expression tree in
-// an identical manner to TypeCheck. It then asserts that the resulting TypedExpr
-// has the provided return type, returning both the typed expression and an error
-// if it does not.
-func TypeCheckAndRequire(expr Expr, ctx *SemaContext, required Type, op string) (TypedExpr, error) {
-	typedExpr, err := TypeCheck(expr, ctx, required)
-	if err != nil {
-		return nil, err
-	}
-	if typ := typedExpr.ResolvedType(); !(typ.Equal(required) || typ == TypeNull) {
-		return typedExpr, fmt.Errorf("argument of %s must be type %s, not type %s", op, required, typ)
-	}
-	return typedExpr, nil
-}
-
-// NormalizeExpr is wrapper around ctx.NormalizeExpr which avoids allocation of
-// a normalizeVisitor.
-func (p *Parser) NormalizeExpr(ctx *EvalContext, typedExpr TypedExpr) (TypedExpr, error) {
-	if ctx.SkipNormalize {
-		return typedExpr, nil
-	}
-	p.normalizeVisitor = normalizeVisitor{ctx: ctx}
-	expr, _ := WalkExpr(&p.normalizeVisitor, typedExpr)
-	if err := p.normalizeVisitor.err; err != nil {
-		return nil, err
-	}
-	return expr.(TypedExpr), nil
-}
-
-// parse parses the sql and returns a list of statements.
-func parse(sql string, syntax Syntax) (StatementList, error) {
-	var p Parser
-	return p.Parse(sql, syntax)
-}
-
-// parseTraditional is short-hand for parse(sql, Traditional)
-func parseTraditional(sql string) (StatementList, error) {
-	return parse(sql, Traditional)
-}
-
-// ParseOne parses a sql statement.
-func ParseOne(sql string, syntax Syntax) (Statement, error) {
-	stmts, err := parse(sql, syntax)
-	if err != nil {
-		return nil, err
+		return Statement{}, err
 	}
 	if len(stmts) != 1 {
-		return nil, errors.Errorf("expected 1 statement, but found %d", len(stmts))
+		return Statement{}, pgerror.NewAssertionErrorf("expected 1 statement, but found %d", len(stmts))
 	}
 	return stmts[0], nil
 }
 
-// ParseOneTraditional is short-hand for ParseOne(sql, Traditional)
-func ParseOneTraditional(sql string) (Statement, error) {
-	return ParseOne(sql, Traditional)
+func (p *Parser) scanOneStmt() (sql string, tokens []sqlSymType, done bool) {
+	var lval sqlSymType
+	tokens = p.tokBuf[:0]
+
+	// Scan the first token.
+	for {
+		p.scanner.scan(&lval)
+		if lval.id == 0 {
+			return "", nil, true
+		}
+		if lval.id != ';' {
+			break
+		}
+	}
+
+	startPos := lval.pos
+	// We make the resulting token positions match the returned string.
+	lval.pos = 0
+	tokens = append(tokens, lval)
+	for {
+		if lval.id == ERROR {
+			return p.scanner.in[startPos:], tokens, true
+		}
+		posBeforeScan := p.scanner.pos
+		p.scanner.scan(&lval)
+		if lval.id == 0 || lval.id == ';' {
+			return p.scanner.in[startPos:posBeforeScan], tokens, (lval.id == 0)
+		}
+		lval.pos -= startPos
+		tokens = append(tokens, lval)
+	}
 }
 
-// ParseTableNameTraditional parses a table name.
-func ParseTableNameTraditional(sql string) (*TableName, error) {
-	stmt, err := ParseOneTraditional(fmt.Sprintf("ALTER TABLE %s RENAME TO x", sql))
+func (p *Parser) parseWithDepth(
+	depth int, sql string, nakedIntType *coltypes.TInt, nakedSerialType *coltypes.TSerial,
+) (Statements, error) {
+	stmts := Statements(p.stmtBuf[:0])
+	p.scanner.init(sql)
+	defer p.scanner.cleanup()
+	for {
+		sql, tokens, done := p.scanOneStmt()
+		stmt, err := p.parse(depth+1, sql, tokens, nakedIntType, nakedSerialType)
+		if err != nil {
+			return nil, err
+		}
+		if stmt.AST != nil {
+			stmts = append(stmts, stmt)
+		}
+		if done {
+			break
+		}
+	}
+	return stmts, nil
+}
+
+// parse parses a statement from the given scanned tokens.
+func (p *Parser) parse(
+	depth int,
+	sql string,
+	tokens []sqlSymType,
+	nakedIntType *coltypes.TInt,
+	nakedSerialType *coltypes.TSerial,
+) (Statement, error) {
+	p.lexer.init(sql, tokens, nakedIntType, nakedSerialType)
+	defer p.lexer.cleanup()
+	if p.parserImpl.Parse(&p.lexer) != 0 {
+		lastError := p.lexer.lastError
+		var err *pgerror.Error
+		if feat := lastError.unimplementedFeature; feat != "" {
+			// UnimplementedWithDepth populates the generic hint. However
+			// in some cases we have a more specific hint. This is overridden
+			// below.
+			err = pgerror.UnimplementedWithDepth(depth+1, "syntax."+feat, lastError.msg)
+		} else {
+			err = pgerror.NewErrorWithDepth(depth+1, pgerror.CodeSyntaxError, lastError.msg)
+		}
+		if lastError.hint != "" {
+			// If lastError.hint is not set, e.g. from (*scanner).Unimplemented(),
+			// we're OK with the default hint. Otherwise, override it.
+			err.Hint = lastError.hint
+		}
+		err.Detail = lastError.detail
+		return Statement{}, err
+	}
+	return Statement{
+		AST:             p.lexer.stmt,
+		SQL:             sql,
+		NumPlaceholders: p.lexer.numPlaceholders,
+	}, nil
+}
+
+// unaryNegation constructs an AST node for a negation. This attempts
+// to preserve constant NumVals and embed the negative sign inside
+// them instead of wrapping in an UnaryExpr. This in turn ensures
+// that negative numbers get considered as a single constant
+// for the purpose of formatting and scrubbing.
+func unaryNegation(e tree.Expr) tree.Expr {
+	if cst, ok := e.(*tree.NumVal); ok {
+		cst.Negative = !cst.Negative
+		return cst
+	}
+
+	// Common case.
+	return &tree.UnaryExpr{Operator: tree.UnaryMinus, Expr: e}
+}
+
+// Parse parses a sql statement string and returns a list of Statements.
+func Parse(sql string) (Statements, error) {
+	var p Parser
+	return p.parseWithDepth(1, sql, defaultNakedIntType, defaultNakedSerialType)
+}
+
+// ParseOne parses a sql statement string, ensuring that it contains only a
+// single statement, and returns that Statement. ParseOne will always
+// interpret the INT and SERIAL types as 64-bit types, since this is
+// used in various internal-execution paths where we might receive
+// bits of SQL from other nodes. In general, we expect that all
+// user-generated SQL has been run through the ParseWithInt() function.
+func ParseOne(sql string) (Statement, error) {
+	var p Parser
+	return p.parseOneWithDepth(1, sql)
+}
+
+// ParseTableNameWithIndex parses a table name with index.
+func ParseTableNameWithIndex(sql string) (tree.TableNameWithIndex, error) {
+	// We wrap the name we want to parse into a dummy statement since our parser
+	// can only parse full statements.
+	stmt, err := ParseOne(fmt.Sprintf("ALTER INDEX %s RENAME TO x", sql))
+	if err != nil {
+		return tree.TableNameWithIndex{}, err
+	}
+	rename, ok := stmt.AST.(*tree.RenameIndex)
+	if !ok {
+		return tree.TableNameWithIndex{}, pgerror.NewAssertionErrorf("expected an ALTER INDEX statement, but found %T", stmt)
+	}
+	return *rename.Index, nil
+}
+
+// ParseTableName parses a table name.
+func ParseTableName(sql string) (*tree.TableName, error) {
+	// We wrap the name we want to parse into a dummy statement since our parser
+	// can only parse full statements.
+	stmt, err := ParseOne(fmt.Sprintf("ALTER TABLE %s RENAME TO x", sql))
 	if err != nil {
 		return nil, err
 	}
-	rename, ok := stmt.(*RenameTable)
+	rename, ok := stmt.AST.(*tree.RenameTable)
 	if !ok {
-		return nil, errors.Errorf("expected an ALTER TABLE statement, but found %T", stmt)
+		return nil, pgerror.NewAssertionErrorf("expected an ALTER TABLE statement, but found %T", stmt)
 	}
-	return rename.Name.Normalize()
+	return &rename.Name, nil
 }
 
-// parseExprs parses one or more sql expression.
-func parseExprs(exprs []string, syntax Syntax) (Exprs, error) {
-	stmt, err := ParseOne(fmt.Sprintf("SET ROW (%s)", strings.Join(exprs, ",")), syntax)
+// parseExprs parses one or more sql expressions.
+func parseExprs(exprs []string) (tree.Exprs, error) {
+	stmt, err := ParseOne(fmt.Sprintf("SET ROW (%s)", strings.Join(exprs, ",")))
 	if err != nil {
 		return nil, err
 	}
-	set, ok := stmt.(*Set)
+	set, ok := stmt.AST.(*tree.SetVar)
 	if !ok {
-		return nil, errors.Errorf("expected a SET statement, but found %T", stmt)
+		return nil, pgerror.NewAssertionErrorf("expected a SET statement, but found %T", stmt)
 	}
 	return set.Values, nil
 }
 
-// ParseExprsTraditional is a short-hand for parseExprs(sql, Traditional)
-func ParseExprsTraditional(sql []string) (Exprs, error) {
+// ParseExprs is a short-hand for parseExprs(sql)
+func ParseExprs(sql []string) (tree.Exprs, error) {
 	if len(sql) == 0 {
-		return Exprs{}, nil
+		return tree.Exprs{}, nil
 	}
-	return parseExprs(sql, Traditional)
+	return parseExprs(sql)
 }
 
-// ParseExprTraditional is a short-hand for parseExprs([]string{sql}, Traditional)
-func ParseExprTraditional(sql string) (Expr, error) {
-	exprs, err := parseExprs([]string{sql}, Traditional)
+// ParseExpr is a short-hand for parseExprs([]string{sql})
+func ParseExpr(sql string) (tree.Expr, error) {
+	exprs, err := parseExprs([]string{sql})
 	if err != nil {
 		return nil, err
 	}
 	if len(exprs) != 1 {
-		return nil, errors.Errorf("expected 1 expression, found %d", len(exprs))
+		return nil, pgerror.NewAssertionErrorf("expected 1 expression, found %d", len(exprs))
 	}
 	return exprs[0], nil
+}
+
+// ParseType parses a column type.
+func ParseType(sql string) (coltypes.CastTargetType, error) {
+	expr, err := ParseExpr(fmt.Sprintf("1::%s", sql))
+	if err != nil {
+		return nil, err
+	}
+
+	cast, ok := expr.(*tree.CastExpr)
+	if !ok {
+		return nil, pgerror.NewAssertionErrorf("expected a tree.CastExpr, but found %T", expr)
+	}
+
+	return cast.Type, nil
 }

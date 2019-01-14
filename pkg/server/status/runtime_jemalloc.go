@@ -11,75 +11,79 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
 
 // +build !stdmalloc
 
 package status
 
-// #cgo darwin CPPFLAGS: -I../../../vendor/github.com/cockroachdb/c-jemalloc/darwin_includes/internal/include
-// #cgo freebsd CPPFLAGS: -I../../../vendor/github.com/cockroachdb/c-jemalloc/freebsd_includes/internal/include
-// #cgo linux CPPFLAGS: -I../../../vendor/github.com/cockroachdb/c-jemalloc/linux_includes/internal/include
-// #cgo darwin LDFLAGS: -Wl,-undefined -Wl,dynamic_lookup
-// #cgo linux LDFLAGS: -Wl,-unresolved-symbols=ignore-all
+// #cgo CPPFLAGS: -DJEMALLOC_NO_DEMANGLE
+// #cgo LDFLAGS: -ljemalloc
+// #cgo dragonfly freebsd LDFLAGS: -lm
+// #cgo linux LDFLAGS: -lrt -lm -lpthread
 //
 // #include <jemalloc/jemalloc.h>
 //
-// // See field definitions at:
-// // http://www.canonware.com/download/jemalloc/jemalloc-latest/doc/jemalloc.html#stats.allocated
+// // https://github.com/jemalloc/jemalloc/wiki/Use-Case:-Introspection-Via-mallctl*()
+// // https://github.com/jemalloc/jemalloc/blob/4.5.0/src/stats.c#L960:L969
+//
 // typedef struct {
-//   size_t allocated;
-//   size_t active;
-//   size_t metadata;
-//   size_t resident;
-//   size_t mapped;
-//   size_t retained;
+//   size_t Allocated;
+//   size_t Active;
+//   size_t Metadata;
+//   size_t Resident;
+//   size_t Mapped;
+//   size_t Retained;
 // } JemallocStats;
 //
 // int jemalloc_get_stats(JemallocStats *stats) {
-//   // Update the statistics cached by mallctl.
+//   // Update the statistics cached by je_mallctl.
 //   uint64_t epoch = 1;
 //   size_t sz = sizeof(epoch);
-//   mallctl("epoch", &epoch, &sz, &epoch, sz);
+//   je_mallctl("epoch", &epoch, &sz, &epoch, sz);
 //
-//   sz = sizeof(size_t);
-//   int err = mallctl("stats.allocated", &stats->allocated, &sz, NULL, 0);
+//   int err;
+//
+//   sz = sizeof(&stats->Allocated);
+//   err = je_mallctl("stats.allocated", &stats->Allocated, &sz, NULL, 0);
 //   if (err != 0) {
 //     return err;
 //   }
-//   err = mallctl("stats.active", &stats->active, &sz, NULL, 0);
+//   sz = sizeof(&stats->Active);
+//   err = je_mallctl("stats.active", &stats->Active, &sz, NULL, 0);
 //   if (err != 0) {
 //     return err;
 //   }
-//   err = mallctl("stats.metadata", &stats->metadata, &sz, NULL, 0);
+//   sz = sizeof(&stats->Metadata);
+//   err = je_mallctl("stats.metadata", &stats->Metadata, &sz, NULL, 0);
 //   if (err != 0) {
 //     return err;
 //   }
-//   err = mallctl("stats.resident", &stats->resident, &sz, NULL, 0);
+//   sz = sizeof(&stats->Resident);
+//   err = je_mallctl("stats.resident", &stats->Resident, &sz, NULL, 0);
 //   if (err != 0) {
 //     return err;
 //   }
-//   err = mallctl("stats.mapped", &stats->mapped, &sz, NULL, 0);
+//   sz = sizeof(&stats->Mapped);
+//   err = je_mallctl("stats.mapped", &stats->Mapped, &sz, NULL, 0);
 //   if (err != 0) {
 //     return err;
 //   }
-//   // stats.retained is introduced in 4.2.0.
-//   // err = mallctl("stats.retained", &stats->retained, &sz, NULL, 0);
+//   sz = sizeof(&stats->Retained);
+//   err = je_mallctl("stats.retained", &stats->Retained, &sz, NULL, 0);
+//   if (err != 0) {
+//     return err;
+//   }
 //   return err;
 // }
 import "C"
 
 import (
-	"fmt"
-
-	"golang.org/x/net/context"
-
-	// This is explicit because this Go library does not export any Go symbols.
-	_ "github.com/cockroachdb/c-jemalloc"
+	"context"
+	"math"
+	"reflect"
+	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-
 	"github.com/dustin/go-humanize"
 )
 
@@ -90,25 +94,38 @@ func init() {
 	getCgoMemStats = getJemallocStats
 }
 
-func getJemallocStats() (uint64, uint64, error) {
+func getJemallocStats(ctx context.Context) (uint, uint, error) {
 	var js C.JemallocStats
 	// TODO(marc): should we panic here? Failure on fetching the stats may be a problem.
-	if errCode := C.jemalloc_get_stats(&js); errCode != 0 {
-		return 0, 0, fmt.Errorf("error code %d", errCode)
+	if _, err := C.jemalloc_get_stats(&js); err != nil {
+		return 0, 0, err
 	}
 
 	if log.V(2) {
 		// Summary of jemalloc stats:
-		log.Infof(context.TODO(), "jemalloc stats: allocated: %s, active: %s, metadata: %s, resident: %s, mapped: %s",
-			humanize.IBytes(uint64(js.allocated)), humanize.IBytes(uint64(js.active)),
-			humanize.IBytes(uint64(js.metadata)), humanize.IBytes(uint64(js.resident)),
-			humanize.IBytes(uint64(js.mapped)))
+		v := reflect.ValueOf(js)
+		t := v.Type()
+		stats := make([]string, v.NumField())
+		for i := 0; i < v.NumField(); i++ {
+			stats[i] = t.Field(i).Name + ": " + humanize.IBytes(uint64(v.Field(i).Interface().(C.size_t)))
+		}
+		log.Infof(ctx, "jemalloc stats: %s", strings.Join(stats, " "))
 	}
 
-	if log.V(3) {
+	// NB: the `!V(MaxInt32)` condition is a workaround to not spew this to the
+	// logs whenever log interception (log spy) is active. If we refactored
+	// je_malloc_stats_print to return a string that we can `log.Infof` instead,
+	// we wouldn't need this.
+	if log.V(3) && !log.V(math.MaxInt32) {
 		// Detailed jemalloc stats (very verbose, includes per-arena stats).
-		C.malloc_stats_print(nil, nil, nil)
+		C.je_malloc_stats_print(nil, nil, nil)
 	}
 
-	return uint64(js.allocated), uint64(js.resident), nil
+	return uint(js.Allocated), uint(js.Resident), nil
+}
+
+// Used to force allocation in tests. 'import "C"' is not supported in tests.
+func allocateMemory() {
+	// Empirically, 8KiB is not enough, but 16KiB is.
+	C.malloc(16 << 10)
 }

@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Andrei Matei (andreimatei1@gmail.com)
 
 package testcluster
 
@@ -29,7 +27,7 @@ import (
 //go:generate ../../util/leaktest/add-leaktest.sh *_test.go
 
 func TestMain(m *testing.M) {
-	security.SetReadFileFn(securitytest.Asset)
+	security.SetAssetLoader(securitytest.EmbeddedAssets)
 	serverutils.InitTestServerFactory(server.TestServerFactory)
 	os.Exit(m.Run())
 }

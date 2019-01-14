@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 /*
 Package engine provides low-level storage. It interacts with storage
@@ -64,6 +62,16 @@ the MVCC version using the metadata's most recent version timestamp.
 This avoids using an expensive merge iterator to scan the most recent
 version. It also allows us to leverage RocksDB's bloom filters.
 
+The following is an example of the sort order for MVCC key/value pairs:
+
+		...
+		keyA: MVCCMetadata of keyA
+		keyA_Timestamp_n: value of version_n
+		keyA_Timestamp_n-1: value of version_n-1
+		...
+		keyA_Timestamp_0: value of version_0
+		keyB: MVCCMetadata of keyB
+
 The binary encoding used on the MVCC keys allows arbitrary keys to be
 stored in the map (no restrictions on intermediate nil-bytes, for
 example), while still sorting lexicographically and guaranteeing that
@@ -87,7 +95,7 @@ same key are rare in practice.
 However, we do allow inlining in order to use the MVCC interface to
 store non-versioned values. It turns out that not everything which
 Cockroach needs to store would be efficient or possible using MVCC.
-Examples include transaction records, response cache entries, stats
+Examples include transaction records, abort span entries, stats
 counters, time series data, and system-local config values. However,
 supporting a mix of encodings is problematic in terms of resulting
 complexity. So Cockroach treats an MVCC timestamp of zero to mean an

@@ -1,4 +1,5 @@
 # Docker Deploy
+
 Installing docker is a prerequisite. The instructions differ depending on the
 environment. Docker is comprised of two parts: the daemon server which runs on
 Linux and accepts commands, and the client which is a Go program capable of
@@ -27,63 +28,103 @@ running CockroachDB. It is based on Debian Jessie and contains only the main
 CockroachDB binary. To fetch this image, run `docker pull
 cockroachdb/cockroach` in the usual fashion.
 
-To build the image yourself, use `./build-docker-deploy.sh`. The script will
-build and run a development container. The CockroachDB binary will be built
-inside of that container. That binary is built into our minimal container. The
+To build the image yourself, use the Dockerfile in the `deploy` directory after
+building a release version of the binary with the development image described in
+the previous section. The CockroachDB binary will be built inside of that
+development container, then placed into the minimal deployment container. The
 resulting image `cockroachdb/cockroach` can be run via `docker run` in the
-usual fashion.
+usual fashion. To be more specific, the steps to do this are:
+
+```
+go/src/github.com/cockroachdb/cockroach $ ./build/builder.sh make build TYPE=release-linux-gnu
+go/src/github.com/cockroachdb/cockroach $ cp ./cockroach-linux-2.6.32-gnu-amd64 build/deploy/cockroach
+go/src/github.com/cockroachdb/cockroach $ cd build/deploy && docker build -t cockroachdb/cockroach .
+```
+
+# Upgrading / extending the Docker image
+
+Process:
+
+- edit `build/Dockerfile` as desired
+- run `build/builder.sh init` to test -- this will build the image locally. Beware this can take a lot of time. The result of `init` is a docker image version which you can subsequently stick into the `version` variable inside the `builder.sh` script for testing locally.
+- Once you are happy with the result, run `build/builder.sh push` which pushes your image towards Docker hub, so that it becomes available to others. The result is again a version number, which you then *must* copy back into `builder.sh`. Then commit the change to both Dockerfile and `builder.sh` and submit a PR.
 
 #  Dependencies
-A snapshot of CockroachDB's dependencies is maintained at https://github.com/cockroachdb/vendored
-and checked out as a sub-module at `./vendor`.
+
+A snapshot of CockroachDB's dependencies is maintained at
+https://github.com/cockroachdb/vendored and checked out as a submodule at
+`./vendor`.
 
 ## Updating Dependencies
-This snapshot was built and is managed using `glide`.
 
-The [docs](https://github.com/Masterminds/glide) have detailed instructions, but in brief:
-* run `./scripts/glide.sh` in `cockroachdb/cockroach`.
-* add new dependencies with `./scripts/glide.sh get -s github.com/my/dependency`
-	- Note: if you are adding a non-import dependency (e.g. a binary tool to be used in development),
-		please add a dummy import to `build/tool_imports.go`. This is a workaround for an upstream issue:
-		https://github.com/Masterminds/glide/issues/690.
-* update dependencies to their latest version with `./scripts/glide.sh up`
-  - to pin a dependency to a particular version, add a `version: ...` line to `glide.yaml`, then update.
-  - to update a pinned dependency, change the version in `glide.yaml`, then update.
+This snapshot was built and is managed using `dep` and we manage `vendor` as a
+submodule.
 
-Updating a single dependency? glide does *not* expose a method to just update a single dependency.
-Since glide attempts to consider the expressed version requirements for all transitive dependencies,
-updating a single dependency could transitively change the resolution of others, and glide currently
-chooses to always do a full resolution to address this.
+Use the version of `dep` in `bin` (may need to `make` first): import your new
+dependency from the Go source you're working on, then run `./bin/dep ensure`.
 
-If an attempt to update a dependency is pulling in unwanted/risky changes to another library, you
-can and perhaps should pin the other library.
+### Working with Submodules
 
-You can also, if you *really* want to, just change the resolution of a single dependency, by editing
-its resolved version in glide.lock, then re-generating `vendor` from the edited resolution with
-`scripts/glide.sh install`. This is not recommended, as it circumvents the normal resolution logic.
+To keep the bloat of all the changes in all our dependencies out of our main
+repository, we embed `vendor` as a git submodule, storing its content and
+history in [`vendored`](https://github.com/cockroachdb/vendored) instead.
 
-## Working with Sub-modules
+This split across two repositories however means that changes involving
+changed dependencies require a two step process.
 
-Since dependencies are stored in their own repository, and `cockroachdb/cockroach` depends on it,
-changing a dependency requires pushing two things, in order: first the changes to the `vendored`
-repository, then the reference to those changes to the main repository.
+- After using dep to add or update dependencies and making related code
+changes, `git status` in `cockroachdb/cockroach` checkout will report that the
+`vendor` submodule has `modified/untracked content`.
 
-After adding or updating dependencies (and running all tests), switch into the `vendor` sub-module
-and commit changes (or use `git -C`). The commit must be available on `github.com/cockroachdb/vendored`
-*before* submitting a pull request to `cockroachdb/cockroach` that references it.
-* Organization members can push new refs directly.
-  * Likely want to `git remote set-url origin git@github.com:cockroachdb/vendored.git`.
-  * If not pushing to `master`, be sure to tag the ref so that it will not be GC'ed.
-* Non-members should fork the `vendored` repo, add their fork as a second remote, and submit a pull
-request.
-  * After the pull request is merged, fetch and checkout the new `origin/master`, and commit *that* as the
-  new ref in `cockroachdb/cockroach`.
+- Switch into `vendor` and commit all changes (or use `git -C vendor`), on a
+new named branch.
+
+   + At this point the `git status` in your `cockroachdb/cockroach` checkout
+will report `new commits` for `vendor` instead of `modified content`.
+
+- Commit your code changes and new `vendor` submodule ref.
+
+- Before this commit can be submitted in a pull request to
+`cockroachdb/cockroach`, the submodule commit it references must be available
+on `github.com/cockroachdb/vendored`.
+
+* Organization members can push their named branches there directly.
+
+* Non-members should fork the `vendored` repo and submit a pull request to
+`cockroachdb/vendored`, and need wait for it to merge before they will be able
+to use it in a `cockroachdb/cockroach` PR.
+
+#### `master` Branch Pointer in Vendored Repo
+
+Since the `cockroachdb/cockroach` submodule references individual commit
+hashes in `vendored`, there is little significance to the `master` branch in
+`vendored` -- as outlined above, new commits are always authored with the
+previously referenced commit as their parent, regardless of what `master`
+happens to be.
+
+That said, it is critical that any ref in `vendored` that is referenced from
+`cockroachdb/cockroach` remain available in `vendored` in perpetuity: after a
+PR referencing a ref merges, the `vendored` `master` branch should be updated
+to point to it before the named feature branch can be deleted, to ensure the
+ref remains reachable and thus is never garbage collected.
+
+#### Conflicting Submodule Changes
+
+The canonical linearization of history is always the main repo. In the event
+of concurrent changes to `vendor`, the first should cause the second to see a
+conflict on the `vendor` submodule pointer. When resolving that conflict, it
+is important to re-run dep against the fetched, updated `vendor` ref, thus
+generating a new commit in the submodule that has as its parent the one from
+the earlier change.
 
 ## Repository Name
-We only want the vendor directory used by builds when it is explicitly checked out *and managed* as a
-sub-module at `./vendor`.
 
-If a go build fails to find a dependency in `./vendor`, it will continue searching anything named
-"vendor" in parent directories. Thus the vendor repository is _not_ named "vendor", to minimize the risk
-of it ending up somewhere in `GOPATH` with the name `vendor` (e.g. if it is manually cloned), where
-it could end up being unintentionally used by builds and causing confusion.
+We only want the vendor directory used by builds when it is explicitly checked
+out *and managed* as a submodule at `./vendor`.
+
+If a go build fails to find a dependency in `./vendor`, it will continue
+searching anything named "vendor" in parent directories. Thus the vendor
+repository is _not_ named "vendor", to minimize the risk of it ending up
+somewhere in `GOPATH` with the name `vendor` (e.g. if it is manually cloned),
+where it could end up being unintentionally used by builds and causing
+confusion.

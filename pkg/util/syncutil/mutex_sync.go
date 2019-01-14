@@ -11,10 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tamir Duberstein (tamird@gmail.com)
 
 // +build !deadlock
+// +build !race
 
 package syncutil
 
@@ -25,7 +24,29 @@ type Mutex struct {
 	sync.Mutex
 }
 
+// AssertHeld may panic if the mutex is not locked (but it is not required to
+// do so). Functions which require that their callers hold a particular lock
+// may use this to enforce this requirement more directly than relying on the
+// race detector.
+//
+// Note that we do not require the lock to be held by any particular thread,
+// just that some thread holds the lock. This is both more efficient and allows
+// for rare cases where a mutex is locked in one thread and used in another.
+func (m *Mutex) AssertHeld() {
+}
+
 // An RWMutex is a reader/writer mutual exclusion lock.
 type RWMutex struct {
 	sync.RWMutex
+}
+
+// AssertHeld may panic if the mutex is not locked for writing (but it is not
+// required to do so). Functions which require that their callers hold a
+// particular lock may use this to enforce this requirement more directly than
+// relying on the race detector.
+//
+// Note that we do not require the lock to be held by any particular thread,
+// just that some thread holds the lock. This is both more efficient and allows
+// for rare cases where a mutex is locked in one thread and used in another.
+func (m *RWMutex) AssertHeld() {
 }

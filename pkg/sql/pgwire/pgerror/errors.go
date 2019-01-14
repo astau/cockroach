@@ -11,247 +11,278 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Nathan VanBenschoten (nvanbenschoten@gmail.com)
 
 package pgerror
 
 import (
+	"bytes"
 	"fmt"
-	"io"
+	"runtime"
+	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/util/caller"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/lib/pq"
+	"github.com/pkg/errors"
 )
 
-// pgError is an error that contains optional Postgres structured error
-// fields. Implementations of the interface annotate these fields onto
-// standard errors by wrapping them. The fields can then be retrieved from
-// the errors using the functions like Hint and Detail below.
-//
-// See https://www.postgresql.org/docs/current/static/protocol-error-fields.html
-// for a list of all Postgres error fields, most of which are optional and can
-// be used to provide auxiliary error information.
-//
-// The style for the implementation is inspired by github.com/pkg/errors,
-// and all pgError implementations are made to play nicely with that package.
-// For instance, a pgError can be wrapped by errors.Wrap and its annotations
-// can still be retrieved. pgErrors also implement the errors.causer interface,
-// meaning that errors.Cause will work correctly with them.
-type pgError interface {
-	error
-	causer
+var _ error = &Error{}
 
-	// structured Postgres error fields. Each method attempts to return the
-	// optional field and a boolean signifying if the optional field was
-	// present.
-	PGCode() (string, bool)
-	Detail() (string, bool)
-	Hint() (string, bool)
-	SourceContext() (SrcCtx, bool)
-
-	// formatting methods.
-	fmt.Formatter
-	verboseFormat() string
+func (pg *Error) Error() string {
+	return pg.Message
 }
 
-// from github.com/pkg/errors package.
-type causer interface {
-	Cause() error
-}
-
-var _ pgError = &withPGCode{}
-var _ pgError = &withDetail{}
-var _ pgError = &withHint{}
-var _ pgError = &withSrcCtx{}
-
-// pgErrorCause is embedded by each pgError implementation to eliminate
-// method duplication.
-type pgErrorCause struct {
-	error
-}
-
-func (ec pgErrorCause) Cause() error                  { return ec.error }
-func (ec pgErrorCause) PGCode() (string, bool)        { return PGCode(ec.error) }
-func (ec pgErrorCause) Detail() (string, bool)        { return Detail(ec.error) }
-func (ec pgErrorCause) Hint() (string, bool)          { return Hint(ec.error) }
-func (ec pgErrorCause) SourceContext() (SrcCtx, bool) { return SourceContext(ec.error) }
-
-// WithPGCode annotates err with a Postgres error code.
-// If err is nil, WithPGCode returns nil.
-func WithPGCode(err error, code string) error {
-	if err == nil || code == "" {
-		return err
+// FullError can be used when the hint and/or detail are to be tested.
+func FullError(err error) string {
+	var errString string
+	if pqErr, ok := err.(*pq.Error); ok {
+		errString = formatMsgHintDetail("pq: ", pqErr.Message, pqErr.Hint, pqErr.Detail)
+	} else if pg, ok := GetPGCause(err); ok {
+		errString = formatMsgHintDetail("", err.Error(), pg.Hint, pg.Detail)
+	} else {
+		errString = err.Error()
 	}
-	return &withPGCode{
-		pgErrorCause: pgErrorCause{err},
-		code:         code,
+	return errString
+}
+
+func formatMsgHintDetail(prefix, msg, hint, detail string) string {
+	var b strings.Builder
+	b.WriteString(prefix)
+	b.WriteString(msg)
+	if hint != "" {
+		b.WriteString("\nHINT: ")
+		b.WriteString(hint)
+	}
+	if detail != "" {
+		b.WriteString("\nDETAIL: ")
+		b.WriteString(detail)
+	}
+	return b.String()
+}
+
+// NewErrorWithDepthf creates an Error and extracts the context
+// information at the specified depth level.
+func NewErrorWithDepthf(depth int, code string, format string, args ...interface{}) *Error {
+	srcCtx := makeSrcCtx(depth + 1)
+	return &Error{
+		Message: fmt.Sprintf(format, args...),
+		Code:    code,
+		Source:  &srcCtx,
 	}
 }
 
-type withPGCode struct {
-	pgErrorCause
-	code string
+// NewError creates an Error.
+func NewError(code string, msg string) *Error {
+	return NewErrorWithDepthf(1, code, "%s", msg)
 }
 
-func (w *withPGCode) PGCode() (string, bool)        { return w.code, true }
-func (w *withPGCode) verboseFormat() string         { return "code: " + w.code }
-func (w *withPGCode) Format(s fmt.State, verb rune) { formatPGError(w, s, verb) }
-
-// WithDetail annotates err with a detail message.
-// If err is nil, WithDetail returns nil.
-func WithDetail(err error, detail string) error {
-	if err == nil || detail == "" {
-		return err
-	}
-	return &withDetail{
-		pgErrorCause: pgErrorCause{err},
-		detail:       detail,
-	}
+// NewErrorWithDepth creates an Error with context extracted from the
+// specified depth.
+func NewErrorWithDepth(depth int, code string, msg string) *Error {
+	return NewErrorWithDepthf(depth+1, code, "%s", msg)
 }
 
-type withDetail struct {
-	pgErrorCause
-	detail string
+// NewErrorf creates an Error with a format string.
+func NewErrorf(code string, format string, args ...interface{}) *Error {
+	return NewErrorWithDepthf(1, code, format, args...)
 }
 
-func (w *withDetail) Detail() (string, bool)        { return w.detail, true }
-func (w *withDetail) verboseFormat() string         { return "detail: " + w.detail }
-func (w *withDetail) Format(s fmt.State, verb rune) { formatPGError(w, s, verb) }
-
-// WithHint annotates err with a hint for users to resolve the
-// issue in the future.
-// If err is nil, WithHint returns nil.
-func WithHint(err error, hint string) error {
-	if err == nil || hint == "" {
-		return err
-	}
-	return &withHint{
-		pgErrorCause: pgErrorCause{err},
-		hint:         hint,
-	}
+// NewDangerousStatementErrorf creates a new Error for "rejected dangerous statements".
+func NewDangerousStatementErrorf(format string, args ...interface{}) *Error {
+	var buf bytes.Buffer
+	buf.WriteString("rejected: ")
+	fmt.Fprintf(&buf, format, args...)
+	buf.WriteString(" (sql_safe_updates = true)")
+	return NewErrorWithDepthf(1, CodeWarningError, "%s", buf.String())
 }
 
-type withHint struct {
-	pgErrorCause
-	hint string
+// NewWrongNumberOfPreparedStatements creates new an Error for trying to prepare
+// a query string containing more than one statement.
+func NewWrongNumberOfPreparedStatements(n int) *Error {
+	return NewErrorWithDepthf(1, CodeInvalidPreparedStatementDefinitionError,
+		"prepared statement had %d statements, expected 1", n)
 }
 
-func (w *withHint) Hint() (string, bool)          { return w.hint, true }
-func (w *withHint) verboseFormat() string         { return "hint: " + w.hint }
-func (w *withHint) Format(s fmt.State, verb rune) { formatPGError(w, s, verb) }
-
-// SrcCtx contains contextual information about the source of an error.
-type SrcCtx struct {
-	File     string
-	Line     int
-	Function string
+// SetHintf annotates an Error object with a hint.
+func (pg *Error) SetHintf(f string, args ...interface{}) *Error {
+	pg.Hint = fmt.Sprintf(f, args...)
+	return pg
 }
 
-// makeSrcCtx creates a SrcCtx value with contextual information about the
-// caller at the requested depth.
-func makeSrcCtx(depth int) SrcCtx {
+// SetDetailf annotates an Error object with details.
+func (pg *Error) SetDetailf(f string, args ...interface{}) *Error {
+	pg.Detail = fmt.Sprintf(f, args...)
+	return pg
+}
+
+// makeSrcCtx creates a Error_Source value with contextual information
+// about the caller at the requested depth.
+func makeSrcCtx(depth int) Error_Source {
 	f, l, fun := caller.Lookup(depth + 1)
-	return SrcCtx{File: f, Line: l, Function: fun}
+	return Error_Source{File: f, Line: int32(l), Function: fun}
 }
 
-// WithSourceContext annotates err with contextual information about the
-// caller at the requested depth.
-// If err is nil, WithSourceContext returns nil.
-func WithSourceContext(err error, depth int) error {
-	if err == nil {
-		return nil
-	}
-	return &withSrcCtx{
-		pgErrorCause: pgErrorCause{err},
-		ctx:          makeSrcCtx(depth + 1),
+// GetPGCause returns an unwrapped Error.
+func GetPGCause(err error) (*Error, bool) {
+	switch pgErr := errors.Cause(err).(type) {
+	case *Error:
+		return pgErr, true
+
+	default:
+		return nil, false
 	}
 }
 
-type withSrcCtx struct {
-	pgErrorCause
-	ctx SrcCtx
+const assertionErrorHint = `You have encountered an unexpected error inside CockroachDB.
+
+Please check https://github.com/cockroachdb/cockroach/issues to check
+whether this problem is already tracked. If you cannot find it there,
+please report the error with details at:
+
+    https://github.com/cockroachdb/cockroach/issues/new/choose
+
+If you would rather not post publicly, please contact us directly at:
+
+    support@cockroachlabs.com
+
+The Cockroach Labs team appreciates your feedback.
+`
+
+// NewAssertionErrorf creates an internal error.
+func NewAssertionErrorf(format string, args ...interface{}) error {
+	err := NewErrorWithDepthf(1, CodeInternalError, "internal error: "+format, args...)
+	err.InternalCommand = captureTrace()
+	err.Detail = err.InternalCommand
+	err.Hint = assertionErrorHint
+	return err
 }
 
-func (w *withSrcCtx) SourceContext() (SrcCtx, bool) { return w.ctx, true }
-func (w *withSrcCtx) verboseFormat() string {
-	return fmt.Sprintf("location: %s, %s:%d", w.ctx.Function, w.ctx.File, w.ctx.Line)
-}
-func (w *withSrcCtx) Format(s fmt.State, verb rune) { formatPGError(w, s, verb) }
-
-// PGCode returns the Postgres error code of the error, if possible.
-//
-// If a code was never annotated onto the error, no code will be
-// returned and a "found" flag will be returned as false.
-func PGCode(err error) (string, bool) {
-	if pgErr := unwrapToPGError(err); pgErr != nil {
-		return pgErr.PGCode()
-	}
-	return "", false
+// NewInternalTrackingError instantiates an error
+// meant for use with telemetry.ReportError directly.
+func NewInternalTrackingError(issue int, detail string) error {
+	prefix := fmt.Sprintf("#%d.%s", issue, detail)
+	err := NewErrorWithDepthf(1, CodeInternalError, "internal error: %s", prefix)
+	err.InternalCommand = prefix + " " + captureTrace()
+	return err.SetHintf("See: https://github.com/cockroachdb/cockroach/issues/%d", issue)
 }
 
-// Detail returns the detail message of the error, if possible.
-//
-// If a detail was never annotated onto the error, no detail will
-// be returned and a "found" flag will be returned as false.
-func Detail(err error) (string, bool) {
-	if pgErr := unwrapToPGError(err); pgErr != nil {
-		return pgErr.Detail()
-	}
-	return "", false
-}
-
-// Hint returns the hint message of the error, if possible.
-//
-// If a hint was never annotated onto the error, no hint will be
-// returned and a "found" flag will be returned as false.
-func Hint(err error) (string, bool) {
-	if pgErr := unwrapToPGError(err); pgErr != nil {
-		return pgErr.Hint()
-	}
-	return "", false
-}
-
-// SourceContext returns contextual information about the source of
-// an error, if possible.
-//
-// If contextual information was never annotated onto the error, no
-// SrcCtx will be returned and a "found" flag will be returned as false.
-func SourceContext(err error) (SrcCtx, bool) {
-	if pgErr := unwrapToPGError(err); pgErr != nil {
-		return pgErr.SourceContext()
-	}
-	return SrcCtx{}, false
-}
-
-// unwrapToPGError returns an unwrapped pgError annotation, if possible.
-// The method behaves similarly to errors.Cause, but will only unwrap (call
-// Cause on) non-pgError implementations. This allows us to strip errors
-// added by errors.Wrap, and find the next pgError.
-func unwrapToPGError(err error) pgError {
-	for err != nil {
-		if pgErr, ok := err.(pgError); ok {
-			return pgErr
-		}
-		cause, ok := err.(causer)
-		if !ok {
+func captureTrace() string {
+	var pc [50]uintptr
+	n := runtime.Callers(3, pc[:])
+	frames := runtime.CallersFrames(pc[:n])
+	var buf bytes.Buffer
+	sep := ""
+	for {
+		frame, more := frames.Next()
+		if !more {
 			break
 		}
-		err = cause.Cause()
+		file := frame.File
+		if index := strings.LastIndexByte(file, '/'); index >= 0 {
+			file = file[index+1:]
+		}
+		fmt.Fprintf(&buf, "%s%s:%d", sep, file, frame.Line)
+		sep = ","
 	}
-	return nil
+	return buf.String()
 }
 
-func formatPGError(pgErr pgError, s fmt.State, verb rune) {
-	switch verb {
-	case 'v':
-		if s.Flag('+') {
-			fmt.Fprintf(s, "%+v\n%s", pgErr.Cause(), pgErr.verboseFormat())
-			return
-		}
-		fallthrough
-	case 's', 'q':
-		if _, err := io.WriteString(s, pgErr.Error()); err != nil {
-			panic(err)
+// UnimplementedWithIssueErrorf constructs an error with the formatted message
+// and a link to the passed issue. Recorded as "#<issue>" in tracking.
+func UnimplementedWithIssueErrorf(issue int, format string, args ...interface{}) error {
+	err := NewErrorWithDepthf(1, CodeFeatureNotSupportedError, "unimplemented: "+format, args...)
+	err.InternalCommand = fmt.Sprintf("#%d", issue)
+	return err.SetHintf("See: https://github.com/cockroachdb/cockroach/issues/%d", issue)
+}
+
+// UnimplementedWithIssueError constructs an error with the given message
+// and a link to the passed issue. Recorded as "#<issue>" in tracking.
+func UnimplementedWithIssueError(issue int, msg string) error {
+	err := NewErrorWithDepthf(1, CodeFeatureNotSupportedError, "unimplemented: %s", msg)
+	err.InternalCommand = fmt.Sprintf("#%d", issue)
+	return err.SetHintf("See: https://github.com/cockroachdb/cockroach/issues/%d", issue)
+}
+
+// UnimplementedWithIssueDetailError constructs an error with the given message
+// and a link to the passed issue. Recorded as "#<issue>.detail" in tracking.
+// This is useful when we need an extra axis of information to drill down into.
+func UnimplementedWithIssueDetailError(issue int, detail, msg string) error {
+	err := NewErrorWithDepthf(1, CodeFeatureNotSupportedError, "unimplemented: %s", msg)
+	err.InternalCommand = fmt.Sprintf("#%d.%s", issue, detail)
+	return err.SetHintf("See: https://github.com/cockroachdb/cockroach/issues/%d", issue)
+}
+
+// UnimplementedWithIssueHintError constructs an error with the given
+// message, hint, and a link to the passed issue. Recorded as "#<issue>"
+// in tracking.
+func UnimplementedWithIssueHintError(issue int, msg, hint string) error {
+	err := NewErrorWithDepthf(1, CodeFeatureNotSupportedError, "unimplemented: %s", msg)
+	err.InternalCommand = fmt.Sprintf("#%d", issue)
+	return err.SetHintf("%s\nSee: https://github.com/cockroachdb/cockroach/issues/%d", hint, issue)
+}
+
+const unimplementedErrorHint = `This feature is not yet implemented in CockroachDB.
+
+Please check https://github.com/cockroachdb/cockroach/issues to check
+whether this feature is already tracked. If you cannot find it there,
+please report this error with reproduction steps at:
+
+    https://github.com/cockroachdb/cockroach/issues/new/choose
+
+If you would rather not post publicly, please contact us directly at:
+
+    support@cockroachlabs.com
+
+The Cockroach Labs team appreciates your feedback.
+`
+
+// Unimplemented constructs an unimplemented feature error.
+//
+// `feature` is used for tracking, and is not included when the error printed.
+func Unimplemented(feature, msg string, args ...interface{}) *Error {
+	return UnimplementedWithDepth(1, feature, msg, args...)
+}
+
+// UnimplementedWithDepth constructs an implemented feature error,
+// tracking the context at the specified depth.
+func UnimplementedWithDepth(depth int, feature, msg string, args ...interface{}) *Error {
+	err := NewErrorWithDepthf(depth+1, CodeFeatureNotSupportedError, msg, args...)
+	err.InternalCommand = feature
+	err.Hint = unimplementedErrorHint
+	return err
+}
+
+// Wrap wraps an error into a pgerror. The code is used
+// if the original error was not a pgerror already. The errContext
+// string is used to populate the InternalCommand. If InternalCommand
+// already exists, the errContext is prepended.
+func Wrap(err error, code, errContext string) error {
+	var pgErr Error
+	origErr, ok := GetPGCause(err)
+	if ok {
+		// Copy the error. We can't use the existing error directly
+		// because it may be a global (const) object and we want to modify
+		// it below.
+		pgErr = *origErr
+	} else {
+		pgErr = Error{
+			Code: code,
+			// Keep the stack trace if one was available in the original
+			// non-Error error (e.g. when constructed via errors.Wrap).
+			InternalCommand: log.ErrorSource(err),
 		}
 	}
+
+	// Prepend the context to the existing message.
+	prefix := errContext + ": "
+	pgErr.Message = prefix + err.Error()
+
+	// Prepend the context also to the internal command, to ensure it
+	// goes to telemetry.
+	if pgErr.InternalCommand != "" {
+		pgErr.InternalCommand = prefix + pgErr.InternalCommand
+	} else {
+		pgErr.InternalCommand = errContext
+	}
+	return &pgErr
 }

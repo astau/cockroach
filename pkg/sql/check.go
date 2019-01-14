@@ -16,144 +16,60 @@ package sql
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"strings"
 
-	"golang.org/x/net/context"
-
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/pkg/errors"
 )
 
-type checkHelper struct {
-	exprs        []parser.TypedExpr
-	cols         []sqlbase.ColumnDescriptor
-	sourceInfo   *dataSourceInfo
-	ivars        []parser.IndexedVar
-	curSourceRow parser.DTuple
-}
-
-func (c *checkHelper) init(
-	p *planner, tn *parser.TableName, tableDesc *sqlbase.TableDescriptor,
-) error {
-	if len(tableDesc.Checks) == 0 {
-		return nil
-	}
-
-	c.cols = tableDesc.Columns
-	c.sourceInfo = newSourceInfoForSingleTable(*tn, makeResultColumns(tableDesc.Columns))
-
-	c.exprs = make([]parser.TypedExpr, len(tableDesc.Checks))
-	exprStrings := make([]string, len(tableDesc.Checks))
-	for i, check := range tableDesc.Checks {
-		exprStrings[i] = check.Expr
-	}
-	exprs, err := parser.ParseExprsTraditional(exprStrings)
-	if err != nil {
-		return err
-	}
-
-	ivarHelper := parser.MakeIndexedVarHelper(c, len(c.cols))
-	for i, raw := range exprs {
-		typedExpr, err := p.analyzeExpr(raw, multiSourceInfo{c.sourceInfo}, ivarHelper,
-			parser.TypeBool, false, "")
-		if err != nil {
-			return err
-		}
-		c.exprs[i] = typedExpr
-	}
-	c.ivars = ivarHelper.GetIndexedVars()
-	c.curSourceRow = make(parser.DTuple, len(c.cols))
-	return nil
-}
-
-// Set values in the IndexedVars used by the CHECK exprs.
-// Any value not passed is set to NULL, unless `merge` is true, in which
-// case it is left unchanged (allowing updating a subset of a row's values).
-func (c *checkHelper) loadRow(colIdx map[sqlbase.ColumnID]int, row parser.DTuple, merge bool) {
-	if len(c.exprs) == 0 {
-		return
-	}
-	// Populate IndexedVars.
-	for _, ivar := range c.ivars {
-		if ivar.Idx == invalidColIdx {
-			continue
-		}
-		ri, has := colIdx[c.cols[ivar.Idx].ID]
-		if has {
-			c.curSourceRow[ivar.Idx] = row[ri]
-		} else if !merge {
-			c.curSourceRow[ivar.Idx] = parser.DNull
-		}
-	}
-}
-
-// IndexedVarEval implements the parser.IndexedVarContainer interface.
-func (c *checkHelper) IndexedVarEval(idx int, ctx *parser.EvalContext) (parser.Datum, error) {
-	return c.curSourceRow[idx].Eval(ctx)
-}
-
-// IndexedVarResolvedType implements the parser.IndexedVarContainer interface.
-func (c *checkHelper) IndexedVarResolvedType(idx int) parser.Type {
-	return c.sourceInfo.sourceColumns[idx].Typ
-}
-
-// IndexedVarFormat implements the parser.IndexedVarContainer interface.
-func (c *checkHelper) IndexedVarFormat(buf *bytes.Buffer, f parser.FmtFlags, idx int) {
-	c.sourceInfo.FormatVar(buf, f, idx)
-}
-
-func (c *checkHelper) check(ctx *parser.EvalContext) error {
-	for _, expr := range c.exprs {
-		if d, err := expr.Eval(ctx); err != nil {
-			return err
-		} else if res, err := parser.GetBool(d); err != nil {
-			return err
-		} else if !res && d != parser.DNull {
-			// Failed to satisfy CHECK constraint.
-			return fmt.Errorf("failed to satisfy CHECK constraint (%s)", expr)
-		}
-	}
-	return nil
-}
-
 func (p *planner) validateCheckExpr(
-	exprStr string, tableName parser.TableExpr, tableDesc *sqlbase.TableDescriptor,
+	ctx context.Context, exprStr string, tableName tree.TableExpr, tableDesc *sqlbase.TableDescriptor,
 ) error {
-	expr, err := parser.ParseExprTraditional(exprStr)
+	expr, err := parser.ParseExpr(exprStr)
 	if err != nil {
 		return err
 	}
-	sel := &parser.SelectClause{
-		Exprs: sqlbase.ColumnsSelectors(tableDesc.Columns),
-		From:  &parser.From{Tables: parser.TableExprs{tableName}},
-		Where: &parser.Where{Expr: &parser.NotExpr{Expr: expr}},
+	sel := &tree.SelectClause{
+		Exprs: sqlbase.ColumnsSelectors(tableDesc.Columns, false /* forUpdateOrDelete */),
+		From:  &tree.From{Tables: tree.TableExprs{tableName}},
+		Where: &tree.Where{Expr: &tree.NotExpr{Expr: expr}},
 	}
-	lim := &parser.Limit{Count: parser.NewDInt(1)}
+	lim := &tree.Limit{Count: tree.NewDInt(1)}
 	// This could potentially use a variant of planner.SelectClause that could
 	// use the tableDesc we have, but this is a rare operation and be benefit
 	// would be marginal compared to the work of the actual query, so the added
 	// complexity seems unjustified.
-	rows, err := p.SelectClause(sel, nil, lim, nil, publicColumns)
+	rows, err := p.SelectClause(ctx, sel, nil, lim, nil, nil, publicColumns)
 	if err != nil {
 		return err
 	}
-	rows, err = p.optimizePlan(rows, allColumns(rows))
+	rows, err = p.optimizePlan(ctx, rows, allColumns(rows))
 	if err != nil {
 		return err
 	}
-	if err := p.startPlan(rows); err != nil {
+	defer rows.Close(ctx)
+
+	params := runParams{
+		ctx:             ctx,
+		extendedEvalCtx: &p.extendedEvalCtx,
+		p:               p,
+	}
+	if err := startPlan(params, rows); err != nil {
 		return err
 	}
-	next, err := rows.Next()
+	next, err := rows.Next(params)
 	if err != nil {
 		return err
 	}
 	if next {
 		return errors.Errorf("validation of CHECK %q failed on row: %s",
-			expr.String(), labeledRowValues(tableDesc.Columns, rows.Values()))
+			expr.String(), sqlbase.LabeledRowValues(tableDesc.Columns, rows.Values()))
 	}
 	return nil
 }
@@ -161,7 +77,7 @@ func (p *planner) validateCheckExpr(
 func (p *planner) validateForeignKey(
 	ctx context.Context, srcTable *sqlbase.TableDescriptor, srcIdx *sqlbase.IndexDescriptor,
 ) error {
-	targetTable, err := sqlbase.GetTableDescFromID(p.txn, srcIdx.ForeignKey.Table)
+	targetTable, err := sqlbase.GetTableDescFromID(ctx, p.txn, srcIdx.ForeignKey.Table)
 	if err != nil {
 		return err
 	}
@@ -170,18 +86,14 @@ func (p *planner) validateForeignKey(
 		return err
 	}
 
-	srcName, err := p.getQualifiedTableName(srcTable)
+	srcName, err := p.getQualifiedTableName(ctx, srcTable)
 	if err != nil {
 		return err
 	}
 
-	targetName, err := p.getQualifiedTableName(targetTable)
+	targetName, err := p.getQualifiedTableName(ctx, targetTable)
 	if err != nil {
 		return err
-	}
-
-	escape := func(s string) string {
-		return parser.Name(s).String()
 	}
 
 	prefix := len(srcIdx.ColumnNames)
@@ -193,8 +105,8 @@ func (p *planner) validateForeignKey(
 	join, where := make([]string, prefix), make([]string, prefix)
 
 	for i := 0; i < prefix; i++ {
-		srcCols[i] = fmt.Sprintf("s.%s", escape(srcIdx.ColumnNames[i]))
-		targetCols[i] = fmt.Sprintf("t.%s", escape(targetIdx.ColumnNames[i]))
+		srcCols[i] = fmt.Sprintf("s.%s", tree.NameString(srcIdx.ColumnNames[i]))
+		targetCols[i] = fmt.Sprintf("t.%s", tree.NameString(targetIdx.ColumnNames[i]))
 		join[i] = fmt.Sprintf("(%s = %s OR (%s IS NULL AND %s IS NULL))",
 			srcCols[i], targetCols[i], srcCols[i], targetCols[i])
 		where[i] = fmt.Sprintf("(%s IS NOT NULL AND %s IS NULL)", srcCols[i], targetCols[i])
@@ -203,7 +115,7 @@ func (p *planner) validateForeignKey(
 	query := fmt.Sprintf(
 		`SELECT %s FROM %s@%s AS s LEFT OUTER JOIN %s@%s AS t ON %s WHERE %s LIMIT 1`,
 		strings.Join(srcCols, ", "),
-		srcName, escape(srcIdx.Name), targetName, escape(targetIdx.Name),
+		srcName, tree.NameString(srcIdx.Name), targetName, tree.NameString(targetIdx.Name),
 		strings.Join(join, " AND "),
 		strings.Join(where, " OR "),
 	)
@@ -214,20 +126,41 @@ func (p *planner) validateForeignKey(
 		query,
 	)
 
-	values, err := p.queryRows(query)
+	rows, err := p.delegateQuery(ctx, "ALTER TABLE VALIDATE", query, nil, nil)
 	if err != nil {
 		return err
 	}
 
-	if len(values) > 0 {
+	rows, err = p.optimizePlan(ctx, rows, allColumns(rows))
+	if err != nil {
+		return err
+	}
+	defer rows.Close(ctx)
+
+	params := runParams{
+		ctx:             ctx,
+		extendedEvalCtx: &p.extendedEvalCtx,
+		p:               p,
+	}
+	if err := startPlan(params, rows); err != nil {
+		return err
+	}
+	next, err := rows.Next(params)
+	if err != nil {
+		return err
+	}
+
+	if next {
+		values := rows.Values()
 		var pairs bytes.Buffer
-		for i := range values[0] {
+		for i := range values {
 			if i > 0 {
 				pairs.WriteString(", ")
 			}
-			pairs.WriteString(fmt.Sprintf("%s=%v", srcIdx.ColumnNames[i], values[0][i]))
+			pairs.WriteString(fmt.Sprintf("%s=%v", srcIdx.ColumnNames[i], values[i]))
 		}
-		return errors.Errorf("foreign key violation: %q row %s has no match in %q",
+		return pgerror.NewErrorf(pgerror.CodeForeignKeyViolationError,
+			"foreign key violation: %q row %s has no match in %q",
 			srcTable.Name, pairs.String(), targetTable.Name)
 	}
 	return nil

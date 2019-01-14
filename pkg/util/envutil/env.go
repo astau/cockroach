@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
 
 package envutil
 
@@ -20,15 +18,13 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"os/user"
 	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
-	"golang.org/x/net/context"
-
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
 
@@ -121,7 +117,13 @@ func GetEnvVarsUsed() []string {
 	var vars []string
 	for k, v := range envVarRegistry.cache {
 		if v.present {
-			vars = append(vars, k)
+			vars = append(vars, k+"="+os.Getenv(k))
+		}
+	}
+
+	for _, name := range []string{"GOGC", "GODEBUG", "GOMAXPROCS", "GOTRACEBACK"} {
+		if val, ok := os.LookupEnv(name); ok {
+			vars = append(vars, name+"="+val)
 		}
 	}
 	return vars
@@ -140,6 +142,20 @@ func GetShellCommand(cmd string) []string {
 	}
 
 	return []string{"/bin/sh", "-c", cmd}
+}
+
+// HomeDir returns the user's home directory, as determined by the env
+// var HOME, if it exists, and otherwise the system's idea of the user
+// configuration (e.g. on non-UNIX systems).
+func HomeDir() (string, error) {
+	if homeDir := os.Getenv("HOME"); len(homeDir) > 0 {
+		return homeDir, nil
+	}
+	userAcct, err := user.Current()
+	if err != nil {
+		return "", err
+	}
+	return userAcct.HomeDir, nil
 }
 
 // EnvString returns the value set by the specified environment variable. The
@@ -166,8 +182,7 @@ func EnvOrDefaultBool(name string, value bool) bool {
 	if str, present := getEnv(name, 1); present {
 		v, err := strconv.ParseBool(str)
 		if err != nil {
-			log.Errorf(context.Background(), "error parsing %s: %s", name, err)
-			return value
+			panic(fmt.Sprintf("error parsing %s: %s", name, err))
 		}
 		return v
 	}
@@ -180,8 +195,7 @@ func EnvOrDefaultInt(name string, value int) int {
 	if str, present := getEnv(name, 1); present {
 		v, err := strconv.ParseInt(str, 0, 0)
 		if err != nil {
-			log.Errorf(context.Background(), "error parsing %s: %s", name, err)
-			return value
+			panic(fmt.Sprintf("error parsing %s: %s", name, err))
 		}
 		return int(v)
 	}
@@ -194,27 +208,27 @@ func EnvOrDefaultInt64(name string, value int64) int64 {
 	if str, present := getEnv(name, 1); present {
 		v, err := strconv.ParseInt(str, 0, 64)
 		if err != nil {
-			log.Errorf(context.Background(), "error parsing %s: %s", name, err)
-			return value
+			panic(fmt.Sprintf("error parsing %s: %s", name, err))
 		}
 		return v
 	}
 	return value
 }
 
-// EnvOrDefaultFloat returns the value set by the specified environment
+// EnvOrDefaultFloat64 returns the value set by the specified environment
 // variable, if any, otherwise the specified default value.
-func EnvOrDefaultFloat(name string, value float64) float64 {
+func EnvOrDefaultFloat64(name string, value float64) float64 {
 	if str, present := getEnv(name, 1); present {
 		v, err := strconv.ParseFloat(str, 64)
 		if err != nil {
-			log.Errorf(context.Background(), "error parsing %s: %s", name, err)
-			return value
+			panic(fmt.Sprintf("error parsing %s: %s", name, err))
 		}
 		return v
 	}
 	return value
 }
+
+var _ = EnvOrDefaultFloat64 // silence unused warning
 
 // EnvOrDefaultBytes returns the value set by the specified environment
 // variable, if any, otherwise the specified default value.
@@ -222,8 +236,7 @@ func EnvOrDefaultBytes(name string, value int64) int64 {
 	if str, present := getEnv(name, 1); present {
 		v, err := humanizeutil.ParseBytes(str)
 		if err != nil {
-			log.Errorf(context.Background(), "error parsing %s: %s", name, err)
-			return value
+			panic(fmt.Sprintf("error parsing %s: %s", name, err))
 		}
 		return v
 	}
@@ -236,8 +249,7 @@ func EnvOrDefaultDuration(name string, value time.Duration) time.Duration {
 	if str, present := getEnv(name, 1); present {
 		v, err := time.ParseDuration(str)
 		if err != nil {
-			log.Errorf(context.Background(), "error parsing %s: %s", name, err)
-			return value
+			panic(fmt.Sprintf("error parsing %s: %s", name, err))
 		}
 		return v
 	}

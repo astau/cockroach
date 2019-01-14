@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package engine
 
@@ -33,13 +31,13 @@ var (
 	aKey  = roachpb.Key("a")
 	bKey  = roachpb.Key("b")
 	aKeys = []MVCCKey{
-		mvccVersionKey(aKey, makeTS(2E9, 0)),
-		mvccVersionKey(aKey, makeTS(1E9, 1)),
-		mvccVersionKey(aKey, makeTS(1E9, 0)),
+		mvccVersionKey(aKey, hlc.Timestamp{WallTime: 2E9, Logical: 0}),
+		mvccVersionKey(aKey, hlc.Timestamp{WallTime: 1E9, Logical: 1}),
+		mvccVersionKey(aKey, hlc.Timestamp{WallTime: 1E9, Logical: 0}),
 	}
 	bKeys = []MVCCKey{
-		mvccVersionKey(bKey, makeTS(2E9, 0)),
-		mvccVersionKey(bKey, makeTS(1E9, 0)),
+		mvccVersionKey(bKey, hlc.Timestamp{WallTime: 2E9, Logical: 0}),
+		mvccVersionKey(bKey, hlc.Timestamp{WallTime: 1E9, Logical: 0}),
 	}
 )
 
@@ -47,8 +45,8 @@ var (
 // different sorts of MVCC keys.
 func TestGarbageCollectorFilter(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	gcA := MakeGarbageCollector(makeTS(0, 0), config.GCPolicy{TTLSeconds: 1})
-	gcB := MakeGarbageCollector(makeTS(0, 0), config.GCPolicy{TTLSeconds: 2})
+	gcA := MakeGarbageCollector(hlc.Timestamp{WallTime: 0, Logical: 0}, config.GCPolicy{TTLSeconds: 1})
+	gcB := MakeGarbageCollector(hlc.Timestamp{WallTime: 0, Logical: 0}, config.GCPolicy{TTLSeconds: 2})
 	n := []byte("data")
 	d := []byte(nil)
 	testData := []struct {
@@ -56,32 +54,36 @@ func TestGarbageCollectorFilter(t *testing.T) {
 		time     hlc.Timestamp
 		keys     []MVCCKey
 		values   [][]byte
+		expIdx   int
 		expDelTS hlc.Timestamp
 	}{
-		{gcA, makeTS(0, 0), aKeys, [][]byte{n, n, n}, hlc.ZeroTimestamp},
-		{gcA, makeTS(0, 0), aKeys, [][]byte{d, d, d}, hlc.ZeroTimestamp},
-		{gcB, makeTS(0, 0), bKeys, [][]byte{n, n}, hlc.ZeroTimestamp},
-		{gcB, makeTS(0, 0), bKeys, [][]byte{d, d}, hlc.ZeroTimestamp},
-		{gcA, makeTS(1E9, 0), aKeys, [][]byte{n, n, n}, hlc.ZeroTimestamp},
-		{gcB, makeTS(1E9, 0), bKeys, [][]byte{n, n}, hlc.ZeroTimestamp},
-		{gcA, makeTS(2E9, 0), aKeys, [][]byte{n, n, n}, hlc.ZeroTimestamp},
-		{gcA, makeTS(2E9, 0), aKeys, [][]byte{d, d, d}, makeTS(1E9, 0)},
-		{gcB, makeTS(2E9, 0), bKeys, [][]byte{n, n}, hlc.ZeroTimestamp},
-		{gcA, makeTS(3E9, 0), aKeys, [][]byte{n, n, n}, makeTS(1E9, 1)},
-		{gcA, makeTS(3E9, 0), aKeys, [][]byte{d, n, n}, makeTS(2E9, 0)},
-		{gcB, makeTS(3E9, 0), bKeys, [][]byte{n, n}, hlc.ZeroTimestamp},
-		{gcA, makeTS(4E9, 0), aKeys, [][]byte{n, n, n}, makeTS(1E9, 1)},
-		{gcB, makeTS(4E9, 0), bKeys, [][]byte{n, n}, makeTS(1E9, 0)},
-		{gcB, makeTS(4E9, 0), bKeys, [][]byte{d, n}, makeTS(2E9, 0)},
-		{gcA, makeTS(5E9, 0), aKeys, [][]byte{n, n, n}, makeTS(1E9, 1)},
-		{gcB, makeTS(5E9, 0), bKeys, [][]byte{n, n}, makeTS(1E9, 0)},
-		{gcB, makeTS(5E9, 0), bKeys, [][]byte{d, n}, makeTS(2E9, 0)},
+		{gcA, hlc.Timestamp{WallTime: 0, Logical: 0}, aKeys, [][]byte{n, n, n}, -1, hlc.Timestamp{}},
+		{gcA, hlc.Timestamp{WallTime: 0, Logical: 0}, aKeys, [][]byte{d, d, d}, -1, hlc.Timestamp{}},
+		{gcB, hlc.Timestamp{WallTime: 0, Logical: 0}, bKeys, [][]byte{n, n}, -1, hlc.Timestamp{}},
+		{gcB, hlc.Timestamp{WallTime: 0, Logical: 0}, bKeys, [][]byte{d, d}, -1, hlc.Timestamp{}},
+		{gcA, hlc.Timestamp{WallTime: 1E9, Logical: 0}, aKeys, [][]byte{n, n, n}, -1, hlc.Timestamp{}},
+		{gcB, hlc.Timestamp{WallTime: 1E9, Logical: 0}, bKeys, [][]byte{n, n}, -1, hlc.Timestamp{}},
+		{gcA, hlc.Timestamp{WallTime: 2E9, Logical: 0}, aKeys, [][]byte{n, n, n}, -1, hlc.Timestamp{}},
+		{gcA, hlc.Timestamp{WallTime: 2E9, Logical: 0}, aKeys, [][]byte{d, d, d}, 2, hlc.Timestamp{WallTime: 1E9, Logical: 0}},
+		{gcB, hlc.Timestamp{WallTime: 2E9, Logical: 0}, bKeys, [][]byte{n, n}, -1, hlc.Timestamp{}},
+		{gcA, hlc.Timestamp{WallTime: 3E9, Logical: 0}, aKeys, [][]byte{n, n, n}, 1, hlc.Timestamp{WallTime: 1E9, Logical: 1}},
+		{gcA, hlc.Timestamp{WallTime: 3E9, Logical: 0}, aKeys, [][]byte{d, n, n}, 0, hlc.Timestamp{WallTime: 2E9, Logical: 0}},
+		{gcB, hlc.Timestamp{WallTime: 3E9, Logical: 0}, bKeys, [][]byte{n, n}, -1, hlc.Timestamp{}},
+		{gcA, hlc.Timestamp{WallTime: 4E9, Logical: 0}, aKeys, [][]byte{n, n, n}, 1, hlc.Timestamp{WallTime: 1E9, Logical: 1}},
+		{gcB, hlc.Timestamp{WallTime: 4E9, Logical: 0}, bKeys, [][]byte{n, n}, 1, hlc.Timestamp{WallTime: 1E9, Logical: 0}},
+		{gcB, hlc.Timestamp{WallTime: 4E9, Logical: 0}, bKeys, [][]byte{d, n}, 0, hlc.Timestamp{WallTime: 2E9, Logical: 0}},
+		{gcA, hlc.Timestamp{WallTime: 5E9, Logical: 0}, aKeys, [][]byte{n, n, n}, 1, hlc.Timestamp{WallTime: 1E9, Logical: 1}},
+		{gcB, hlc.Timestamp{WallTime: 5E9, Logical: 0}, bKeys, [][]byte{n, n}, 1, hlc.Timestamp{WallTime: 1E9, Logical: 0}},
+		{gcB, hlc.Timestamp{WallTime: 5E9, Logical: 0}, bKeys, [][]byte{d, n}, 0, hlc.Timestamp{WallTime: 2E9, Logical: 0}},
 	}
 	for i, test := range testData {
 		test.gc.Threshold = test.time
 		test.gc.Threshold.WallTime -= int64(test.gc.policy.TTLSeconds) * 1E9
-		delTS := test.gc.Filter(test.keys, test.values)
-		if !delTS.Equal(test.expDelTS) {
+		idx, delTS := test.gc.Filter(test.keys, test.values)
+		if idx != test.expIdx {
+			t.Errorf("%d: expected index %d; got %d", i, test.expIdx, idx)
+		}
+		if delTS != test.expDelTS {
 			t.Errorf("%d: expected deletion timestamp %s; got %s", i, test.expDelTS, delTS)
 		}
 	}

@@ -11,25 +11,21 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package simulation
 
 import (
+	"context"
 	"crypto/tls"
 	"net"
 	"time"
-
-	"golang.org/x/net/context"
-
-	"google.golang.org/grpc"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/gossip/resolver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -37,16 +33,19 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"google.golang.org/grpc"
 )
 
 // Node represents a node used in a Network. It includes information
 // about the node's gossip instance, network address, and underlying
 // server.
 type Node struct {
-	Gossip   *gossip.Gossip
-	Server   *grpc.Server
-	Listener net.Listener
-	Registry *metric.Registry
+	Gossip    *gossip.Gossip
+	Server    *grpc.Server
+	Listener  net.Listener
+	Registry  *metric.Registry
+	Resolvers []resolver.Resolver
 }
 
 // Addr returns the address of the connected listener.
@@ -73,10 +72,11 @@ func NewNetwork(stopper *stop.Stopper, nodeCount int, createResolvers bool) *Net
 		Stopper: stopper,
 	}
 	n.rpcContext = rpc.NewContext(
-		log.AmbientContext{},
+		log.AmbientContext{Tracer: tracing.NewTracer()},
 		&base.Config{Insecure: true},
 		hlc.NewClock(hlc.UnixNano, time.Nanosecond),
 		n.Stopper,
+		&cluster.MakeTestingClusterSettings().Version,
 	)
 	var err error
 	n.tlsConfig, err = n.rpcContext.GetServerTLSConfig()
@@ -95,7 +95,7 @@ func NewNetwork(stopper *stop.Stopper, nodeCount int, createResolvers bool) *Net
 			if err != nil {
 				log.Fatalf(context.TODO(), "bad gossip address %s: %s", n.Nodes[0].Addr(), err)
 			}
-			node.Gossip.SetResolvers([]resolver.Resolver{r})
+			node.Resolvers = []resolver.Resolver{r}
 		}
 	}
 	return n
@@ -109,8 +109,8 @@ func (n *Network) CreateNode() (*Node, error) {
 		return nil, err
 	}
 	node := &Node{Server: server, Listener: ln, Registry: metric.NewRegistry()}
-	node.Gossip = gossip.NewTest(0, n.rpcContext, server, nil, n.Stopper, node.Registry)
-	n.Stopper.RunWorker(func() {
+	node.Gossip = gossip.NewTest(0, n.rpcContext, server, n.Stopper, node.Registry)
+	n.Stopper.RunWorker(context.TODO(), func(context.Context) {
 		<-n.Stopper.ShouldQuiesce()
 		netutil.FatalIfUnexpected(ln.Close())
 		<-n.Stopper.ShouldStop()
@@ -124,7 +124,7 @@ func (n *Network) CreateNode() (*Node, error) {
 // StartNode initializes a gossip instance for the simulation node and
 // starts it.
 func (n *Network) StartNode(node *Node) error {
-	node.Gossip.Start(node.Addr())
+	node.Gossip.Start(node.Addr(), node.Resolvers)
 	node.Gossip.EnableSimulationCycler(true)
 	n.nodeIDAllocator++
 	node.Gossip.NodeID.Set(context.TODO(), n.nodeIDAllocator)
@@ -138,7 +138,7 @@ func (n *Network) StartNode(node *Node) error {
 		encoding.EncodeUint64Ascending(nil, 0), time.Hour); err != nil {
 		return err
 	}
-	n.Stopper.RunWorker(func() {
+	n.Stopper.RunWorker(context.TODO(), func(context.Context) {
 		netutil.FatalIfUnexpected(node.Server.Serve(node.Listener))
 	})
 	return nil
@@ -229,7 +229,7 @@ func (n *Network) Start() {
 func (n *Network) RunUntilFullyConnected() int {
 	var connectedAtCycle int
 	n.SimulateNetwork(func(cycle int, network *Network) bool {
-		if network.isNetworkConnected() {
+		if network.IsNetworkConnected() {
 			connectedAtCycle = cycle
 			return false
 		}
@@ -238,10 +238,10 @@ func (n *Network) RunUntilFullyConnected() int {
 	return connectedAtCycle
 }
 
-// isNetworkConnected returns true if the network is fully connected
+// IsNetworkConnected returns true if the network is fully connected
 // with no partitions (i.e. every node knows every other node's
 // network address).
-func (n *Network) isNetworkConnected() bool {
+func (n *Network) IsNetworkConnected() bool {
 	for _, leftNode := range n.Nodes {
 		for _, rightNode := range n.Nodes {
 			if _, err := leftNode.Gossip.GetInfo(gossip.MakeNodeIDKey(rightNode.Gossip.NodeID.Get())); err != nil {

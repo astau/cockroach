@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf
 
 package log
 
@@ -23,11 +21,16 @@ import (
 )
 
 func init() {
-	logflags.InitFlags(&logging.mu, &logging.toStderr,
-		&logDir, &logging.nocolor, &logging.verbosity,
-		&logging.vmodule, &logging.traceLocation)
-	// We define this flag here because stderrThreshold has the type Severity
+	logflags.InitFlags(
+		&logging.noStderrRedirect,
+		&logging.logDir, &showLogs, &noColor,
+		&logging.vmodule,
+		&LogFileMaxSize, &LogFilesCombinedMaxSize,
+	)
+	// We define these flags here because they have the type Severity
 	// which we can't pass to logflags without creating an import cycle.
 	flag.Var(&logging.stderrThreshold,
-		logflags.AlsoLogToStderrName, "logs at or above this threshold go to stderr")
+		logflags.LogToStderrName, "logs at or above this threshold go to stderr")
+	flag.Var(&logging.fileThreshold,
+		logflags.LogFileVerbosityThresholdName, "minimum verbosity of messages written to the log file")
 }

@@ -11,24 +11,24 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package storage
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"math"
 	"reflect"
 	"sort"
 	"testing"
-
-	"golang.org/x/net/context"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -56,21 +56,13 @@ func meta2Key(key roachpb.RKey) []byte {
 	return testutils.MakeKey(keys.Meta2Prefix, key)
 }
 
-func metaKey(key roachpb.RKey) []byte {
-	rk, err := keys.Addr(keys.RangeMetaKey(key))
-	if err != nil {
-		panic(err)
-	}
-	return rk
-}
-
 // TestUpdateRangeAddressing verifies range addressing records are
 // correctly updated on creation of new range descriptors.
 func TestUpdateRangeAddressing(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
-	store, _ := createTestStore(t, stopper)
+	defer stopper.Stop(context.TODO())
+	store, _ := createTestStore(t, testStoreOpts{createSystemRanges: false}, stopper)
 
 	// When split is false, merging treats the right range as the merged
 	// range. With merging, expNewLeft indicates the addressing keys we
@@ -94,25 +86,25 @@ func TestUpdateRangeAddressing(t *testing.T) {
 		{true, roachpb.RKey("a"), roachpb.RKey("m"), roachpb.RKey("m"), roachpb.RKey("z"),
 			[][]byte{meta2Key(roachpb.RKey("m"))}, [][]byte{meta2Key(roachpb.RKey("z"))}},
 		// Split KeyMin-"a" at meta2(m).
-		{true, roachpb.RKeyMin, metaKey(roachpb.RKey("m")), metaKey(roachpb.RKey("m")), roachpb.RKey("a"),
+		{true, roachpb.RKeyMin, keys.RangeMetaKey(roachpb.RKey("m")), keys.RangeMetaKey(roachpb.RKey("m")), roachpb.RKey("a"),
 			[][]byte{meta1Key(roachpb.RKey("m"))}, [][]byte{meta1Key(roachpb.RKeyMax), meta2Key(roachpb.RKey("a"))}},
 		// Split meta2(m)-"a" at meta2(z).
-		{true, metaKey(roachpb.RKey("m")), metaKey(roachpb.RKey("z")), metaKey(roachpb.RKey("z")), roachpb.RKey("a"),
+		{true, keys.RangeMetaKey(roachpb.RKey("m")), keys.RangeMetaKey(roachpb.RKey("z")), keys.RangeMetaKey(roachpb.RKey("z")), roachpb.RKey("a"),
 			[][]byte{meta1Key(roachpb.RKey("z"))}, [][]byte{meta1Key(roachpb.RKeyMax), meta2Key(roachpb.RKey("a"))}},
 		// Split meta2(m)-meta2(z) at meta2(r).
-		{true, metaKey(roachpb.RKey("m")), metaKey(roachpb.RKey("r")), metaKey(roachpb.RKey("r")), metaKey(roachpb.RKey("z")),
+		{true, keys.RangeMetaKey(roachpb.RKey("m")), keys.RangeMetaKey(roachpb.RKey("r")), keys.RangeMetaKey(roachpb.RKey("r")), keys.RangeMetaKey(roachpb.RKey("z")),
 			[][]byte{meta1Key(roachpb.RKey("r"))}, [][]byte{meta1Key(roachpb.RKey("z"))}},
 
 		// Now, merge all of our splits backwards...
 
 		// Merge meta2(m)-meta2(z).
-		{false, metaKey(roachpb.RKey("m")), metaKey(roachpb.RKey("r")), metaKey(roachpb.RKey("m")), metaKey(roachpb.RKey("z")),
+		{false, keys.RangeMetaKey(roachpb.RKey("m")), keys.RangeMetaKey(roachpb.RKey("r")), keys.RangeMetaKey(roachpb.RKey("m")), keys.RangeMetaKey(roachpb.RKey("z")),
 			[][]byte{meta1Key(roachpb.RKey("r"))}, [][]byte{meta1Key(roachpb.RKey("z"))}},
 		// Merge meta2(m)-"a".
-		{false, metaKey(roachpb.RKey("m")), metaKey(roachpb.RKey("z")), metaKey(roachpb.RKey("m")), roachpb.RKey("a"),
+		{false, keys.RangeMetaKey(roachpb.RKey("m")), keys.RangeMetaKey(roachpb.RKey("z")), keys.RangeMetaKey(roachpb.RKey("m")), roachpb.RKey("a"),
 			[][]byte{meta1Key(roachpb.RKey("z"))}, [][]byte{meta1Key(roachpb.RKeyMax), meta2Key(roachpb.RKey("a"))}},
 		// Merge KeyMin-"a".
-		{false, roachpb.RKeyMin, metaKey(roachpb.RKey("m")), roachpb.RKeyMin, roachpb.RKey("a"),
+		{false, roachpb.RKeyMin, keys.RangeMetaKey(roachpb.RKey("m")), roachpb.RKeyMin, roachpb.RKey("a"),
 			[][]byte{meta1Key(roachpb.RKey("m"))}, [][]byte{meta1Key(roachpb.RKeyMax), meta2Key(roachpb.RKey("a"))}},
 		// Merge "a"-"z".
 		{false, roachpb.RKey("a"), roachpb.RKey("m"), roachpb.RKey("a"), roachpb.RKey("z"),
@@ -139,11 +131,38 @@ func TestUpdateRangeAddressing(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		if err := store.DB().Run(context.TODO(), b); err != nil {
+
+		st := cluster.MakeTestingClusterSettings()
+
+		// This test constructs an overlapping batch (delete then put on the same
+		// key), which is only allowed in a transaction. The test wants to send the
+		// batch through the "client" interface (because that's what it used to
+		// construct it); unfortunately we can't use the client's transactional
+		// interface without sending through a TxnCoordSender (which initializes a
+		// transaction id). Also, we need the TxnCoordSender to clean up the
+		// intents, otherwise the MVCCScan that the test does below fails.
+		actx := testutils.MakeAmbientCtx()
+		tcsf := kv.NewTxnCoordSenderFactory(
+			kv.TxnCoordSenderFactoryConfig{
+				AmbientCtx: actx,
+				Settings:   st,
+				Clock:      store.cfg.Clock,
+				Stopper:    stopper,
+				Metrics:    kv.MakeTxnMetrics(time.Second),
+			},
+			store.TestSender(),
+		)
+		db := client.NewDB(actx, tcsf, store.cfg.Clock)
+		ctx := context.Background()
+		txn := client.NewTxn(ctx, db, 0 /* gatewayNodeID */, client.RootTxn)
+		if err := txn.Run(ctx, b); err != nil {
+			t.Fatal(err)
+		}
+		if err := txn.Commit(ctx); err != nil {
 			t.Fatal(err)
 		}
 		// Scan meta keys directly from engine.
-		kvs, _, _, err := engine.MVCCScan(context.Background(), store.Engine(), keys.MetaMin, keys.MetaMax, math.MaxInt64, hlc.MaxTimestamp, true, nil)
+		kvs, _, _, err := engine.MVCCScan(ctx, store.Engine(), keys.MetaMin, keys.MetaMax, math.MaxInt64, hlc.MaxTimestamp, engine.MVCCScanOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -181,16 +200,16 @@ func TestUpdateRangeAddressing(t *testing.T) {
 
 		if test.split {
 			if log.V(1) {
-				log.Infof(context.Background(), "test case %d: split %q-%q at %q", i, left.StartKey, right.EndKey, left.EndKey)
+				log.Infof(ctx, "test case %d: split %q-%q at %q", i, left.StartKey, right.EndKey, left.EndKey)
 			}
 		} else {
 			if log.V(1) {
-				log.Infof(context.Background(), "test case %d: merge %q-%q + %q-%q", i, left.StartKey, left.EndKey, left.EndKey, right.EndKey)
+				log.Infof(ctx, "test case %d: merge %q-%q + %q-%q", i, left.StartKey, left.EndKey, left.EndKey, right.EndKey)
 			}
 		}
 		for _, meta := range metas {
 			if log.V(1) {
-				log.Infof(context.Background(), "%q", meta.key)
+				log.Infof(ctx, "%q", meta.key)
 			}
 		}
 

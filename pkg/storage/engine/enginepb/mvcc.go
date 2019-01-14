@@ -11,18 +11,14 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Jiang-Ming Yang (jiangming.yang@gmail.com)
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package enginepb
 
+import "sort"
+
 // Short returns a prefix of the transaction's ID.
 func (t TxnMeta) Short() string {
-	if id := t.ID; id != nil {
-		return id.Short()
-	}
-	return "<nil>"
+	return t.ID.Short()
 }
 
 // Total returns the range size as the sum of the key and value
@@ -58,16 +54,25 @@ func (ms MVCCStats) GCByteAge(nowNanos int64) int64 {
 	return ms.GCBytesAge
 }
 
-// AgeTo encapsulates the complexity of computing the increment in age
-// quantities contained in MVCCStats. Two MVCCStats structs only add and
-// subtract meaningfully if their LastUpdateNanos matches, so aging them to
-// the max of their LastUpdateNanos is a prerequisite.
-// If nowNanos is behind ms.LastUpdateNanos, this method is a noop.
-func (ms *MVCCStats) AgeTo(nowNanos int64) {
+// Forward is like AgeTo, but if nowNanos is not ahead of ms.LastUpdateNanos,
+// this method is a noop.
+func (ms *MVCCStats) Forward(nowNanos int64) {
 	if ms.LastUpdateNanos >= nowNanos {
 		return
 	}
-	diffSeconds := nowNanos/1E9 - ms.LastUpdateNanos/1E9 // not (...)/1E9!
+	ms.AgeTo(nowNanos)
+}
+
+// AgeTo encapsulates the complexity of computing the increment in age
+// quantities contained in MVCCStats. Two MVCCStats structs only add and
+// subtract meaningfully if their LastUpdateNanos matches, so aging them to
+// the max of their LastUpdateNanos is a prerequisite, though Add() takes
+// care of this internally.
+func (ms *MVCCStats) AgeTo(nowNanos int64) {
+	// Seconds are counted every time each individual nanosecond timestamp
+	// crosses a whole second boundary (i.e. is zero mod 1E9). Thus it would
+	// be a mistake to use the (nonequivalent) expression (a-b)/1E9.
+	diffSeconds := nowNanos/1E9 - ms.LastUpdateNanos/1E9
 
 	ms.GCBytesAge += ms.GCBytes() * diffSeconds
 	ms.IntentAge += ms.IntentCount * diffSeconds
@@ -79,8 +84,8 @@ func (ms *MVCCStats) AgeTo(nowNanos int64) {
 func (ms *MVCCStats) Add(oms MVCCStats) {
 	// Enforce the max LastUpdateNanos for both ages based on their
 	// pre-addition state.
-	ms.AgeTo(oms.LastUpdateNanos)
-	oms.AgeTo(ms.LastUpdateNanos)
+	ms.Forward(oms.LastUpdateNanos)
+	oms.Forward(ms.LastUpdateNanos) // on local copy
 	// If either stats object contains estimates, their sum does too.
 	ms.ContainsEstimates = ms.ContainsEstimates || oms.ContainsEstimates
 	// Now that we've done that, we may just add them.
@@ -103,8 +108,8 @@ func (ms *MVCCStats) Add(oms MVCCStats) {
 func (ms *MVCCStats) Subtract(oms MVCCStats) {
 	// Enforce the max LastUpdateNanos for both ages based on their
 	// pre-subtraction state.
-	ms.AgeTo(oms.LastUpdateNanos)
-	oms.AgeTo(ms.LastUpdateNanos)
+	ms.Forward(oms.LastUpdateNanos)
+	oms.Forward(ms.LastUpdateNanos)
 	// If either stats object contains estimates, their difference does too.
 	ms.ContainsEstimates = ms.ContainsEstimates || oms.ContainsEstimates
 	// Now that we've done that, we may subtract.
@@ -125,4 +130,34 @@ func (ms *MVCCStats) Subtract(oms MVCCStats) {
 // IsInline returns true if the value is inlined in the metadata.
 func (meta MVCCMetadata) IsInline() bool {
 	return meta.RawBytes != nil
+}
+
+// AddToIntentHistory adds the sequence and value to the intent history.
+func (meta *MVCCMetadata) AddToIntentHistory(seq int32, val []byte) {
+	meta.IntentHistory = append(meta.IntentHistory,
+		MVCCMetadata_SequencedIntent{Sequence: seq, Value: val})
+}
+
+// GetPrevIntentSeq goes through the intent history and finds the previous
+// intent's sequence number given the current sequence.
+func (meta *MVCCMetadata) GetPrevIntentSeq(seq int32) (int32, bool) {
+	index := sort.Search(len(meta.IntentHistory), func(i int) bool {
+		return meta.IntentHistory[i].Sequence >= seq
+	})
+	if index > 0 && index < len(meta.IntentHistory) {
+		return meta.IntentHistory[index-1].Sequence, true
+	}
+	return 0, false
+}
+
+// GetIntentValue goes through the intent history and finds the value
+// written at the sequence number.
+func (meta *MVCCMetadata) GetIntentValue(seq int32) ([]byte, bool) {
+	index := sort.Search(len(meta.IntentHistory), func(i int) bool {
+		return meta.IntentHistory[i].Sequence >= seq
+	})
+	if index < len(meta.IntentHistory) && meta.IntentHistory[index].Sequence == seq {
+		return meta.IntentHistory[index].Value, true
+	}
+	return nil, false
 }

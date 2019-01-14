@@ -11,11 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 /*
-Package client and its KV API has been deprecated for external usage. Please use
+Package client and its KV API have been deprecated for external usage. Please use
 a postgres-compatible SQL driver (e.g. github.com/lib/pq). For more details, see
 http://www.cockroachlabs.com/blog/sql-in-cockroachdb-mapping-table-data-to-key-value-storage/.
 
@@ -99,7 +97,7 @@ necessary. An example of using transactions with parallel writes:
 		log.Fatal(err)
 	}
 
-	err := db.Txn(func(txn *client.Txn) error {
+	err := db.Txn(func(ctx context.Context, txn *client.Txn) error {
 		b := txn.NewBatch()
 		for i := 0; i < 100; i++ {
 			key := fmt.Sprintf("testkey-%02d", i)
@@ -109,7 +107,7 @@ necessary. An example of using transactions with parallel writes:
 		// Note that the Txn client is flushed automatically when this function
 		// returns success (i.e. nil). Calling CommitInBatch explicitly can
 		// sometimes reduce the number of RPCs.
-		return txn.CommitInBatch(b)
+		return txn.CommitInBatch(ctx, b)
 	})
 	if err != nil {
 		log.Fatal(err)

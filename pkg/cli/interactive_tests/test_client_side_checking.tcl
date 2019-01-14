@@ -7,7 +7,7 @@ start_server $argv
 spawn $argv sql
 eexpect root@
 
-# Check that syntax errors are handled client-side when running interactive.
+start_test "Check that syntax errors are handled client-side when running interactive."
 send "begin;\r\r"
 eexpect BEGIN
 eexpect root@
@@ -23,8 +23,16 @@ eexpect root@
 send "commit;\r"
 eexpect COMMIT
 eexpect root@
+end_test
 
-# Check that the user can force server-side handling.
+start_test "Check that the syntax checker does not get confused by empty inputs."
+# (issue #22441.)
+send ";\r"
+eexpect "0 rows"
+eexpect root@
+end_test
+
+start_test "Check that the user can force server-side handling."
 send "\\unset check_syntax\r"
 eexpect root@
 
@@ -43,10 +51,11 @@ send "commit;\r"
 eexpect "ROLLBACK"
 eexpect root@
 
-send "\003"
+interrupt
 eexpect eof
+end_test
 
-# Check that syntax errors are handled server-side by default when running non-interactive.
+start_test "Check that syntax errors are handled server-side by default when running non-interactive."
 spawn /bin/bash
 send "PS1=':''/# '\r"
 eexpect ":/# "
@@ -65,9 +74,23 @@ eexpect "COMMIT"
 eexpect ":/# "
 send "echo \$?\r"
 eexpect "0\r\n:/# "
+end_test
+
+start_test "Check that --debug-sql-cli sets suitable simplified client-side options."
+send "$argv sql --debug-sql-cli\r"
+eexpect "Welcome"
+eexpect "root@"
+send "\\set display_format csv\r\\set\r"
+eexpect "check_syntax,false"
+eexpect "echo,true"
+eexpect "prompt1,%n@%M>"
+eexpect "smart_prompt,false"
+eexpect "root@"
+send "\\q\r"
+eexpect ":/# "
+end_test
 
 send "exit 0\r"
 eexpect eof
 
 stop_server $argv
-

@@ -11,17 +11,17 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
 
 package cli
 
 import (
 	"os"
 
-	"github.com/spf13/cobra"
-
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/util/version"
+	"github.com/lib/pq"
+	"github.com/spf13/cobra"
 )
 
 var password bool
@@ -33,21 +33,32 @@ var getUserCmd = &cobra.Command{
 	Long: `
 Fetches and displays the user for <username>.
 `,
-	SilenceUsage: true,
-	RunE:         MaybeDecorateGRPCError(runGetUser),
+	Args: cobra.ExactArgs(1),
+	RunE: MaybeDecorateGRPCError(runGetUser),
 }
 
+var verGetUser = version.MustParse("v2.0.0-alpha.20180116")
+var verRmUser = version.MustParse("v1.1.0-alpha.20170622")
+var verSetUser = version.MustParse("v1.2.0-alpha.20171113")
+
 func runGetUser(cmd *cobra.Command, args []string) error {
-	if len(args) != 1 {
-		return usageAndError(cmd)
-	}
-	conn, err := getPasswordAndMakeSQLClient()
+	conn, err := getPasswordAndMakeSQLClient("cockroach user")
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
+	// NOTE: We too aggressively broke backwards compatibility in this command.
+	// Future changes should maintain compatibility with the last two released
+	// versions of CockroachDB.
+	if err := conn.requireServerVersion(verGetUser); err != nil {
+		return err
+	}
 	return runQueryAndFormatResults(conn, os.Stdout,
-		makeQuery(`SELECT * FROM system.users WHERE username=$1`, args[0]), cliCtx.prettyFmt)
+		makeQuery(`
+SELECT username AS user_name,
+       "isRole" as is_role
+  FROM system.users
+ WHERE username = $1 AND "isRole" = false`, args[0]))
 }
 
 // A lsUsersCmd command displays a list of users.
@@ -57,21 +68,18 @@ var lsUsersCmd = &cobra.Command{
 	Long: `
 List all users.
 `,
-	SilenceUsage: true,
-	RunE:         MaybeDecorateGRPCError(runLsUsers),
+	Args: cobra.NoArgs,
+	RunE: MaybeDecorateGRPCError(runLsUsers),
 }
 
 func runLsUsers(cmd *cobra.Command, args []string) error {
-	if len(args) > 0 {
-		return usageAndError(cmd)
-	}
-	conn, err := getPasswordAndMakeSQLClient()
+	conn, err := getPasswordAndMakeSQLClient("cockroach user")
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
 	return runQueryAndFormatResults(conn, os.Stdout,
-		makeQuery(`SELECT username FROM system.users`), cliCtx.prettyFmt)
+		makeQuery(`SHOW USERS`))
 }
 
 // A rmUserCmd command removes the user for the specified username.
@@ -81,21 +89,24 @@ var rmUserCmd = &cobra.Command{
 	Long: `
 Remove an existing user by username.
 `,
-	SilenceUsage: true,
-	RunE:         MaybeDecorateGRPCError(runRmUser),
+	Args: cobra.ExactArgs(1),
+	RunE: MaybeDecorateGRPCError(runRmUser),
 }
 
 func runRmUser(cmd *cobra.Command, args []string) error {
-	if len(args) != 1 {
-		return usageAndError(cmd)
-	}
-	conn, err := getPasswordAndMakeSQLClient()
+	conn, err := getPasswordAndMakeSQLClient("cockroach user")
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
+	// NOTE: We too aggressively broke backwards compatibility in this command.
+	// Future changes should maintain compatibility with the last two released
+	// versions of CockroachDB.
+	if err := conn.requireServerVersion(verRmUser); err != nil {
+		return err
+	}
 	return runQueryAndFormatResults(conn, os.Stdout,
-		makeQuery(`DELETE FROM system.users WHERE username=$1`, args[0]), cliCtx.prettyFmt)
+		makeQuery(`DROP USER $1`, args[0]))
 }
 
 // A setUserCmd command creates a new or updates an existing user.
@@ -105,9 +116,13 @@ var setUserCmd = &cobra.Command{
 	Long: `
 Create or update a user for the specified username, prompting
 for the password.
+
+Valid usernames contain 1 to 63 alphanumeric characters. They must
+begin with either a letter or an underscore. Subsequent characters
+may be letters, numbers, or underscores.
 `,
-	SilenceUsage: true,
-	RunE:         MaybeDecorateGRPCError(runSetUser),
+	Args: cobra.ExactArgs(1),
+	RunE: MaybeDecorateGRPCError(runSetUser),
 }
 
 // runSetUser prompts for a password, then inserts the user and hash
@@ -115,27 +130,41 @@ for the password.
 // TODO(marc): once we have more fields in the user, we will need
 // to allow changing just some of them (eg: change email, but leave password).
 func runSetUser(cmd *cobra.Command, args []string) error {
-	if len(args) != 1 {
-		return usageAndError(cmd)
-	}
-	var err error
-	var hashed []byte
+	pwdString := ""
 	if password {
-		hashed, err = security.PromptForPasswordAndHash()
+		var err error
+		pwdString, err = security.PromptForPasswordTwice()
 		if err != nil {
 			return err
 		}
 	}
 
-	conn, err := getPasswordAndMakeSQLClient()
+	conn, err := getPasswordAndMakeSQLClient("cockroach user")
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
-	// TODO(asubiotto): Implement appropriate server-side authorization rules
-	// for users to be able to change their own passwords.
+
+	// NOTE: We too aggressively broke backwards compatibility in this command.
+	// Future changes should maintain compatibility with the last two released
+	// versions of CockroachDB.
+	if err := conn.requireServerVersion(verSetUser); err != nil {
+		return err
+	}
+
+	if password {
+		if err := runQueryAndFormatResults(conn, os.Stdout,
+			makeQuery(`CREATE USER $1 PASSWORD $2`, args[0], pwdString),
+		); err != nil {
+			if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == pgerror.CodeDuplicateObjectError {
+				return runQueryAndFormatResults(conn, os.Stdout,
+					makeQuery(`ALTER USER $1 WITH PASSWORD $2`, args[0], pwdString))
+			}
+			return err
+		}
+	}
 	return runQueryAndFormatResults(conn, os.Stdout,
-		makeQuery(`UPSERT INTO system.users VALUES ($1, $2)`, args[0], hashed), cliCtx.prettyFmt)
+		makeQuery(`CREATE USER IF NOT EXISTS $1`, args[0]))
 }
 
 var userCmds = []*cobra.Command{
@@ -148,9 +177,7 @@ var userCmds = []*cobra.Command{
 var userCmd = &cobra.Command{
 	Use:   "user",
 	Short: "get, set, list and remove users",
-	RunE: func(cmd *cobra.Command, args []string) error {
-		return cmd.Usage()
-	},
+	RunE:  usageAndErr,
 }
 
 func init() {

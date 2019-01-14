@@ -16,18 +16,17 @@ package storage
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"sort"
 	"testing"
 
-	"github.com/pkg/errors"
-
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/pkg/errors"
 )
 
 func TestRangeIDChunk(t *testing.T) {
@@ -141,19 +140,19 @@ func newTestProcessor() *testProcessor {
 	return p
 }
 
-func (p *testProcessor) processReady(rangeID roachpb.RangeID) {
+func (p *testProcessor) processReady(_ context.Context, rangeID roachpb.RangeID) {
 	p.mu.Lock()
 	p.mu.raftReady[rangeID]++
 	p.mu.Unlock()
 }
 
-func (p *testProcessor) processRequestQueue(rangeID roachpb.RangeID) {
+func (p *testProcessor) processRequestQueue(_ context.Context, rangeID roachpb.RangeID) {
 	p.mu.Lock()
 	p.mu.raftRequest[rangeID]++
 	p.mu.Unlock()
 }
 
-func (p *testProcessor) processTick(rangeID roachpb.RangeID) bool {
+func (p *testProcessor) processTick(_ context.Context, rangeID roachpb.RangeID) bool {
 	p.mu.Lock()
 	p.mu.raftTick[rangeID]++
 	p.mu.Unlock()
@@ -194,10 +193,11 @@ func TestSchedulerLoop(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	p := newTestProcessor()
-	s := newRaftScheduler(log.AmbientContext{}, nil, p, 1)
+	s := newRaftScheduler(nil, p, 1)
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
-	s.Start(stopper)
+	ctx := context.TODO()
+	defer stopper.Stop(ctx)
+	s.Start(ctx, stopper)
 	s.EnqueueRaftTick(1, 2, 3)
 
 	testutils.SucceedsSoon(t, func() error {
@@ -215,10 +215,11 @@ func TestSchedulerBuffering(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	p := newTestProcessor()
-	s := newRaftScheduler(log.AmbientContext{}, nil, p, 1)
+	s := newRaftScheduler(nil, p, 1)
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
-	s.Start(stopper)
+	ctx := context.TODO()
+	defer stopper.Stop(ctx)
+	s.Start(ctx, stopper)
 
 	testCases := []struct {
 		state    raftScheduleState

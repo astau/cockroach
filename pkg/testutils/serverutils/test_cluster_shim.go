@@ -12,9 +12,6 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
 //
-// Author: Radu Berinde (radu@cockroachlabs.com)
-// Author: Andrei Matei (andreimatei1@gmail.com)
-//
 // This file provides generic interfaces that allow tests to set up test
 // clusters without importing the testcluster (and indirectly server) package
 // (avoiding circular dependencies). To be used, the binary needs to call
@@ -56,12 +53,12 @@ type TestClusterInterface interface {
 	// The method blocks until a snapshot of the range has been copied to all the
 	// new replicas and the new replicas become part of the Raft group.
 	AddReplicas(
-		startKey roachpb.Key, targets ...base.ReplicationTarget,
+		startKey roachpb.Key, targets ...roachpb.ReplicationTarget,
 	) (roachpb.RangeDescriptor, error)
 
 	// RemoveReplicas removes one or more replicas from a range.
 	RemoveReplicas(
-		startKey roachpb.Key, targets ...base.ReplicationTarget,
+		startKey roachpb.Key, targets ...roachpb.ReplicationTarget,
 	) (roachpb.RangeDescriptor, error)
 
 	// FindRangeLeaseHolder returns the current lease holder for the given range.
@@ -75,8 +72,8 @@ type TestClusterInterface interface {
 	// to have applied the transfer is the previous lease holder.
 	FindRangeLeaseHolder(
 		rangeDesc roachpb.RangeDescriptor,
-		hint *base.ReplicationTarget,
-	) (base.ReplicationTarget, error)
+		hint *roachpb.ReplicationTarget,
+	) (roachpb.ReplicationTarget, error)
 
 	// TransferRangeLease transfers the lease for a range from whoever has it to
 	// a particular store. That store must already have a replica of the range. If
@@ -87,14 +84,18 @@ type TestClusterInterface interface {
 	// lease holder has applied it (so it might not know immediately that it is the
 	// new lease holder).
 	TransferRangeLease(
-		rangeDesc roachpb.RangeDescriptor, dest base.ReplicationTarget,
+		rangeDesc roachpb.RangeDescriptor, dest roachpb.ReplicationTarget,
 	) error
 
 	// LookupRange returns the descriptor of the range containing key.
 	LookupRange(key roachpb.Key) (roachpb.RangeDescriptor, error)
 
-	// Target returns a base.ReplicationTarget for the specified server.
-	Target(serverIdx int) base.ReplicationTarget
+	// Target returns a roachpb.ReplicationTarget for the specified server.
+	Target(serverIdx int) roachpb.ReplicationTarget
+
+	// ReplicationMode returns the ReplicationMode that the test cluster was
+	// configured with.
+	ReplicationMode() base.TestClusterReplicationMode
 }
 
 // TestClusterFactory encompasses the actual implementation of the shim

@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tamir Duberstein (tamird@gmail.com)
 
 package util
 
@@ -80,7 +78,7 @@ func (a UnresolvedAddr) IsEmpty() bool {
 }
 
 // String returns the address's string form.
-func (a *UnresolvedAddr) String() string {
+func (a UnresolvedAddr) String() string {
 	return a.AddressField
 }
 

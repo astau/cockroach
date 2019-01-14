@@ -1,4 +1,4 @@
-// Copyright 2015 The Cockroach Authors.
+// Copyright 2017 The Cockroach Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -11,38 +11,32 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Ben Darnell
 
-package log
+package log_test
 
 import (
-	"io/ioutil"
 	"os"
 	"testing"
 
-	"golang.org/x/net/context"
+	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
+	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 )
 
 func TestMain(m *testing.M) {
-	// We need to execute the code of runTest() via a function call, so
-	// as to ensure that its defer is guaranteed to run (os.Exit
-	// explicitly does not run defers).
-	os.Exit(runTests(m))
-}
+	randutil.SeedForTests()
+	security.SetAssetLoader(securitytest.EmbeddedAssets)
+	serverutils.InitTestServerFactory(server.TestServerFactory)
 
-func runTests(m *testing.M) int {
-	tmpDir, err := ioutil.TempDir("", "logtest")
-	if err != nil {
-		Fatalf(context.Background(), "could not create temporary directory: %s", err)
-	}
-	defer func() {
-		if err := os.RemoveAll(tmpDir); err != nil {
-			Errorf(context.Background(), "failed to clean up temp directory: %s", err)
-		}
-	}()
-	if err := logDir.Set(tmpDir); err != nil {
-		Fatal(context.Background(), err)
-	}
-	return m.Run()
+	// MakeTestingClusterSettings initializes log.ReportingSettings to this
+	// instance of setting values.
+	st := cluster.MakeTestingClusterSettings()
+	log.DiagnosticsReportingEnabled.Override(&st.SV, false)
+	log.CrashReports.Override(&st.SV, false)
+
+	os.Exit(m.Run())
 }

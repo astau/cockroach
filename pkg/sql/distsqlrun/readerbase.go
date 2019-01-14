@@ -1,4 +1,4 @@
-// Copyright 2016 The Cockroach Authors.
+// Copyright 2017 The Cockroach Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -11,130 +11,79 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 package distsqlrun
 
 import (
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/pkg/errors"
+	"context"
+	"fmt"
+
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
-// readerBase implements basic code shared by tableReader and joinReader.
-type readerBase struct {
-	flowCtx *FlowCtx
-	desc    sqlbase.TableDescriptor
+// We ignore any limits that are higher than this value to avoid integer
+// overflows. See limitHint for how this bound is used.
+const readerOverflowProtection = 1000000000000000 /* 10^15 */
 
-	index            *sqlbase.IndexDescriptor
-	isSecondaryIndex bool
+// limitHint returns the limit hint to set for a KVFetcher based on
+// the spec's limit hint and the PostProcessSpec.
+func limitHint(specLimitHint int64, post *distsqlpb.PostProcessSpec) (limitHint int64) {
+	// We prioritize the post process's limit since ProcOutputHelper
+	// will tell us to stop once we emit enough rows.
+	if post.Limit != 0 && post.Limit <= readerOverflowProtection {
+		limitHint = int64(post.Limit)
+	} else if specLimitHint != 0 && specLimitHint <= readerOverflowProtection {
+		// If it turns out that limiHint rows are sufficient for our consumer, we
+		// want to avoid asking for another batch. Currently, the only way for us to
+		// "stop" is if we block on sending rows and the consumer sets
+		// ConsumerDone() on the RowChannel while we block. So we want to block
+		// *after* sending all the rows in the limit hint; to do this, we request
+		// rowChannelBufSize + 1 more rows:
+		//  - rowChannelBufSize rows guarantee that we will fill the row channel
+		//    even after limitHint rows are consumed
+		//  - the extra row gives us chance to call Push again after we unblock,
+		//    which will notice that ConsumerDone() was called.
+		//
+		// This flimsy mechanism is only useful in the (optimistic) case that the
+		// processor that only needs this many rows is our direct, local consumer.
+		// If we have a chain of processors and RowChannels, or remote streams, this
+		// reasoning goes out the door.
+		//
+		// TODO(radu, andrei): work on a real mechanism for limits.
+		limitHint = specLimitHint + rowChannelBufSize + 1
+	}
 
-	fetcher sqlbase.RowFetcher
+	if !post.Filter.Empty() {
+		// We have a filter so we will likely need to read more rows.
+		limitHint *= 2
+	}
 
-	filter exprHelper
-
-	// colIdxMap maps ColumnIDs to indices into desc.Columns
-	colIdxMap map[sqlbase.ColumnID]int
-
-	outputCols []int
-
-	// Last row returned by the rowFetcher; it has one entry per table column.
-	row      sqlbase.EncDatumRow
-	rowAlloc sqlbase.EncDatumRowAlloc
+	return limitHint
 }
 
-func (rb *readerBase) init(
-	flowCtx *FlowCtx,
-	desc *sqlbase.TableDescriptor,
-	indexIdx int,
-	filter Expression,
-	outputCols []uint32,
-	reverseScan bool,
-) error {
-	rb.flowCtx = flowCtx
-	rb.desc = *desc
-
-	rb.outputCols = make([]int, len(outputCols))
-	for i, v := range outputCols {
-		rb.outputCols[i] = int(v)
-	}
-
-	numCols := len(rb.desc.Columns)
-
-	// Figure out which columns we need: the output columns plus any other
-	// columns used by the filter expression.
-	valNeededForCol := make([]bool, numCols)
-	for _, c := range rb.outputCols {
-		if c < 0 || c >= numCols {
-			return errors.Errorf("invalid column index %d", c)
-		}
-		valNeededForCol[c] = true
-	}
-
-	if filter.Expr != "" {
-		types := make([]sqlbase.ColumnType, numCols)
-		for i := range types {
-			types[i] = rb.desc.Columns[i].Type
-		}
-		if err := rb.filter.init(filter, types, flowCtx.evalCtx); err != nil {
-			return err
-		}
-		for c := 0; c < numCols; c++ {
-			valNeededForCol[c] = valNeededForCol[c] || rb.filter.vars.IndexedVarUsed(c)
+// misplannedRanges filters out the misplanned ranges and their RangeInfo for a
+// given node.
+func misplannedRanges(
+	ctx context.Context, rangeInfos []roachpb.RangeInfo, nodeID roachpb.NodeID,
+) (misplannedRanges []roachpb.RangeInfo) {
+	for _, ri := range rangeInfos {
+		if ri.Lease.Replica.NodeID != nodeID {
+			misplannedRanges = append(misplannedRanges, ri)
 		}
 	}
 
-	// indexIdx is 0 for the primary index, or 1 to <num-indexes> for a
-	// secondary index.
-	if indexIdx < 0 || indexIdx > len(rb.desc.Indexes) {
-		return errors.Errorf("invalid indexIdx %d", indexIdx)
+	if len(misplannedRanges) != 0 {
+		var msg string
+		if len(misplannedRanges) < 3 {
+			msg = fmt.Sprintf("%+v", misplannedRanges[0].Desc)
+		} else {
+			msg = fmt.Sprintf("%+v...", misplannedRanges[:3])
+		}
+		log.VEventf(ctx, 2, "tableReader pushing metadata about misplanned ranges: %s",
+			msg)
 	}
 
-	if indexIdx > 0 {
-		rb.index = &rb.desc.Indexes[indexIdx-1]
-		rb.isSecondaryIndex = true
-	} else {
-		rb.index = &rb.desc.PrimaryIndex
-	}
-
-	rb.colIdxMap = make(map[sqlbase.ColumnID]int, len(rb.desc.Columns))
-	for i, c := range rb.desc.Columns {
-		rb.colIdxMap[c.ID] = i
-	}
-	err := rb.fetcher.Init(&rb.desc, rb.colIdxMap, rb.index, reverseScan, rb.isSecondaryIndex,
-		rb.desc.Columns, valNeededForCol)
-	if err != nil {
-		return err
-	}
-	rb.row = make(sqlbase.EncDatumRow, len(rb.desc.Columns))
-	return nil
-}
-
-// nextRow processes table rows until it finds a row that passes the filter.
-// Returns a nil row when there are no more rows.
-func (rb *readerBase) nextRow() (sqlbase.EncDatumRow, error) {
-	for {
-		fetcherRow, err := rb.fetcher.NextRow()
-		if err != nil || fetcherRow == nil {
-			return nil, err
-		}
-
-		for i := range fetcherRow {
-			if !fetcherRow[i].IsUnset() {
-				rb.row[i] = fetcherRow[i]
-			}
-		}
-		passesFilter, err := rb.filter.evalFilter(rb.row)
-		if err != nil {
-			return nil, err
-		}
-		if passesFilter {
-			break
-		}
-	}
-	outRow := rb.rowAlloc.AllocRow(len(rb.outputCols))
-	for i, col := range rb.outputCols {
-		outRow[i] = rb.row[col]
-	}
-	return outRow, nil
+	return misplannedRanges
 }

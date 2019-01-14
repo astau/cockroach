@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Tracy (matt@cockroachlabs.com)
 
 package sqlutils
 
@@ -27,6 +25,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
+	"github.com/cockroachdb/cockroach/pkg/util/fileutil"
 )
 
 // PGUrl returns a postgres connection url which connects to this server with the given user, and a
@@ -47,14 +46,16 @@ func PGUrl(t testing.TB, servingAddr, prefix string, user *url.Userinfo) (url.UR
 		t.Fatal(err)
 	}
 
-	tempDir, err := ioutil.TempDir("", prefix)
+	// TODO(benesch): Audit usage of prefix and replace the following line with
+	// `testutils.TempDir(t)` if prefix can always be `t.Name()`.
+	tempDir, err := ioutil.TempDir("", fileutil.EscapeFilename(prefix))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	caPath := filepath.Join(security.EmbeddedCertsDir, security.EmbeddedCACert)
-	certPath := filepath.Join(security.EmbeddedCertsDir, fmt.Sprintf("%s.crt", user.Username()))
-	keyPath := filepath.Join(security.EmbeddedCertsDir, fmt.Sprintf("%s.key", user.Username()))
+	certPath := filepath.Join(security.EmbeddedCertsDir, fmt.Sprintf("client.%s.crt", user.Username()))
+	keyPath := filepath.Join(security.EmbeddedCertsDir, fmt.Sprintf("client.%s.key", user.Username()))
 
 	// Copy these assets to disk from embedded strings, so this test can
 	// run from a standalone binary.

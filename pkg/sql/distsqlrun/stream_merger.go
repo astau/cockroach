@@ -11,184 +11,144 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Irfan Sharif (irfansharif@cockroachlabs.com)
 
 package distsqlrun
 
 import (
+	"context"
+
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/pkg/errors"
 )
-
-// streamCacher is a thin wrapper around an ordered RowSource buffering in the most
-// recently received rows.
-type streamCacher struct {
-	src      RowSource
-	ordering sqlbase.ColumnOrdering
-	// rows contains the last set of rows received from the source.
-	rows       []sqlbase.EncDatumRow
-	datumAlloc sqlbase.DatumAlloc
-}
-
-// nextRow() is a wrapper around RowSource.NextRow(), it simultaneously saves the
-// retrieved row within the stream's most recently added rows buffer.
-func (s *streamCacher) nextRow() (sqlbase.EncDatumRow, error) {
-	row, err := s.src.NextRow()
-	// We don't make the explicit check for row == nil and therefore add the nil
-	// row to the row buffer, this is because the nil row can be used in
-	// group comparisons (end of stream is effectively another group).
-	if err != nil {
-		return nil, err
-	}
-	s.rows = append(s.rows, row)
-	return row, nil
-}
-
-// currentGroup returns the set of rows belonging to the same group as
-// s.rows[0], i.e. with the same group key (comprised of the set of ordered
-// columns).
-func (s *streamCacher) currentGroup() []sqlbase.EncDatumRow {
-	// we ignore the last row of the row buffer because this is either a nil row
-	// (end of stream) or a row not "equal" to s.rows[0], either case it belongs
-	// to the next group.
-	return s.rows[:len(s.rows)-1]
-}
-
-// advanceGroup moves over the 'current group' window to point to the next group
-// discarding the previous.
-func (s *streamCacher) advanceGroup() sqlbase.EncDatumRow {
-	// for each stream we discard all the rows except the last row (which is
-	// either a nil row or a row not "equal" to s.rows[0], either case it
-	// belongs to the next group.
-	s.rows[0] = s.rows[len(s.rows)-1]
-	s.rows = s.rows[:1]
-	return s.rows[0]
-}
-
-// accumulateGroup collects all the rows that are "equal" to s.rows[0], the
-// first occurrence of a row not "equal" to s.rows[0] is stored at the end of
-// s.rows.
-func (s *streamCacher) accumulateGroup() error {
-	for {
-		next, err := s.nextRow()
-		if err != nil || next == nil {
-			return err
-		}
-		cmp, err := s.rows[0].Compare(&s.datumAlloc, s.ordering, next)
-		if err != nil || cmp != 0 {
-			return err
-		}
-	}
-}
 
 // We define a group to be a set of rows from a given source with the same
 // group key, in this case the set of ordered columns. streamMerger emits
 // batches of rows that are the cross-product of matching groups from each
 // stream.
 type streamMerger struct {
-	left         streamCacher
-	right        streamCacher
+	left       streamGroupAccumulator
+	right      streamGroupAccumulator
+	leftGroup  []sqlbase.EncDatumRow
+	rightGroup []sqlbase.EncDatumRow
+	// nulLEquality indicates when NULL = NULL is truth-y. This is helpful
+	// when we want NULL to be meaningful during equality, for example
+	// during SCRUB secondary index checks.
+	nullEquality bool
 	datumAlloc   sqlbase.DatumAlloc
-	outputBuffer [][2]sqlbase.EncDatumRow
-	initialized  bool
 }
 
-// initialize loads up each stream with the first row received from it's
-// corresponding source.
-func (sm *streamMerger) initialize() error {
-	if _, err := sm.left.nextRow(); err != nil {
-		return err
-	}
-	_, err := sm.right.nextRow()
-	return err
+func (sm *streamMerger) start(ctx context.Context) {
+	sm.left.start(ctx)
+	sm.right.start(ctx)
 }
 
-// computeBatch adds the cross-product of the next matching set of groups
-// from each of streams to the output buffer.
-func (sm *streamMerger) computeBatch() error {
-	sm.outputBuffer = sm.outputBuffer[:0]
-
-	lrow := sm.left.advanceGroup()
-	rrow := sm.right.advanceGroup()
-
-	if lrow == nil && rrow == nil {
-		return nil
+// NextBatch returns a set of rows from the left stream and a set of rows from
+// the right stream, all matching on the equality columns. One of the sets can
+// be empty.
+func (sm *streamMerger) NextBatch(
+	evalCtx *tree.EvalContext,
+) ([]sqlbase.EncDatumRow, []sqlbase.EncDatumRow, *ProducerMetadata) {
+	if sm.leftGroup == nil {
+		var meta *ProducerMetadata
+		sm.leftGroup, meta = sm.left.nextGroup(evalCtx)
+		if meta != nil {
+			return nil, nil, meta
+		}
+	}
+	if sm.rightGroup == nil {
+		var meta *ProducerMetadata
+		sm.rightGroup, meta = sm.right.nextGroup(evalCtx)
+		if meta != nil {
+			return nil, nil, meta
+		}
+	}
+	if sm.leftGroup == nil && sm.rightGroup == nil {
+		return nil, nil, nil
 	}
 
-	cmp, err := sm.compare(lrow, rrow)
+	var lrow, rrow sqlbase.EncDatumRow
+	if len(sm.leftGroup) > 0 {
+		lrow = sm.leftGroup[0]
+	}
+	if len(sm.rightGroup) > 0 {
+		rrow = sm.rightGroup[0]
+	}
+
+	cmp, err := CompareEncDatumRowForMerge(
+		sm.left.types, lrow, rrow, sm.left.ordering, sm.right.ordering,
+		sm.nullEquality, &sm.datumAlloc, evalCtx,
+	)
 	if err != nil {
-		return err
+		return nil, nil, &ProducerMetadata{Err: err}
 	}
-
-	if cmp < 0 {
-		// lrow < rrow or rrow == nil, accumulate set of rows "equal" to lrow
-		// and emit (lrow, nil) tuples.
-		if err := sm.left.accumulateGroup(); err != nil {
-			return err
-		}
-
-		for _, l := range sm.left.currentGroup() {
-			sm.outputBuffer = append(sm.outputBuffer, [2]sqlbase.EncDatumRow{l, nil})
-		}
-		return nil
+	var leftGroup, rightGroup []sqlbase.EncDatumRow
+	if cmp <= 0 {
+		leftGroup = sm.leftGroup
+		sm.leftGroup = nil
 	}
-
-	if cmp > 0 {
-		// rrow < lrow or lrow == nil, accumulate set of rows "equal" to rrow
-		// and emit (nil, rrow) tuples.
-		if err := sm.right.accumulateGroup(); err != nil {
-			return err
-		}
-
-		for _, r := range sm.right.currentGroup() {
-			sm.outputBuffer = append(sm.outputBuffer, [2]sqlbase.EncDatumRow{nil, r})
-		}
-		return nil
+	if cmp >= 0 {
+		rightGroup = sm.rightGroup
+		sm.rightGroup = nil
 	}
-
-	// lrow == rrow, accumulate set of rows "equal" to lrow and set of rows
-	// "equal" to rrow then emit cross product of the two sets ((lrow, rrow)
-	// tuples).
-	if err := sm.right.accumulateGroup(); err != nil {
-		return err
-	}
-	if err := sm.left.accumulateGroup(); err != nil {
-		return err
-	}
-
-	// Output cross-product.
-	for _, l := range sm.left.currentGroup() {
-		for _, r := range sm.right.currentGroup() {
-			sm.outputBuffer = append(sm.outputBuffer, [2]sqlbase.EncDatumRow{l, r})
-		}
-	}
-
-	return nil
+	return leftGroup, rightGroup, nil
 }
 
-func (sm *streamMerger) compare(lhs, rhs sqlbase.EncDatumRow) (int, error) {
+// CompareEncDatumRowForMerge EncDatumRow compares two EncDatumRows for merging.
+// When merging two streams and preserving the order (as in a MergeSort or
+// a MergeJoin) compare the head of the streams, emitting the one that sorts
+// first. It allows for the EncDatumRow to be nil if one of the streams is
+// exhausted (and hence nil). CompareEncDatumRowForMerge returns 0 when both
+// rows are nil, and a nil row is considered greater than any non-nil row.
+// CompareEncDatumRowForMerge assumes that the two rows have the same columns
+// in the same orders, but can handle different ordering directions. It takes
+// a DatumAlloc which is used for decoding if any underlying EncDatum is not
+// yet decoded.
+func CompareEncDatumRowForMerge(
+	lhsTypes []sqlbase.ColumnType,
+	lhs, rhs sqlbase.EncDatumRow,
+	leftOrdering, rightOrdering sqlbase.ColumnOrdering,
+	nullEquality bool,
+	da *sqlbase.DatumAlloc,
+	evalCtx *tree.EvalContext,
+) (int, error) {
 	if lhs == nil && rhs == nil {
-		panic("comparing two nil rows")
+		return 0, nil
 	}
-
 	if lhs == nil {
 		return 1, nil
 	}
 	if rhs == nil {
 		return -1, nil
 	}
+	if len(leftOrdering) != len(rightOrdering) {
+		return 0, errors.Errorf(
+			"cannot compare two EncDatumRow types that have different length ColumnOrderings",
+		)
+	}
 
-	for i, ord := range sm.left.ordering {
+	for i, ord := range leftOrdering {
 		lIdx := ord.ColIdx
-		rIdx := sm.right.ordering[i].ColIdx
-		cmp, err := lhs[lIdx].Compare(&sm.datumAlloc, &rhs[rIdx])
+		rIdx := rightOrdering[i].ColIdx
+		// If both datums are NULL, we need to follow SQL semantics where
+		// they are not equal. This differs from our datum semantics where
+		// they are equal. In the case where we want to consider NULLs to be
+		// equal, we continue and skip to the next datums in the row.
+		if lhs[lIdx].IsNull() && rhs[rIdx].IsNull() {
+			if !nullEquality {
+				// We can return either -1 or 1, it does not change the behavior.
+				return -1, nil
+			}
+			continue
+		}
+		cmp, err := lhs[lIdx].Compare(&lhsTypes[lIdx], da, evalCtx, &rhs[rIdx])
 		if err != nil {
 			return 0, err
 		}
 		if cmp != 0 {
-			if sm.left.ordering[i].Direction == encoding.Descending {
+			if leftOrdering[i].Direction == encoding.Descending {
 				cmp = -cmp
 			}
 			return cmp, nil
@@ -197,47 +157,36 @@ func (sm *streamMerger) compare(lhs, rhs sqlbase.EncDatumRow) (int, error) {
 	return 0, nil
 }
 
-func (sm *streamMerger) NextBatch() ([][2]sqlbase.EncDatumRow, error) {
-	if !sm.initialized {
-		if err := sm.initialize(); err != nil {
-			return nil, err
-		}
-		sm.initialized = true
-	}
-	if err := sm.computeBatch(); err != nil {
-		return nil, err
-	}
-	return sm.outputBuffer, nil
+func (sm *streamMerger) close(ctx context.Context) {
+	sm.left.close(ctx)
+	sm.right.close(ctx)
 }
 
+// makeStreamMerger creates a streamMerger, joining rows from leftSource with
+// rows from rightSource.
+//
+// All metadata from the sources is forwarded to metadataSink.
 func makeStreamMerger(
-	orderings []sqlbase.ColumnOrdering, sources []RowSource,
+	leftSource RowSource,
+	leftOrdering sqlbase.ColumnOrdering,
+	rightSource RowSource,
+	rightOrdering sqlbase.ColumnOrdering,
+	nullEquality bool,
+	memMonitor *mon.BytesMonitor,
 ) (streamMerger, error) {
-	if len(sources) != 2 {
-		return streamMerger{}, errors.Errorf("only 2 sources allowed, %d provided", len(sources))
-	}
-	if len(sources) != len(orderings) {
+	if len(leftOrdering) != len(rightOrdering) {
 		return streamMerger{}, errors.Errorf(
-			"orderings count %d doesn't match source count %d", len(orderings), len(sources))
+			"ordering lengths don't match: %d and %d", len(leftOrdering), len(rightOrdering))
 	}
-	if len(orderings[0]) != len(orderings[1]) {
-		return streamMerger{}, errors.Errorf(
-			"ordering lengths don't match: %d and %d", len(orderings[0]), len(orderings[1]))
-	}
-	for i, ord := range orderings[0] {
-		if ord.Direction != orderings[1][i].Direction {
+	for i, ord := range leftOrdering {
+		if ord.Direction != rightOrdering[i].Direction {
 			return streamMerger{}, errors.New("Ordering mismatch")
 		}
 	}
 
 	return streamMerger{
-		left: streamCacher{
-			src:      sources[0],
-			ordering: orderings[0],
-		},
-		right: streamCacher{
-			src:      sources[1],
-			ordering: orderings[1],
-		},
+		left:         makeStreamGroupAccumulator(leftSource, leftOrdering, memMonitor),
+		right:        makeStreamGroupAccumulator(rightSource, rightOrdering, memMonitor),
+		nullEquality: nullEquality,
 	}, nil
 }

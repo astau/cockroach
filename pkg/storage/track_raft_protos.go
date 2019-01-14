@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tamir Duberstein (tamird@gmail.com)
 
 package storage
 
@@ -22,22 +20,43 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/gogo/protobuf/proto"
-
 	"github.com/cockroachdb/cockroach/pkg/gossip"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/storage/compactor"
+	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/stateloader"
+	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
 
-// TrackRaftProtos instruments proto marshalling to track protos which are
-// marshalled downstream of raft. It returns a function that removes the
+func funcName(f interface{}) string {
+	return runtime.FuncForPC(reflect.ValueOf(f).Pointer()).Name()
+}
+
+// TrackRaftProtos instruments proto marshaling to track protos which are
+// marshaled downstream of raft. It returns a function that removes the
 // instrumentation and returns the list of downstream-of-raft protos.
 func TrackRaftProtos() func() []reflect.Type {
 	// Grab the name of the function that roots all raft operations.
-	applyRaftFunc := runtime.FuncForPC(reflect.ValueOf((*Replica).executeBatch).Pointer()).Name()
-	// Some raft operations trigger gossip, but we don't care about proto
-	// serialization in gossip, so we're going to ignore it.
-	addInfoFunc := runtime.FuncForPC(reflect.ValueOf((*gossip.Gossip).AddInfoProto).Pointer()).Name()
+	processRaftFunc := funcName((*Replica).processRaftCommand)
+	// We only need to track protos that could cause replica divergence
+	// by being written to disk downstream of raft.
+	whitelist := []string{
+		// Some raft operations trigger gossip, but we don't require
+		// strict consistency there.
+		funcName((*gossip.Gossip).AddInfoProto),
+		// Replica destroyed errors are written to disk, but they are
+		// deliberately per-replica values.
+		funcName((stateloader.StateLoader).SetReplicaDestroyedError),
+		// Compactions are suggested below Raft, but they are local to a store and
+		// thus not subject to Raft consistency requirements.
+		funcName((*compactor.Compactor).Suggest),
+		// Range merges destroy replicas beneath Raft and write replica tombstones,
+		// but tombstones are unreplicated and thus not subject to the strict
+		// consistency requirements.
+		funcName((*Replica).setTombstoneKey),
+	}
 
 	belowRaftProtos := struct {
 		syncutil.Mutex
@@ -46,8 +65,23 @@ func TrackRaftProtos() func() []reflect.Type {
 		inner: make(map[reflect.Type]struct{}),
 	}
 
-	protoutil.Interceptor = func(pb proto.Message) {
+	// Hard-coded protos for which we don't want to change the encoding. These
+	// are not "below raft" in the normal sense, but instead are used as part of
+	// conditional put operations.
+	belowRaftProtos.Lock()
+	belowRaftProtos.inner[reflect.TypeOf(&roachpb.RangeDescriptor{})] = struct{}{}
+	belowRaftProtos.inner[reflect.TypeOf(&storagepb.Liveness{})] = struct{}{}
+	belowRaftProtos.Unlock()
+
+	protoutil.Interceptor = func(pb protoutil.Message) {
 		t := reflect.TypeOf(pb)
+
+		// Special handling for MVCCMetadata: we expect MVCCMetadata to be
+		// marshaled below raft, but MVCCMetadata.Txn should always be nil in such
+		// cases.
+		if meta, ok := pb.(*enginepb.MVCCMetadata); ok && meta.Txn != nil {
+			protoutil.Interceptor(meta.Txn)
+		}
 
 		belowRaftProtos.Lock()
 		_, ok := belowRaftProtos.inner[t]
@@ -56,28 +90,39 @@ func TrackRaftProtos() func() []reflect.Type {
 			return
 		}
 
-		pcs := make([]uintptr, 100)
-		numCallers := runtime.Callers(0, pcs)
-		if numCallers == len(pcs) {
+		var pcs [256]uintptr
+		if numCallers := runtime.Callers(0, pcs[:]); numCallers == len(pcs) {
 			panic(fmt.Sprintf("number of callers %d might have exceeded slice size %d", numCallers, len(pcs)))
 		}
-		for _, pc := range pcs[:numCallers] {
-			funcName := runtime.FuncForPC(pc).Name()
-			if strings.Contains(funcName, addInfoFunc) {
+		frames := runtime.CallersFrames(pcs[:])
+		for {
+			f, more := frames.Next()
+
+			whitelisted := false
+			for _, s := range whitelist {
+				if strings.Contains(f.Function, s) {
+					whitelisted = true
+					break
+				}
+			}
+			if whitelisted {
 				break
 			}
-			if strings.Contains(funcName, applyRaftFunc) {
+
+			if strings.Contains(f.Function, processRaftFunc) {
 				belowRaftProtos.Lock()
 				belowRaftProtos.inner[t] = struct{}{}
 				belowRaftProtos.Unlock()
-
+				break
+			}
+			if !more {
 				break
 			}
 		}
 	}
 
 	return func() []reflect.Type {
-		protoutil.Interceptor = func(_ proto.Message) {}
+		protoutil.Interceptor = func(_ protoutil.Message) {}
 
 		belowRaftProtos.Lock()
 		types := make([]reflect.Type, 0, len(belowRaftProtos.inner))

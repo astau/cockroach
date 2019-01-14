@@ -11,15 +11,18 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 package distsqlrun
 
 import (
+	"context"
 	"io"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/pkg/errors"
 )
 
 // ProcessInboundStream receives rows from a DistSQL_FlowStreamServer and sends
@@ -27,66 +30,176 @@ import (
 // already received (because the first message contains the flow and stream IDs,
 // it needs to be received before we can get here).
 func ProcessInboundStream(
-	flowCtx *FlowCtx, stream DistSQL_FlowStreamServer, firstMsg *StreamMessage, dst RowReceiver,
+	ctx context.Context,
+	stream distsqlpb.DistSQL_FlowStreamServer,
+	firstMsg *distsqlpb.ProducerMessage,
+	dst RowReceiver,
+	f *Flow,
 ) error {
-	ctx := flowCtx.Context
-	// Function which we call when we are done.
-	finish := func(err error) error {
-		dst.Close(err)
+
+	err := processInboundStreamHelper(ctx, stream, firstMsg, dst, f)
+
+	// err, if set, will also be propagated to the producer
+	// as the last record that the producer gets.
+	if err != nil {
+		log.VEventf(ctx, 1, "inbound stream error: %s", err)
+		return err
+	}
+	log.VEventf(ctx, 1, "inbound stream done")
+	// We are now done. The producer, if it's still around, will receive an EOF
+	// error over its side of the stream.
+	return nil
+}
+
+func processInboundStreamHelper(
+	ctx context.Context,
+	stream distsqlpb.DistSQL_FlowStreamServer,
+	firstMsg *distsqlpb.ProducerMessage,
+	dst RowReceiver,
+	f *Flow,
+) error {
+	draining := false
+	var sd StreamDecoder
+
+	sendErrToConsumer := func(err error) {
 		if err != nil {
-			log.VEventf(ctx, 1, "inbound stream error: %s", err)
-			// TODO(radu): populate response and send error instead
-			return err
+			dst.Push(nil, &ProducerMetadata{Err: err})
 		}
-		if log.V(1) {
-			log.Infof(ctx, "inbound stream done")
-		}
-		return stream.SendAndClose(&SimpleResponse{})
+		dst.ProducerDone()
 	}
 
-	var sd StreamDecoder
-	for {
-		var msg *StreamMessage
-		if firstMsg != nil {
-			msg = firstMsg
-			firstMsg = nil
-		} else {
-			var err error
-			msg, err = stream.Recv()
+	if firstMsg != nil {
+		if res := processProducerMessage(
+			ctx, stream, dst, &sd, &draining, firstMsg,
+		); res.err != nil || res.consumerClosed {
+			sendErrToConsumer(res.err)
+			return res.err
+		}
+	}
+
+	// There's two goroutines involved in handling the RPC - the current one (the
+	// "parent"), which is watching for context cancellation, and a "reader" one
+	// that receives messages from the stream. This is all because a stream.Recv()
+	// call doesn't react to context cancellation. The idea is that, if the parent
+	// detects a canceled context, it will return from this RPC handler, which
+	// will cause the stream to be closed. Because the parent cannot wait for the
+	// reader to finish (that being the whole point of the different goroutines),
+	// the reader sending an error to the parent might race with the parent
+	// finishing. In that case, nobody cares about the reader anymore and so its
+	// result channel is buffered.
+	errChan := make(chan error, 1)
+
+	f.waitGroup.Add(1)
+	go func() {
+		defer f.waitGroup.Done()
+		for {
+			msg, err := stream.Recv()
 			if err != nil {
 				if err != io.EOF {
 					// Communication error.
-					dst.Close(err)
-					return err
+					err = pgerror.NewErrorf(pgerror.CodeConnectionFailureError, "communication error: %s", err)
+					sendErrToConsumer(err)
+					errChan <- err
+					return
 				}
 				// End of the stream.
-				return finish(nil)
+				sendErrToConsumer(nil)
+				errChan <- nil
+				return
+			}
+
+			if res := processProducerMessage(
+				ctx, stream, dst, &sd, &draining, msg,
+			); res.err != nil || res.consumerClosed {
+				sendErrToConsumer(res.err)
+				errChan <- res.err
+				return
 			}
 		}
-		err := sd.AddMessage(msg)
-		if err != nil {
-			return finish(err)
-		}
-		for {
-			row, err := sd.GetRow(nil)
-			if err != nil {
-				return finish(err)
-			}
-			if row == nil {
-				// No more rows in the last message.
-				break
-			}
-			if log.V(3) {
-				log.Infof(ctx, "inbound stream pushing row %s", row)
-			}
-			if !dst.PushRow(row) {
-				// Rest of rows not needed.
-				return finish(nil)
-			}
-		}
-		done, err := sd.IsDone()
-		if done {
-			return finish(err)
+	}()
+
+	// Check for context cancellation while reading from the stream on another
+	// goroutine.
+	select {
+	case <-f.ctxDone:
+		return sqlbase.QueryCanceledError
+	case err := <-errChan:
+		return err
+	}
+}
+
+// sendDrainSignalToProducer is called when the consumer wants to signal the
+// producer that it doesn't need any more rows and the producer should drain. A
+// signal is sent on stream to the producer to ask it to send metadata.
+func sendDrainSignalToStreamProducer(
+	ctx context.Context, stream distsqlpb.DistSQL_FlowStreamServer,
+) error {
+	log.VEvent(ctx, 1, "sending drain signal to producer")
+	sig := distsqlpb.ConsumerSignal{DrainRequest: &distsqlpb.DrainRequest{}}
+	return stream.Send(&sig)
+}
+
+// processProducerMessage is a helper function to process data from the producer
+// and send it along to the consumer. It keeps track of whether or not it's
+// draining between calls. If err in the result is set (or if the consumer is
+// closed), the caller must return the error to the producer.
+func processProducerMessage(
+	ctx context.Context,
+	stream distsqlpb.DistSQL_FlowStreamServer,
+	dst RowReceiver,
+	sd *StreamDecoder,
+	draining *bool,
+	msg *distsqlpb.ProducerMessage,
+) processMessageResult {
+	err := sd.AddMessage(msg)
+	if err != nil {
+		return processMessageResult{
+			err:            errors.Wrap(err, log.MakeMessage(ctx, "decoding error", nil /* args */)),
+			consumerClosed: false,
 		}
 	}
+	var types []sqlbase.ColumnType
+	for {
+		row, meta, err := sd.GetRow(nil /* rowBuf */)
+		if err != nil {
+			return processMessageResult{err: err, consumerClosed: false}
+		}
+		if row == nil && meta == nil {
+			// No more rows in the last message.
+			return processMessageResult{err: nil, consumerClosed: false}
+		}
+
+		if log.V(3) && row != nil {
+			if types == nil {
+				types = sd.Types()
+			}
+			log.Infof(ctx, "inbound stream pushing row %s", row.String(types))
+		}
+		if *draining && meta == nil {
+			// Don't forward data rows when we're draining.
+			continue
+		}
+		switch dst.Push(row, meta) {
+		case NeedMoreRows:
+			continue
+		case DrainRequested:
+			// The rest of rows are not needed by the consumer. We'll send a drain
+			// signal to the producer and expect it to quickly send trailing
+			// metadata and close its side of the stream, at which point we also
+			// close the consuming side of the stream and call dst.ProducerDone().
+			if !*draining {
+				*draining = true
+				if err := sendDrainSignalToStreamProducer(ctx, stream); err != nil {
+					log.Errorf(ctx, "draining error: %s", err)
+				}
+			}
+		case ConsumerClosed:
+			return processMessageResult{err: nil, consumerClosed: true}
+		}
+	}
+}
+
+type processMessageResult struct {
+	err            error
+	consumerClosed bool
 }

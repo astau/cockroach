@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 // +build !linux,!freebsd
 
@@ -20,6 +18,6 @@ package cli
 
 import "github.com/cockroachdb/cockroach/pkg/util/stop"
 
-func initBacktrace(logDir string) *stop.Stopper {
-	return stop.NewStopper()
+func initBacktrace(logDir string, options ...stop.Option) *stop.Stopper {
+	return stop.NewStopper(options...)
 }

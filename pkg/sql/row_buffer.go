@@ -11,13 +11,12 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Irfan Sharif (irfansharif@cockroachlabs.com)
 
 package sql
 
 import (
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 )
 
 // RowBuffer is a buffer for rows of DTuples. Rows must be added using
@@ -29,14 +28,14 @@ import (
 // under the constraints imposed by Next() and Values() under the planNode
 // interface.
 type RowBuffer struct {
-	*RowContainer
-	output parser.DTuple
+	*sqlbase.RowContainer
+	output tree.Datums
 }
 
 // Values here is analogous to Values() as defined under planNode.
 //
 // Available after Next(), result only valid until the next call to Next()
-func (rb *RowBuffer) Values() parser.DTuple {
+func (rb *RowBuffer) Values() tree.Datums {
 	return rb.output
 }
 

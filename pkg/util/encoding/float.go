@@ -11,9 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Andrew Bonventre (andybons@gmail.com)
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package encoding
 
@@ -42,14 +39,15 @@ import (
 // direction, and that after them a logical ordering is followed.
 func EncodeFloatAscending(b []byte, f float64) []byte {
 	// Handle the simplistic cases first.
-	u := math.Float64bits(f)
 	switch {
 	case math.IsNaN(f):
 		return append(b, floatNaN)
-	case u == 0:
-		// Only special-case positive zero.
+	case f == 0:
+		// This encodes both positive and negative zero the same. Negative zero uses
+		// composite indexes to decode itself correctly.
 		return append(b, floatZero)
 	}
+	u := math.Float64bits(f)
 	if u&(1<<63) != 0 {
 		u = ^u
 		b = append(b, floatNeg)
