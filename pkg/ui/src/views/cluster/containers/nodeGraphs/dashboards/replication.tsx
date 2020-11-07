@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 import React from "react";
 import _ from "lodash";
@@ -19,6 +15,9 @@ import { LineGraph } from "src/views/cluster/components/linegraph";
 import { Metric, Axis, AxisUnits } from "src/views/shared/components/metricQuery";
 
 import { GraphDashboardProps, nodeDisplayName, storeIDsForNode } from "./dashboardUtils";
+import {
+  LogicalBytesGraphTooltip,
+} from "src/views/cluster/containers/nodeGraphs/dashboards/graphTooltips";
 
 export default function (props: GraphDashboardProps) {
   const { nodeIDs, nodesSummary, storeSources } = props;
@@ -32,6 +31,7 @@ export default function (props: GraphDashboardProps) {
         <Metric name="cr.store.replicas.leaders_not_leaseholders" title="Leaders w/o Lease" />
         <Metric name="cr.store.ranges.unavailable" title="Unavailable" />
         <Metric name="cr.store.ranges.underreplicated" title="Under-replicated" />
+        <Metric name="cr.store.ranges.overreplicated" title="Over-replicated" />
       </Axis>
     </LineGraph>,
 
@@ -86,7 +86,7 @@ export default function (props: GraphDashboardProps) {
       </Axis>
     </LineGraph>,
 
-    <LineGraph title="Logical Bytes per Store" tooltip={`The number of logical bytes of data on each store.`}>
+    <LineGraph title="Logical Bytes per Store" tooltip={<LogicalBytesGraphTooltip />}>
       <Axis units={AxisUnits.Bytes} label="logical store size">
         {
           _.map(nodeIDs, (nid) => (
@@ -111,6 +111,7 @@ export default function (props: GraphDashboardProps) {
     <LineGraph title="Range Operations" sources={storeSources}>
       <Axis label="ranges">
         <Metric name="cr.store.range.splits" title="Splits" nonNegativeRate />
+        <Metric name="cr.store.range.merges" title="Merges" nonNegativeRate />
         <Metric name="cr.store.range.adds" title="Adds" nonNegativeRate />
         <Metric name="cr.store.range.removes" title="Removes" nonNegativeRate />
         <Metric name="cr.store.leases.transfers.success" title="Lease Transfers" nonNegativeRate />
@@ -122,8 +123,9 @@ export default function (props: GraphDashboardProps) {
     <LineGraph title="Snapshots" sources={storeSources}>
       <Axis label="snapshots">
         <Metric name="cr.store.range.snapshots.generated" title="Generated" nonNegativeRate />
-        <Metric name="cr.store.range.snapshots.normal-applied" title="Applied (Raft-initiated)" nonNegativeRate />
-        <Metric name="cr.store.range.snapshots.preemptive-applied" title="Applied (Preemptive)" nonNegativeRate />
+        <Metric name="cr.store.range.snapshots.applied-voter" title="Applied (Voters)" nonNegativeRate />
+        <Metric name="cr.store.range.snapshots.applied-initial" title="Applied (Initial Upreplication)" nonNegativeRate />
+        <Metric name="cr.store.range.snapshots.applied-non-voter" title="Applied (Non-Voters)" nonNegativeRate/>
         <Metric name="cr.store.replicas.reserved" title="Reserved" nonNegativeRate />
       </Axis>
     </LineGraph>,

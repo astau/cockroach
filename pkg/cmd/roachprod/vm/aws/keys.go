@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package aws
 
@@ -21,14 +16,15 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"strings"
 
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 const sshPublicKeyFile = "${HOME}/.ssh/id_rsa.pub"
 
 // sshKeyExists checks to see if there is a an SSH key with the given name in the given region.
-func sshKeyExists(keyName string, region string) (bool, error) {
+func (p *Provider) sshKeyExists(keyName string, region string) (bool, error) {
 	var data struct {
 		KeyPairs []struct {
 			KeyName string
@@ -38,7 +34,7 @@ func sshKeyExists(keyName string, region string) (bool, error) {
 		"ec2", "describe-key-pairs",
 		"--region", region,
 	}
-	err := runJSONCommand(args, &data)
+	err := p.runJSONCommand(args, &data)
 	if err != nil {
 		return false, err
 	}
@@ -52,7 +48,7 @@ func sshKeyExists(keyName string, region string) (bool, error) {
 
 // sshKeyImport takes the user's local, public SSH key and imports it into the ec2 region so that
 // we can create new hosts with it.
-func sshKeyImport(keyName string, region string) error {
+func (p *Provider) sshKeyImport(keyName string, region string) error {
 	keyBytes, err := ioutil.ReadFile(os.ExpandEnv(sshPublicKeyFile))
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -71,7 +67,13 @@ func sshKeyImport(keyName string, region string) error {
 		"--key-name", keyName,
 		"--public-key-material", string(keyBytes),
 	}
-	return runJSONCommand(args, &data)
+	err = p.runJSONCommand(args, &data)
+	// If two roachprod instances run at the same time with the same key, they may
+	// race to upload the key pair.
+	if err == nil || strings.Contains(err.Error(), "InvalidKeyPair.Duplicate") {
+		return nil
+	}
+	return err
 }
 
 // sshKeyName computes the name of the ec2 ssh key that we'll store the local user's public key in

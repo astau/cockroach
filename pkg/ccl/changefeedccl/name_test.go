@@ -13,11 +13,13 @@ import (
 	"unicode/utf8"
 
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/stretchr/testify/require"
 )
 
 func TestSQLNameToKafkaName(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	tests := []struct {
 		sql, kafka string
@@ -35,8 +37,8 @@ func TestSQLNameToKafkaName(t *testing.T) {
 		{`/`, `_u002f_`},
 		{`☃`, `_u2603_`},
 		{"\x00", `_u0000_`},
-		{string(utf8.RuneSelf), `_u0080_`},
-		{string(utf8.MaxRune), `_u0010ffff_`},
+		{string(rune(utf8.RuneSelf)), `_u0080_`},
+		{string(rune(utf8.MaxRune)), `_u0010ffff_`},
 		// special case: exact match of . and .. are disallowed by kafka
 		{`.`, `_u002e_`},
 		{`..`, `_u002e__u002e_`},
@@ -55,6 +57,7 @@ func TestSQLNameToKafkaName(t *testing.T) {
 
 func TestSQLNameToAvroName(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	tests := []struct {
 		sql, avro string
@@ -74,8 +77,8 @@ func TestSQLNameToAvroName(t *testing.T) {
 		{`/`, `_u002f_`},
 		{`☃`, `_u2603_`},
 		{"\x00", `_u0000_`},
-		{string(utf8.RuneSelf), `_u0080_`},
-		{string(utf8.MaxRune), `_u0010ffff_`},
+		{string(rune(utf8.RuneSelf)), `_u0080_`},
+		{string(rune(utf8.MaxRune)), `_u0010ffff_`},
 	}
 	for i, test := range tests {
 		if a := SQLNameToAvroName(test.sql); a != test.avro {

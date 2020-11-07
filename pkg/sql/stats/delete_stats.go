@@ -1,27 +1,23 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package stats
 
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 const (
@@ -40,9 +36,9 @@ const (
 func DeleteOldStatsForColumns(
 	ctx context.Context,
 	executor sqlutil.InternalExecutor,
-	txn *client.Txn,
-	tableID sqlbase.ID,
-	columnIDs []sqlbase.ColumnID,
+	txn *kv.Txn,
+	tableID descpb.ID,
+	columnIDs []descpb.ColumnID,
 ) error {
 	columnIDsVal := tree.NewDArray(types.Int)
 	for _, c := range columnIDs {
@@ -53,7 +49,7 @@ func DeleteOldStatsForColumns(
 
 	// This will delete all old statistics for the given table and columns,
 	// including stats created manually (except for a few automatic statistics,
-	// which are identified by the name autoStatsName).
+	// which are identified by the name AutoStatsName).
 	_, err := executor.Exec(
 		ctx, "delete-statistics", txn,
 		`DELETE FROM system.table_statistics
@@ -68,7 +64,7 @@ func DeleteOldStatsForColumns(
                    LIMIT $4
                )`,
 		tableID,
-		autoStatsName,
+		AutoStatsName,
 		columnIDsVal,
 		keepCount,
 	)

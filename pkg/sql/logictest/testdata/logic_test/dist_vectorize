@@ -1,0 +1,310 @@
+# LogicTest: 5node 5node-disk
+
+statement ok
+CREATE TABLE kv (k INT PRIMARY KEY, v INT)
+
+statement ok
+INSERT INTO kv SELECT i, i FROM generate_series(1,5) AS g(i)
+
+statement ok
+CREATE TABLE kw (k INT PRIMARY KEY, w INT)
+
+statement ok
+INSERT INTO kw SELECT i, i FROM generate_series(1,5) AS g(i)
+
+# Split into 5 parts, each row from each table goes to one node.
+statement ok
+ALTER TABLE kv SPLIT AT SELECT i FROM generate_series(1,5) AS g(i)
+
+statement ok
+ALTER TABLE kw SPLIT AT SELECT i FROM generate_series(1,5) AS g(i)
+
+statement ok
+ALTER TABLE kv EXPERIMENTAL_RELOCATE SELECT ARRAY[i], i FROM generate_series(1, 5) as g(i)
+
+statement ok
+ALTER TABLE kw EXPERIMENTAL_RELOCATE SELECT ARRAY[i], i FROM generate_series(1, 5) as g(i)
+
+# Verify data placement.
+query TTTI rowsort
+SELECT start_key, end_key, replicas, lease_holder from [SHOW RANGES FROM TABLE kv]
+----
+NULL       /1       {1}       1
+/1         /2       {1}       1
+/2         /3       {2}       2
+/3         /4       {3}       3
+/4         /5       {4}       4
+/5         NULL     {5}       5
+
+# Verify data placement.
+query TTTI rowsort
+SELECT start_key, end_key, replicas, lease_holder from [SHOW RANGES FROM TABLE kw]
+----
+NULL       /1       {5}       5
+/1         /2       {1}       1
+/2         /3       {2}       2
+/3         /4       {3}       3
+/4         /5       {4}       4
+/5         NULL     {5}       5
+
+# Verify that EXPLAIN ANALYZE works in a distributed setting.
+query T
+SELECT url FROM [EXPLAIN ANALYZE SELECT count(*) FROM kv]
+----
+https://cockroachdb.github.io/distsqlplan/decode.html#eJzMlU9vm0AQxe_9FKs5OdVamD92HE5xU1dCciA1jvonQhGBkYuCWbq7pIksf_cKSFWwkoUcWnFk2Me8x29g9iB-pmCDv1wtLzak4Cn5tPYuyc3y69Vq4bhk4S5W374vyeij42_8z6sT8nw0YkUmR-9P6vP3DwFQyFiMbrhDAfYN6EDBAAomULCAwhQCCjlnEQrBeHlkXwmc-BHsCYUkywtZlgMKEeMI9h5kIlMEGzbhXYprDGPk2gQoxCjDJK3a3D-c5zzZhfwJKPh5mAmbjLWysVdIm7gsQ6BwF8roBwrCCpmX5fIhssjTRqn063hEJju0yUSUoieJgnAMY5vMyQegwNmvPwUdggOFWvzsWshwi2DrB9o_2WK75bgNJePatB3swrt2N7dr74s_OumfAB8xKmTCMlWQ15wbrzr_a7jIGI-RY9xyGxzU2fQjav715a3jbkbn-v_KZray6f3nTe-eN80Ya-ZgJq4jW4PKbGATZ_SnYvSgYo41azBUOrI1qJwOjIrZn4rZg4o1rv50w6DSka1BZT4wKlZ_KlYPKtPxYJh0JGswORsYk45dv0aRs0zg0eZ8-cmTcqNivMV6_QpW8AivOIuqNvWlV-mqQoxC1nf1-sLJ6lulwaZYV4qNllg_Fhvqzh2tTaXaUoutt_iu3mL1Ql-cgrcObdvJVOlkpo4xG0yMU6WTuTrGfDAxztQjOen4GtTf0j8NEhze_Q4AAP__MqxXkw==
+
+query T
+SELECT url FROM [EXPLAIN ANALYZE SELECT * FROM kv JOIN kw ON kv.k = kw.k]
+----
+https://cockroachdb.github.io/distsqlplan/decode.html#eJzUWF1v2zYUfd-vIO5Tu9KVqI80EVDA2ZYBLlK7S_KwrfCDYnG2YEfSKCpuEOS_D7IWNHZsiqQoVX5LZFLnnqtzDnj5CPm_Kwjg-uLy4tcbVLAV-v1q8hl9vfjzy-X5aIzOx-eXf_19gd78Nrq-uf7j8i36f-nP1cLlPfo0GY3Rco0mY7S8f79EH9Fy_X45BQxJGtFxeEdzCL4CAQwOYHABgwcYfJhiyFg6o3mesnLJ42bDKPoGgY0hTrKCl4-nGGYpoxA8Ao_5ikIAN-Htil7RMKLMsgFDRHkYrzYwy_thxuK7kD0AhussTPIADawS-DbkswXNUVrwrOABKjfyIlu9eFTWOJogHt_RANl5uemB0xwxGkYBOkW_AAaWrp8fEJg-Yag2VwSeC7x9QIswX2yXNizXTzHkPJxTCMgT1mN8ssN4_ZqxRfrJ2TnI-ft7UhZRRqPd97wrgaVW7WnfZ8rm9FMaJ5RZZEcxK_oPfzMk795-ZPF8Uf0JGCZlc4YEDx08dPHQk-8m_UZnBY_TRNTU7S5-75Ar0aEi2cd-L_FxOkgzi_jblCWI-DJEPFvAxNtiQuT1TeodbTkDy-2hvoku5w8Snu4pZ-cg5w49TY7H0468KhwJJ7gDS4HHD3KCAudTCSf0lLNzkHOHTnCOxwmuvCpcCSd4A8vvoSqILuczCSf0lLNzkHOHTnCPxwmevCo8CSf4gx5qgugy9ut9MLAICpMIEZTyBWU9ZO8cZN-hI7zjcUTNPHxF8yxNcrozAe1_s102hkZzWrU7Tws2o19YOtvAVP9ONvs259eI5rz61an-GSXPP-U85LITlL2_IZtvKV_CiVIJL-WsCHSmDSTjG5VKiFrbG3AmvjkkoqAkpx0liUs4USqhAdczbSB1JYkrIWptb8B5R0mNkJxdJPslkrst2d3NrnAz2RaB3Y4OPYOhKuyUGEgtOlvhqh-qikAmM7MGST8z1e3tGwxVIWcxkFp0aipJXIJ-qCoCmczMGiT9zFRX0olKqLZayYeu0lEMZPBgKQZSy0BN84hLaJCOpr-vySPnaVfpKAYyeLAUA6lloKaSxCU0SEd1JdWUYvDIedabdCQmJ3Lxgb6twds4aYOnyBokxaDUnVM7nMpNjuVNkPRDUkNObc3nqkiKaakrp-5Gc6I0m7f7kV9N-oaC0ngpBk-aNUgmg1KMZHLeroNSi0NdE6lc2rQcXyrXOs3srHJ70yaS0YtKpfubtjL51ejfXVBOn376LwAA__9Jy9vs
+
+# Verify execution.
+statement ok
+SET vectorize = experimental_always
+
+query I rowsort
+SELECT kv.k FROM kv JOIN kw ON kv.k = kw.k
+----
+1
+2
+3
+4
+5
+
+statement ok
+RESET vectorize
+
+# Regression test for #38919.
+statement ok
+SET optimizer = on
+
+query B
+SELECT EXISTS(SELECT * FROM kv WHERE k > 2)
+----
+true
+
+statement ok
+RESET optimizer
+
+query T
+EXPLAIN (VEC, VERBOSE) SELECT count(*) FROM kv
+----
+│
+├ Node 1
+│ └ *colexec.Materializer
+│   └ *colexec.orderedAggregator
+│     └ *colexec.oneShotOp
+│       └ *colexec.distinctChainOps
+│         └ *colexec.ParallelUnorderedSynchronizer
+│           ├ *colexec.countOp
+│           │ └ *colexec.simpleProjectOp
+│           │   └ *colexec.CancelChecker
+│           │     └ *colfetcher.ColBatchScan
+│           ├ *colrpc.Inbox
+│           ├ *colrpc.Inbox
+│           ├ *colrpc.Inbox
+│           └ *colrpc.Inbox
+├ Node 2
+│ └ *colrpc.Outbox
+│   └ *colexec.deselectorOp
+│     └ *colexec.countOp
+│       └ *colexec.simpleProjectOp
+│         └ *colexec.CancelChecker
+│           └ *colfetcher.ColBatchScan
+├ Node 3
+│ └ *colrpc.Outbox
+│   └ *colexec.deselectorOp
+│     └ *colexec.countOp
+│       └ *colexec.simpleProjectOp
+│         └ *colexec.CancelChecker
+│           └ *colfetcher.ColBatchScan
+├ Node 4
+│ └ *colrpc.Outbox
+│   └ *colexec.deselectorOp
+│     └ *colexec.countOp
+│       └ *colexec.simpleProjectOp
+│         └ *colexec.CancelChecker
+│           └ *colfetcher.ColBatchScan
+└ Node 5
+  └ *colrpc.Outbox
+    └ *colexec.deselectorOp
+      └ *colexec.countOp
+        └ *colexec.simpleProjectOp
+          └ *colexec.CancelChecker
+            └ *colfetcher.ColBatchScan
+
+query T
+EXPLAIN (VEC, VERBOSE) SELECT count(*) FROM kv NATURAL INNER HASH JOIN kv kv2
+----
+│
+├ Node 1
+│ └ *colexec.Materializer
+│   └ *colexec.orderedAggregator
+│     └ *colexec.oneShotOp
+│       └ *colexec.distinctChainOps
+│         └ *colexec.ParallelUnorderedSynchronizer
+│           ├ *colexec.countOp
+│           │ └ *colexec.simpleProjectOp
+│           │   └ *colexec.diskSpillerBase
+│           │     ├ *colexec.hashJoiner
+│           │     │ ├ *colexec.ParallelUnorderedSynchronizer
+│           │     │ │ ├ *colexec.routerOutputOp
+│           │     │ │ │ └ *colexec.HashRouter
+│           │     │ │ │   └ *colexec.CancelChecker
+│           │     │ │ │     └ *colfetcher.ColBatchScan
+│           │     │ │ ├ *colrpc.Inbox
+│           │     │ │ ├ *colrpc.Inbox
+│           │     │ │ ├ *colrpc.Inbox
+│           │     │ │ └ *colrpc.Inbox
+│           │     │ └ *colexec.ParallelUnorderedSynchronizer
+│           │     │   ├ *colexec.routerOutputOp
+│           │     │   │ └ *colexec.HashRouter
+│           │     │   │   └ *colexec.CancelChecker
+│           │     │   │     └ *colfetcher.ColBatchScan
+│           │     │   ├ *colrpc.Inbox
+│           │     │   ├ *colrpc.Inbox
+│           │     │   ├ *colrpc.Inbox
+│           │     │   └ *colrpc.Inbox
+│           │     ├ *colexec.ParallelUnorderedSynchronizer
+│           │     ├ *colexec.ParallelUnorderedSynchronizer
+│           │     └ *colexec.externalHashJoiner
+│           │       ├ *colexec.bufferExportingOperator
+│           │       └ *colexec.bufferExportingOperator
+│           ├ *colrpc.Inbox
+│           ├ *colrpc.Inbox
+│           ├ *colrpc.Inbox
+│           └ *colrpc.Inbox
+├ Node 2
+│ └ *colrpc.Outbox
+│   └ *colexec.deselectorOp
+│     └ *colexec.countOp
+│       └ *colexec.simpleProjectOp
+│         └ *colexec.diskSpillerBase
+│           ├ *colexec.hashJoiner
+│           │ ├ *colexec.ParallelUnorderedSynchronizer
+│           │ │ ├ *colrpc.Inbox
+│           │ │ ├ *colexec.routerOutputOp
+│           │ │ │ └ *colexec.HashRouter
+│           │ │ │   └ *colexec.CancelChecker
+│           │ │ │     └ *colfetcher.ColBatchScan
+│           │ │ ├ *colrpc.Inbox
+│           │ │ ├ *colrpc.Inbox
+│           │ │ └ *colrpc.Inbox
+│           │ └ *colexec.ParallelUnorderedSynchronizer
+│           │   ├ *colrpc.Inbox
+│           │   ├ *colexec.routerOutputOp
+│           │   │ └ *colexec.HashRouter
+│           │   │   └ *colexec.CancelChecker
+│           │   │     └ *colfetcher.ColBatchScan
+│           │   ├ *colrpc.Inbox
+│           │   ├ *colrpc.Inbox
+│           │   └ *colrpc.Inbox
+│           ├ *colexec.ParallelUnorderedSynchronizer
+│           ├ *colexec.ParallelUnorderedSynchronizer
+│           └ *colexec.externalHashJoiner
+│             ├ *colexec.bufferExportingOperator
+│             └ *colexec.bufferExportingOperator
+├ Node 3
+│ └ *colrpc.Outbox
+│   └ *colexec.deselectorOp
+│     └ *colexec.countOp
+│       └ *colexec.simpleProjectOp
+│         └ *colexec.diskSpillerBase
+│           ├ *colexec.hashJoiner
+│           │ ├ *colexec.ParallelUnorderedSynchronizer
+│           │ │ ├ *colrpc.Inbox
+│           │ │ ├ *colrpc.Inbox
+│           │ │ ├ *colexec.routerOutputOp
+│           │ │ │ └ *colexec.HashRouter
+│           │ │ │   └ *colexec.CancelChecker
+│           │ │ │     └ *colfetcher.ColBatchScan
+│           │ │ ├ *colrpc.Inbox
+│           │ │ └ *colrpc.Inbox
+│           │ └ *colexec.ParallelUnorderedSynchronizer
+│           │   ├ *colrpc.Inbox
+│           │   ├ *colrpc.Inbox
+│           │   ├ *colexec.routerOutputOp
+│           │   │ └ *colexec.HashRouter
+│           │   │   └ *colexec.CancelChecker
+│           │   │     └ *colfetcher.ColBatchScan
+│           │   ├ *colrpc.Inbox
+│           │   └ *colrpc.Inbox
+│           ├ *colexec.ParallelUnorderedSynchronizer
+│           ├ *colexec.ParallelUnorderedSynchronizer
+│           └ *colexec.externalHashJoiner
+│             ├ *colexec.bufferExportingOperator
+│             └ *colexec.bufferExportingOperator
+├ Node 4
+│ └ *colrpc.Outbox
+│   └ *colexec.deselectorOp
+│     └ *colexec.countOp
+│       └ *colexec.simpleProjectOp
+│         └ *colexec.diskSpillerBase
+│           ├ *colexec.hashJoiner
+│           │ ├ *colexec.ParallelUnorderedSynchronizer
+│           │ │ ├ *colrpc.Inbox
+│           │ │ ├ *colrpc.Inbox
+│           │ │ ├ *colrpc.Inbox
+│           │ │ ├ *colexec.routerOutputOp
+│           │ │ │ └ *colexec.HashRouter
+│           │ │ │   └ *colexec.CancelChecker
+│           │ │ │     └ *colfetcher.ColBatchScan
+│           │ │ └ *colrpc.Inbox
+│           │ └ *colexec.ParallelUnorderedSynchronizer
+│           │   ├ *colrpc.Inbox
+│           │   ├ *colrpc.Inbox
+│           │   ├ *colrpc.Inbox
+│           │   ├ *colexec.routerOutputOp
+│           │   │ └ *colexec.HashRouter
+│           │   │   └ *colexec.CancelChecker
+│           │   │     └ *colfetcher.ColBatchScan
+│           │   └ *colrpc.Inbox
+│           ├ *colexec.ParallelUnorderedSynchronizer
+│           ├ *colexec.ParallelUnorderedSynchronizer
+│           └ *colexec.externalHashJoiner
+│             ├ *colexec.bufferExportingOperator
+│             └ *colexec.bufferExportingOperator
+└ Node 5
+  └ *colrpc.Outbox
+    └ *colexec.deselectorOp
+      └ *colexec.countOp
+        └ *colexec.simpleProjectOp
+          └ *colexec.diskSpillerBase
+            ├ *colexec.hashJoiner
+            │ ├ *colexec.ParallelUnorderedSynchronizer
+            │ │ ├ *colrpc.Inbox
+            │ │ ├ *colrpc.Inbox
+            │ │ ├ *colrpc.Inbox
+            │ │ ├ *colrpc.Inbox
+            │ │ └ *colexec.routerOutputOp
+            │ │   └ *colexec.HashRouter
+            │ │     └ *colexec.CancelChecker
+            │ │       └ *colfetcher.ColBatchScan
+            │ └ *colexec.ParallelUnorderedSynchronizer
+            │   ├ *colrpc.Inbox
+            │   ├ *colrpc.Inbox
+            │   ├ *colrpc.Inbox
+            │   ├ *colrpc.Inbox
+            │   └ *colexec.routerOutputOp
+            │     └ *colexec.HashRouter
+            │       └ *colexec.CancelChecker
+            │         └ *colfetcher.ColBatchScan
+            ├ *colexec.ParallelUnorderedSynchronizer
+            ├ *colexec.ParallelUnorderedSynchronizer
+            └ *colexec.externalHashJoiner
+              ├ *colexec.bufferExportingOperator
+              └ *colexec.bufferExportingOperator
+
+# Test that SelOnDest flag of coldata.SliceArgs is respected when setting
+# nulls.
+statement ok
+CREATE TABLE t1(a INT PRIMARY KEY, b INT)
+
+statement ok
+INSERT INTO t1 VALUES (1, NULL), (2, NULL)
+
+query I rowsort
+SELECT CASE WHEN a>1 THEN b*2 ELSE b*10 END FROM t1
+----
+NULL
+NULL

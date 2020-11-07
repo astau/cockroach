@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sqlutils
 
@@ -19,16 +15,15 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 )
 
 // ZoneRow represents a row returned by SHOW ZONE CONFIGURATION.
 type ZoneRow struct {
-	ID           uint32
-	CLISpecifier string
-	Config       config.ZoneConfig
+	ID     uint32
+	Config zonepb.ZoneConfig
 }
 
 func (row ZoneRow) sqlRowString() ([]string, error) {
@@ -38,7 +33,6 @@ func (row ZoneRow) sqlRowString() ([]string, error) {
 	}
 	return []string{
 		fmt.Sprintf("%d", row.ID),
-		row.CLISpecifier,
 		string(configProto),
 	}, nil
 }
@@ -46,16 +40,13 @@ func (row ZoneRow) sqlRowString() ([]string, error) {
 // RemoveAllZoneConfigs removes all installed zone configs.
 func RemoveAllZoneConfigs(t testing.TB, sqlDB *SQLRunner) {
 	t.Helper()
-	for _, zone := range sqlDB.QueryStr(t, "SELECT cli_specifier FROM crdb_internal.zones") {
-		zs, err := config.ParseCLIZoneSpecifier(zone[0])
-		if err != nil {
-			t.Fatal(err)
-		}
-		if zs.NamedZone == config.DefaultZoneName {
+	for _, row := range sqlDB.QueryStr(t, "SHOW ALL ZONE CONFIGURATIONS") {
+		target := row[0]
+		if target == fmt.Sprintf("RANGE %s", zonepb.DefaultZoneName) {
 			// The default zone cannot be removed.
 			continue
 		}
-		sqlDB.Exec(t, fmt.Sprintf("ALTER %s CONFIGURE ZONE DISCARD", &zs))
+		DeleteZoneConfig(t, sqlDB, target)
 	}
 }
 
@@ -92,7 +83,7 @@ func VerifyZoneConfigForTarget(t testing.TB, sqlDB *SQLRunner, target string, ro
 		t.Fatal(err)
 	}
 	sqlDB.CheckQueryResults(t, fmt.Sprintf(`
-SELECT zone_id, cli_specifier, config_protobuf
+SELECT zone_id, raw_config_protobuf
   FROM [SHOW ZONE CONFIGURATION FOR %s]`, target),
 		[][]string{sqlRow})
 }
@@ -109,19 +100,15 @@ func VerifyAllZoneConfigs(t testing.TB, sqlDB *SQLRunner, rows ...ZoneRow) {
 			t.Fatal(err)
 		}
 	}
-	sqlDB.CheckQueryResults(t, `
-SELECT zone_id, cli_specifier, config_protobuf
-  FROM crdb_internal.zones
-  WHERE cli_specifier IS NOT NULL`, expected)
+	sqlDB.CheckQueryResults(t, `SELECT zone_id, raw_config_protobuf FROM crdb_internal.zones`, expected)
 }
 
-// ZoneConfigExists returns whether a zone config with the provided cliSpecifier
-// exists.
-func ZoneConfigExists(t testing.TB, sqlDB *SQLRunner, cliSpecifier string) bool {
+// ZoneConfigExists returns whether a zone config with the provided name exists.
+func ZoneConfigExists(t testing.TB, sqlDB *SQLRunner, name string) bool {
 	t.Helper()
 	var exists bool
 	sqlDB.QueryRow(
-		t, "SELECT EXISTS (SELECT 1 FROM crdb_internal.zones WHERE cli_specifier = $1)", cliSpecifier,
+		t, "SELECT EXISTS (SELECT 1 FROM crdb_internal.zones WHERE target = $1)", name,
 	).Scan(&exists)
 	return exists
 }

@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package cli
 
@@ -26,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/errors"
 )
 
 func TestConnRecover(t *testing.T) {
@@ -35,7 +32,7 @@ func TestConnRecover(t *testing.T) {
 	c := newCLITest(p)
 	defer c.cleanup()
 
-	url, cleanup := sqlutils.PGUrl(t, c.ServingAddr(), t.Name(), url.User(security.RootUser))
+	url, cleanup := sqlutils.PGUrl(t, c.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
 	defer cleanup()
 
 	conn := makeSQLConn(url.String())
@@ -58,7 +55,7 @@ func TestConnRecover(t *testing.T) {
 	// and starts delivering ErrBadConn. We don't know the timing of
 	// this however.
 	testutils.SucceedsSoon(t, func() error {
-		if sqlRows, err := conn.Query(`SELECT 1`, nil); err != driver.ErrBadConn {
+		if sqlRows, err := conn.Query(`SELECT 1`, nil); !errors.Is(err, driver.ErrBadConn) {
 			return fmt.Errorf("expected ErrBadConn, got %v", err)
 		} else if err == nil {
 			if closeErr := sqlRows.Close(); closeErr != nil {
@@ -82,7 +79,7 @@ func TestConnRecover(t *testing.T) {
 
 	// Ditto from Query().
 	testutils.SucceedsSoon(t, func() error {
-		if err := conn.Exec(`SELECT 1`, nil); err != driver.ErrBadConn {
+		if err := conn.Exec(`SELECT 1`, nil); !errors.Is(err, driver.ErrBadConn) {
 			return fmt.Errorf("expected ErrBadConn, got %v", err)
 		}
 		return nil
@@ -99,7 +96,7 @@ func TestConnRecover(t *testing.T) {
 // number is selected randomly.
 func simulateServerRestart(c *cliTest, p cliTestParams, conn *sqlConn) func() {
 	c.restartServer(p)
-	url2, cleanup2 := sqlutils.PGUrl(c.t, c.ServingAddr(), c.t.Name(), url.User(security.RootUser))
+	url2, cleanup2 := sqlutils.PGUrl(c.t, c.ServingSQLAddr(), c.t.Name(), url.User(security.RootUser))
 	conn.url = url2.String()
 	return cleanup2
 }
@@ -110,7 +107,7 @@ func TestRunQuery(t *testing.T) {
 	c := newCLITest(cliTestParams{t: t})
 	defer c.cleanup()
 
-	url, cleanup := sqlutils.PGUrl(t, c.ServingAddr(), t.Name(), url.User(security.RootUser))
+	url, cleanup := sqlutils.PGUrl(t, c.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
 	defer cleanup()
 
 	conn := makeSQLConn(url.String())
@@ -167,11 +164,11 @@ SET
 	}
 
 	expected = `
-  column_name | data_type | is_nullable | column_default | generation_expression |  indices  | is_hidden  
-+-------------+-----------+-------------+----------------+-----------------------+-----------+-----------+
-  parentID    | INT8      |    false    | NULL           |                       | {primary} |   false    
-  name        | STRING    |    false    | NULL           |                       | {primary} |   false    
-  id          | INT8      |    true     | NULL           |                       | {}        |   false    
+  column_name | data_type | is_nullable | column_default | generation_expression |  indices  | is_hidden
+--------------+-----------+-------------+----------------+-----------------------+-----------+------------
+  parentID    | INT8      |    false    | NULL           |                       | {primary} |   false
+  name        | STRING    |    false    | NULL           |                       | {primary} |   false
+  id          | INT8      |    true     | NULL           |                       | {}        |   false
 (3 rows)
 `
 
@@ -187,9 +184,9 @@ SET
 	}
 
 	expected = `
-  parentID |    name    | id  
-+----------+------------+----+
-         1 | descriptor |  3  
+  parentID | parentSchemaID |    name    | id
+-----------+----------------+------------+-----
+         1 |             29 | descriptor |  3
 (1 row)
 `
 	if a, e := b.String(), expected[1:]; a != e {
@@ -204,17 +201,17 @@ SET
 	}
 
 	expected = `
-  1  
-+---+
-  1  
+  1
+-----
+  1
 (1 row)
-  2 | 3  
-+---+---+
-  2 | 3  
+  2 | 3
+----+----
+  2 | 3
 (1 row)
-  'hello'  
-+---------+
-  hello    
+  'hello'
+-----------
+  hello
 (1 row)
 `
 
@@ -231,7 +228,7 @@ func TestTransactionRetry(t *testing.T) {
 	c := newCLITest(p)
 	defer c.cleanup()
 
-	url, cleanup := sqlutils.PGUrl(t, c.ServingAddr(), t.Name(), url.User(security.RootUser))
+	url, cleanup := sqlutils.PGUrl(t, c.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
 	defer cleanup()
 
 	conn := makeSQLConn(url.String())

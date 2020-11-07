@@ -1,23 +1,20 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package lang
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
+
+	"github.com/cockroachdb/errors"
 )
 
 // CompiledExpr is the result of Optgen scanning, parsing, and semantic
@@ -348,6 +345,12 @@ func (c *ruleCompiler) inferTypes(e Expr, suggested DataType) {
 		// match. The matching is checked in ruleContentCompiler.compileFunc.
 		prototype := defType.Defines[0]
 
+		if len(t.Args) > len(prototype.Fields) {
+			err := fmt.Errorf("%s has too many args", e.Op())
+			c.compiler.addErr(t.Source(), err)
+			break
+		}
+
 		// Recurse on name and arguments.
 		c.inferTypes(t.Name, AnyDataType)
 		for i, arg := range t.Args {
@@ -437,7 +440,7 @@ type ruleContentCompiler struct {
 
 func (c *ruleContentCompiler) compile(e Expr) Expr {
 	// Recurse into match or construct operator separately, since they will need
-	// to ceate new context before visiting arguments.
+	// to create new context before visiting arguments.
 	switch t := e.(type) {
 	case *FuncExpr:
 		return c.compileFunc(t)

@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package builtins
 
@@ -18,7 +14,7 @@ import (
 	"sort"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 // AllBuiltinNames is an array containing all the built-in function
@@ -38,7 +34,9 @@ func init() {
 	initAggregateBuiltins()
 	initWindowBuiltins()
 	initGeneratorBuiltins()
+	initGeoBuiltins()
 	initPGBuiltins()
+	initMathBuiltins()
 
 	AllBuiltinNames = make([]string, 0, len(builtins))
 	AllAggregateBuiltinNames = make([]string, 0, len(aggregates))
@@ -46,8 +44,8 @@ func init() {
 	for name, def := range builtins {
 		fDef := tree.NewFunctionDefinition(name, &def.props, def.overloads)
 		tree.FunDefs[name] = fDef
-		if fDef.Private {
-			// Avoid listing help for private functions.
+		if !fDef.ShouldDocument() {
+			// Avoid listing help for undocumented functions.
 			continue
 		}
 		AllBuiltinNames = append(AllBuiltinNames, name)
@@ -90,7 +88,7 @@ func getCategory(b []tree.Overload) string {
 }
 
 func collectOverloads(
-	props tree.FunctionProperties, types []types.T, gens ...func(types.T) tree.Overload,
+	props tree.FunctionProperties, types []*types.T, gens ...func(*types.T) tree.Overload,
 ) builtinDefinition {
 	r := make([]tree.Overload, 0, len(types)*len(gens))
 	for _, f := range gens {

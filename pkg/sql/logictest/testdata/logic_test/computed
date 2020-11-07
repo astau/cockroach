@@ -1,19 +1,18 @@
-# LogicTest: local local-opt local-parallel-stmts fakedist fakedist-opt fakedist-metadata
-
 statement ok
 CREATE TABLE with_no_column_refs (
   a INT,
   b INT,
-  c INT AS (3) STORED
+  c INT AS (3) STORED,
+  FAMILY "primary" (a, b, c, rowid)
 )
 
 query TT
 SHOW CREATE TABLE with_no_column_refs
 ----
-with_no_column_refs  CREATE TABLE with_no_column_refs (
+with_no_column_refs  CREATE TABLE public.with_no_column_refs (
                      a INT8 NULL,
                      b INT8 NULL,
-                     c INT8 NULL AS (3) STORED,
+                     c INT8 NULL AS (3:::INT8) STORED,
                      FAMILY "primary" (a, b, c, rowid)
 )
 
@@ -21,16 +20,17 @@ statement ok
 CREATE TABLE extra_parens (
   a INT,
   b INT,
-  c INT AS ((3)) STORED
+  c INT AS ((3)) STORED,
+  FAMILY "primary" (a, b, c, rowid)
 )
 
 query TT
 SHOW CREATE TABLE extra_parens
 ----
-extra_parens  CREATE TABLE extra_parens (
+extra_parens  CREATE TABLE public.extra_parens (
               a INT8 NULL,
               b INT8 NULL,
-              c INT8 NULL AS ((3)) STORED,
+              c INT8 NULL AS (3:::INT8) STORED,
               FAMILY "primary" (a, b, c, rowid)
 )
 
@@ -73,13 +73,14 @@ CREATE TABLE x (
   a INT DEFAULT 3,
   b INT DEFAULT 7,
   c INT AS (a) STORED,
-  d INT AS (a + b) STORED
+  d INT AS (a + b) STORED,
+  FAMILY "primary" (a, b, c, d, rowid)
 )
 
 query TT
 SHOW CREATE TABLE x
 ----
-x  CREATE TABLE x (
+x  CREATE TABLE public.x (
    a INT8 NULL DEFAULT 3:::INT8,
    b INT8 NULL DEFAULT 7:::INT8,
    c INT8 NULL AS (a) STORED,
@@ -95,7 +96,7 @@ a            INT8       true         3:::INT8        ·                      {} 
 b            INT8       true         7:::INT8        ·                      {}         false
 c            INT8       true         NULL            a                      {}         false
 d            INT8       true         NULL            a + b                  {}         false
-rowid        INT        false        unique_rowid()  ·                      {primary}  true
+rowid        INT8       false        unique_rowid()  ·                      {primary}  true
 
 statement error cannot write directly to computed column "c"
 INSERT INTO x (c) VALUES (1)
@@ -270,7 +271,7 @@ CREATE TABLE y (
   a INT AS (3)
 )
 
-statement error unimplemented at or near "virtual"
+statement error at or near "virtual": syntax error: unimplemented
 CREATE TABLE y (
   a INT AS (3) VIRTUAL
 )
@@ -288,14 +289,27 @@ CREATE TABLE y (
   b INT AS (a) STORED
 )
 
-statement error impure functions are not allowed in computed column
+statement error context-dependent operators are not allowed in computed column
 CREATE TABLE y (
   a TIMESTAMP AS (now()) STORED
 )
 
-statement error impure functions are not allowed in computed column
+statement error context-dependent operators are not allowed in computed column
 CREATE TABLE y (
-  a STRING AS (concat(now()::STRING, uuid_v4()::STRING)) STORED
+  a STRING,
+  b TIMESTAMPTZ AS (a::TIMESTAMPTZ) STORED
+)
+
+statement error context-dependent operators are not allowed in computed column
+CREATE TABLE y (
+  a TIMESTAMPTZ,
+  b INTERVAL,
+  c TIMESTAMPTZ AS (a+ b) STORED
+)
+
+statement error volatile functions are not allowed in computed column
+CREATE TABLE y (
+  a STRING AS (concat('foo', uuid_v4()::STRING)) STORED
 )
 
 statement error computed columns cannot reference other computed columns
@@ -350,6 +364,16 @@ CREATE TABLE y (
   a INT,
   r INT AS (1) STORED REFERENCES x
 )
+
+# Regression test for #36036.
+statement ok
+CREATE TABLE tt (i INT8 AS (1) STORED)
+
+statement error variable sub-expressions are not allowed in computed column
+ALTER TABLE tt ADD COLUMN c STRING AS ((SELECT NULL)) STORED
+
+statement error computed columns cannot reference other computed columns
+ALTER TABLE tt ADD COLUMN c INT8 AS (i) STORED
 
 # Composite FK.
 
@@ -500,7 +524,7 @@ create table y (
 statement ok
 INSERT INTO y VALUES (5)
 
-statement error foreign key violation
+statement error foreign key
 INSERT INTO y VALUES (100)
 
 statement ok
@@ -591,13 +615,14 @@ DROP TABLE x
 statement ok
 CREATE TABLE x (
   a INT,
-  b INT as (x.a) STORED
+  b INT as (x.a) STORED,
+  FAMILY "primary" (a, b, rowid)
 )
 
 query TT
 SHOW CREATE TABLE x
 ----
-x  CREATE TABLE x (
+x  CREATE TABLE public.x (
    a INT8 NULL,
    b INT8 NULL AS (a) STORED,
    FAMILY "primary" (a, b, rowid)
@@ -610,7 +635,8 @@ DROP TABLE x
 statement ok
 CREATE TABLE x (
   a INT,
-  b INT AS (a) STORED
+  b INT AS (a) STORED,
+  FAMILY "primary" (a, b, rowid)
 )
 
 statement ok
@@ -619,7 +645,7 @@ ALTER TABLE x RENAME COLUMN a TO c
 query TT
 SHOW CREATE TABLE x
 ----
-x  CREATE TABLE x (
+x  CREATE TABLE public.x (
    c INT8 NULL,
    b INT8 NULL AS (c) STORED,
    FAMILY "primary" (c, b, rowid)
@@ -631,7 +657,8 @@ DROP TABLE x
 statement ok
 CREATE TABLE x (
   a INT,
-  b INT AS (a * 2) STORED
+  b INT AS (a * 2) STORED,
+  FAMILY "primary" (a, b, rowid)
 )
 
 query T colnames
@@ -657,10 +684,10 @@ ALTER TABLE x ADD COLUMN c INT NOT NULL AS (a + 4) STORED
 query TT
 SHOW CREATE TABLE x
 ----
-x  CREATE TABLE x (
+x  CREATE TABLE public.x (
    a INT8 NULL,
-   b INT8 NULL AS (a * 2) STORED,
-   c INT8 NOT NULL AS (a + 4) STORED,
+   b INT8 NULL AS (a * 2:::INT8) STORED,
+   c INT8 NOT NULL AS (a + 4:::INT8) STORED,
    FAMILY "primary" (a, b, rowid, c)
 )
 
@@ -673,8 +700,19 @@ SELECT * FROM x ORDER BY a
 3 6 7
 6 12 10
 
+# Multiple ADD COLUMNs can only reference columns that are defined previously.
+statement error pq: column "t" does not exist, referenced in "lower\(t\)"
+ALTER TABLE x
+    ADD COLUMN s STRING AS (lower(t)) STORED,
+    ADD COLUMN t STRING
+
+statement ok
+ALTER TABLE x
+    ADD COLUMN s STRING,
+    ADD COLUMN t STRING AS (lower(s)) STORED
+
 # Verify a bad statement fails.
-statement error could not parse "a" as type int
+statement error pq: could not parse "a" as type int
 ALTER TABLE x ADD COLUMN d INT AS (a + 'a') STORED
 
 statement error could not parse "a" as type int
@@ -744,5 +782,35 @@ CREATE TABLE x (
   b INT AS (a+1) STORED
 )
 
-query error value type decimal doesn't match type INT8 of column "a"
+query error value type decimal doesn't match type int of column "a"
 INSERT INTO x VALUES(1.4)
+
+# Regression test for #34901: verify that builtins can be used in computed
+# column expressions without a "memory budget exceeded" error while backfilling
+statement ok
+CREATE TABLE t34901 (x STRING)
+
+statement ok
+INSERT INTO t34901 VALUES ('a')
+
+statement ok
+ALTER TABLE t34901 ADD COLUMN y STRING AS (concat(x, 'b')) STORED
+
+query TT
+SELECT * FROM t34901
+----
+a  ab
+
+# Regression test for #42418.
+statement ok
+CREATE TABLE t42418 (x INT GENERATED ALWAYS AS (1) STORED);
+ALTER TABLE t42418 ADD COLUMN y INT GENERATED ALWAYS AS (1) STORED
+
+query TT
+SHOW CREATE t42418
+----
+t42418  CREATE TABLE public.t42418 (
+        x INT8 NULL AS (1:::INT8) STORED,
+        y INT8 NULL AS (1:::INT8) STORED,
+        FAMILY "primary" (x, rowid, y)
+)

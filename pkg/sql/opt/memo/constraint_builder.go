@@ -1,29 +1,36 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package memo
 
 import (
-	"fmt"
 	"regexp"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
+
+// BuildConstraints returns a constraint.Set that represents the given scalar
+// expression. A "tight" boolean is also returned which is true if the
+// constraint is exactly equivalent to the expression.
+func BuildConstraints(
+	e opt.ScalarExpr, md *opt.Metadata, evalCtx *tree.EvalContext,
+) (_ *constraint.Set, tight bool) {
+	cb := constraintsBuilder{md: md, evalCtx: evalCtx}
+	return cb.buildConstraints(e)
+}
 
 // Convenience aliases to avoid the constraint prefix everywhere.
 const includeBoundary = constraint.IncludeBoundary
@@ -197,6 +204,10 @@ func (cb *constraintsBuilder) buildSingleColumnConstraintConst(
 				return cb.makeStringPrefixSpan(col, prefix), false
 			}
 		}
+
+	case opt.ContainsOp:
+		// NULL cannot contain anything, so a non-tight, not-null span is built.
+		return cb.notNullSpan(col), false
 	}
 	return unconstrained, false
 }
@@ -383,7 +394,7 @@ func (cb *constraintsBuilder) buildConstraintForTupleInequality(
 	case opt.GeOp:
 		less, boundary = false, includeBoundary
 	default:
-		panic(fmt.Sprintf("unsupported operator type %s", e.Op()))
+		panic(errors.AssertionFailedf("unsupported operator type %s", log.Safe(e.Op())))
 	}
 	// Disallow NULLs on the first column.
 	startKey, startBoundary := constraint.MakeKey(tree.DNull), excludeBoundary
@@ -408,14 +419,33 @@ func (cb *constraintsBuilder) buildConstraintForTupleInequality(
 	return constraint.SingleSpanConstraint(&keyCtx, &span), true
 }
 
+func (cb *constraintsBuilder) buildFunctionConstraints(
+	f *FunctionExpr,
+) (_ *constraint.Set, tight bool) {
+	if f.Properties.NullableArgs {
+		return unconstrained, false
+	}
+
+	// For an arbitrary function, the best we can do is deduce a set of not-null
+	// constraints.
+	cs := unconstrained
+	for _, arg := range f.Args {
+		if variable, ok := arg.(*VariableExpr); ok {
+			cs = cs.Intersect(cb.evalCtx, cb.notNullSpan(variable.Col))
+		}
+	}
+
+	return cs, false
+}
+
 func (cb *constraintsBuilder) buildConstraints(e opt.ScalarExpr) (_ *constraint.Set, tight bool) {
 	switch t := e.(type) {
-	case *NullExpr:
+	case *FalseExpr, *NullExpr:
 		return contradiction, true
 
 	case *VariableExpr:
 		// (x) is equivalent to (x = TRUE) if x is boolean.
-		if cb.md.ColumnMeta(t.Col).Type.Equivalent(types.Bool) {
+		if cb.md.ColumnMeta(t.Col).Type.Family() == types.BoolFamily {
 			return cb.buildSingleColumnConstraintConst(t.Col, opt.EqOp, tree.DBoolTrue)
 		}
 		return unconstrained, false
@@ -423,7 +453,7 @@ func (cb *constraintsBuilder) buildConstraints(e opt.ScalarExpr) (_ *constraint.
 	case *NotExpr:
 		// (NOT x) is equivalent to (x = FALSE) if x is boolean.
 		if v, ok := t.Input.(*VariableExpr); ok {
-			if cb.md.ColumnMeta(v.Col).Type.Equivalent(types.Bool) {
+			if cb.md.ColumnMeta(v.Col).Type.Family() == types.BoolFamily {
 				return cb.buildSingleColumnConstraintConst(v.Col, opt.EqOp, tree.DBoolFalse)
 			}
 		}
@@ -435,6 +465,74 @@ func (cb *constraintsBuilder) buildConstraints(e opt.ScalarExpr) (_ *constraint.
 		cl = cl.Intersect(cb.evalCtx, cr)
 		tightl = tightl && tightr
 		return cl, (tightl || cl == contradiction)
+
+	case *OrExpr:
+		cl, tightl := cb.buildConstraints(t.Left)
+		cr, tightr := cb.buildConstraints(t.Right)
+		res := cl.Union(cb.evalCtx, cr)
+
+		// The union may not be "tight" because the new constraint set might
+		// allow combinations of values that the expression does not allow.
+		//
+		// For example, consider the expression:
+		//
+		//   (@1 = 4 AND @2 = 6) OR (@1 = 5 AND @2 = 7)
+		//
+		// The resulting constraint set is:
+		//
+		//   /1: [/4 - /4] [/5 - /5]
+		//   /2: [/6 - /6] [/7 - /7]
+		//
+		// This constraint set is not tight, because it allows values for @1
+		// and @2 that the original expression does not, such as @1=4, @2=7.
+		//
+		// However, there are three cases in which the union constraint set is
+		// tight.
+		//
+		// First, if the left, right, and result sets have a single constraint,
+		// then the result constraint is tight if the left and right are tight.
+		// If there is a single constraint for all three sets, it implies that
+		// the sets involve the same column. Therefore it is safe to determine
+		// the tightness of the union based on the tightness of the left and
+		// right.
+		//
+		// Second, if one of the left or right set is a contradiction, then the
+		// result constraint is tight if the other input set is tight. This is
+		// because contradictions are tight and fully describe the set of
+		// values that the original expression allows - none.
+		//
+		// For example, consider the expression:
+		//
+		//   (@1 = 4 AND @1 = 6) OR (@1 = 5 AND @2 = 7)
+		//
+		// The resulting constraint set is:
+		//
+		//   /1: [/5 - /5]
+		//   /2: [/7 - /7]
+		//
+		// This constraint set is tight, because there are no values for @1 and
+		// @2 that satisfy the set but do not satisfy the expression.
+		//
+		// Third, if both the left and the right set are contradictions, then
+		// the result set is tight. This is because contradictions are tight
+		// and, as explained above, they fully describe the set of values that
+		// satisfy their expression. Note that this third case is generally
+		// covered by the second case, but it's mentioned here for the sake of
+		// explicitness.
+		if cl == contradiction {
+			return res, tightr
+		}
+		if cr == contradiction {
+			return res, tightl
+		}
+		tight := tightl && tightr && cl.Length() == 1 && cr.Length() == 1 && res.Length() == 1
+		return res, tight
+
+	case *RangeExpr:
+		return cb.buildConstraints(t.And)
+
+	case *FunctionExpr:
+		return cb.buildFunctionConstraints(t)
 	}
 
 	if e.ChildCount() < 2 {
@@ -518,6 +616,6 @@ func (cb *constraintsBuilder) makeStringPrefixSpan(
 // verifyType checks that the type of column matches the given type. We disallow
 // mixed-type comparisons because if they become index constraints, we would
 // generate incorrect encodings (#4313).
-func (cb *constraintsBuilder) verifyType(col opt.ColumnID, typ types.T) bool {
-	return typ == types.Unknown || cb.md.ColumnMeta(col).Type.Equivalent(typ)
+func (cb *constraintsBuilder) verifyType(col opt.ColumnID, typ *types.T) bool {
+	return typ.Family() == types.UnknownFamily || cb.md.ColumnMeta(col).Type.Equivalent(typ)
 }

@@ -1,32 +1,120 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tpcc
 
 import (
 	"bytes"
-	"encoding/binary"
+	gosql "database/sql"
 	"fmt"
-	"math"
-	"math/rand"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/util/uuid"
-	"github.com/jackc/pgx"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
+	"golang.org/x/exp/rand"
 )
+
+type partitionStrategy int
+
+const (
+	// The partitionedReplication strategy constrains replication for a given
+	// partition to within a single zone. It does so by requiring that all
+	// replicas of each range in a partition are stored in the same zone.
+	//
+	// Example of 9 warehouses partitioned over 3 zones:
+	//  partitions = [0,1,2], [3,4,5], [6,7,8]
+	//  w = warehouse #
+	//  L = leaseholder
+	//
+	// us-east1-b:
+	//  n1 = [w0(L), w1,    w2   ]
+	//  n2 = [w0,    w1(L), w2   ]
+	//  n3 = [w0,    w1,    w2(L)]
+	//
+	// us-west1-b:
+	//  n4 = [w3(L), w4,    w5   ]
+	//  n5 = [w3,    w4,    w5   ]
+	//  n6 = [w3,    w4(L), w5(L)]
+	//
+	// europe-west2-b:
+	//  n7 = [w6,    w7,    w8(L)]
+	//  n8 = [w6,    w7(L), w8   ]
+	//  n9 = [w6(L), w7,    w8   ]
+	//
+	// NOTE: the lease for a range is randomly scattered within the zone
+	// that contains all replicas of the range.
+	//
+	partitionedReplication partitionStrategy = iota
+	// The partitionedLeases strategy collocates read leases for a given
+	// partition to within a single zone. It does so by configuring lease
+	// preferences on each range in a partition to prefer the same zone.
+	// Unlike the partitioned replication strategy, it does not prevent
+	// cross-zone replication.
+	//
+	// Example of 9 warehouses partitioned over 3 zones:
+	//  partitions = [0,1,2], [3,4,5], [6,7,8]
+	//  w = warehouse #
+	//  L = leaseholder
+	//
+	// us-east1-b:
+	//  n1 = [w0(L), w3, w6]
+	//  n2 = [w1(L), w4, w7]
+	//  n3 = [w2(L), w5, w8]
+	//
+	// us-west1-b:
+	//  n4 = [w0,    w1,    w2   ]
+	//  n5 = [w3(L), w4(L), w5(L)]
+	//  n6 = [w6,    w7,    w8   ]
+	//
+	// europe-west2-b:
+	//  n7 = [w2, w5, w8(L)]
+	//  n8 = [w1, w4, w7(L)]
+	//  n9 = [w0, w3, w6(L)]
+	//
+	// NOTE: a copy of each range is randomly scattered within each zone.
+	//
+	partitionedLeases
+)
+
+// Part of pflag's Value interface.
+func (ps partitionStrategy) String() string {
+	switch ps {
+	case partitionedReplication:
+		return "replication"
+	case partitionedLeases:
+		return "leases"
+	}
+	panic("unexpected")
+}
+
+// Part of pflag's Value interface.
+func (ps *partitionStrategy) Set(value string) error {
+	switch value {
+	case "replication":
+		*ps = partitionedReplication
+		return nil
+	case "leases":
+		*ps = partitionedLeases
+		return nil
+	}
+	return errors.Errorf("unknown partition strategy %q", value)
+}
+
+// Part of pflag's Value interface.
+func (ps partitionStrategy) Type() string {
+	return "partitionStrategy"
+}
+
+type zoneConfig struct {
+	zones    []string
+	strategy partitionStrategy
+}
 
 // partitioner encapsulates all logic related to partitioning discrete numbers
 // of warehouses into disjoint sets of roughly equal sizes. Partitions are then
@@ -156,40 +244,44 @@ func (p *partitioner) randActive(rng *rand.Rand) int {
 	return p.totalElems[rng.Intn(len(p.totalElems))]
 }
 
-// configureZone sets up zone configs for previously created partitions. By default it adds constraints
-// in terms of racks, but if the zones flag is passed into tpcc, it will set the constraints based on the
-// geographic zones provided.
-func configureZone(db *pgx.ConnPool, table, partition string, constraint int, zones []string) {
-	var constraints string
-	if len(zones) > 0 {
-		constraints = fmt.Sprintf("[+zone=%s]", zones[constraint])
+// configureZone sets up zone configs for previously created partitions. By
+// default it adds constraints/preferences in terms of racks, but if the zones
+// flag is passed into tpcc, it will set the constraints/preferences based on
+// the geographic zones provided.
+func configureZone(db *gosql.DB, cfg zoneConfig, table, partition string, partIdx int) error {
+	var kv string
+	if len(cfg.zones) > 0 {
+		kv = fmt.Sprintf("zone=%s", cfg.zones[partIdx])
 	} else {
-		constraints = fmt.Sprintf("[+rack=%d]", constraint)
+		kv = fmt.Sprintf("rack=%d", partIdx)
 	}
 
-	// We are removing the EXPERIMENTAL keyword in 2.1. For compatibility
-	// with 2.0 clusters we still need to try with it if the
-	// syntax without EXPERIMENTAL fails.
-	// TODO(knz): Remove this in 2.2.
-	sql := fmt.Sprintf(`ALTER PARTITION %s OF TABLE %s CONFIGURE ZONE USING constraints = '%s'`,
-		partition, table, constraints)
-	_, err := db.Exec(sql)
-	if err != nil && strings.Contains(err.Error(), "syntax error") {
-		sql = fmt.Sprintf(`ALTER PARTITION %s OF TABLE %s EXPERIMENTAL CONFIGURE ZONE 'constraints: %s'`,
-			partition, table, constraints)
-		_, err = db.Exec(sql)
+	var opts string
+	switch cfg.strategy {
+	case partitionedReplication:
+		// Place all replicas in the zone.
+		opts = fmt.Sprintf(`constraints = '[+%s]'`, kv)
+	case partitionedLeases:
+		// Place one replica in the zone and give that replica lease preference.
+		opts = fmt.Sprintf(`num_replicas = COPY FROM PARENT, constraints = '{"+%s":1}', lease_preferences = '[[+%s]]'`, kv, kv)
+	default:
+		panic("unexpected")
 	}
-	if err != nil {
-		panic(fmt.Sprintf("Couldn't exec %s: %s\n", sql, err))
+
+	sql := fmt.Sprintf(`ALTER PARTITION %s OF TABLE %s CONFIGURE ZONE USING %s`,
+		partition, table, opts)
+	if _, err := db.Exec(sql); err != nil {
+		return errors.Wrapf(err, "Couldn't exec %q", sql)
 	}
+	return nil
 }
 
 // partitionObject partitions the specified object (TABLE or INDEX) with the
 // provided name, given the partitioning. Callers of the function must specify
 // the associated table and the partition's number.
 func partitionObject(
-	db *pgx.ConnPool, p *partitioner, zones []string, obj, name, col, table string, idx int,
-) {
+	db *gosql.DB, cfg zoneConfig, p *partitioner, obj, name, col, table string, idx int,
+) error {
 	var buf bytes.Buffer
 	fmt.Fprintf(&buf, "ALTER %s %s PARTITION BY RANGE (%s) (\n", obj, name, col)
 	for i := 0; i < p.parts; i++ {
@@ -202,132 +294,199 @@ func partitionObject(
 	}
 	buf.WriteString(")\n")
 	if _, err := db.Exec(buf.String()); err != nil {
-		panic(fmt.Sprintf("Couldn't exec %s: %s\n", buf.String(), err))
+		return errors.Wrapf(err, "Couldn't exec %q", buf.String())
 	}
 
 	for i := 0; i < p.parts; i++ {
-		configureZone(db, table, fmt.Sprintf("p%d_%d", idx, i), i, zones)
+		if err := configureZone(db, cfg, table, fmt.Sprintf("p%d_%d", idx, i), i); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
-func partitionTable(db *pgx.ConnPool, p *partitioner, zones []string, table, col string, idx int) {
-	partitionObject(db, p, zones, "TABLE", table, col, table, idx)
+func partitionTable(
+	db *gosql.DB, cfg zoneConfig, p *partitioner, table, col string, idx int,
+) error {
+	return partitionObject(db, cfg, p, "TABLE", table, col, table, idx)
 }
 
 func partitionIndex(
-	db *pgx.ConnPool, p *partitioner, zones []string, table, index, col string, idx int,
-) {
+	db *gosql.DB, cfg zoneConfig, p *partitioner, table, index, col string, idx int,
+) error {
 	indexStr := fmt.Sprintf("%s@%s", table, index)
-	partitionObject(db, p, zones, "INDEX", indexStr, col, table, idx)
+	if exists, err := indexExists(db, table, index); err != nil {
+		return err
+	} else if !exists {
+		return errors.Errorf("could not find index %q", indexStr)
+	}
+	return partitionObject(db, cfg, p, "INDEX", indexStr, col, table, idx)
 }
 
-func partitionWarehouse(db *pgx.ConnPool, wPart *partitioner, zones []string) {
-	partitionTable(db, wPart, zones, "warehouse", "w_id", 0)
+func partitionWarehouse(db *gosql.DB, cfg zoneConfig, wPart *partitioner) error {
+	return partitionTable(db, cfg, wPart, "warehouse", "w_id", 0)
 }
 
-func partitionDistrict(db *pgx.ConnPool, wPart *partitioner, zones []string) {
-	partitionTable(db, wPart, zones, "district", "d_w_id", 0)
+func partitionDistrict(db *gosql.DB, cfg zoneConfig, wPart *partitioner) error {
+	return partitionTable(db, cfg, wPart, "district", "d_w_id", 0)
 }
 
-func partitionNewOrder(db *pgx.ConnPool, wPart *partitioner, zones []string) {
-	partitionTable(db, wPart, zones, "new_order", "no_w_id", 0)
+func partitionNewOrder(db *gosql.DB, cfg zoneConfig, wPart *partitioner) error {
+	return partitionTable(db, cfg, wPart, "new_order", "no_w_id", 0)
 }
 
-func partitionOrder(db *pgx.ConnPool, wPart *partitioner, zones []string) {
-	partitionTable(db, wPart, zones, `"order"`, "o_w_id", 0)
-	partitionIndex(db, wPart, zones, `"order"`, "order_idx", "o_w_id", 1)
-	partitionIndex(db, wPart, zones, `"order"`, "order_o_w_id_o_d_id_o_c_id_idx", "o_w_id", 2)
+func partitionOrder(db *gosql.DB, cfg zoneConfig, wPart *partitioner) error {
+	if err := partitionTable(db, cfg, wPart, `"order"`, "o_w_id", 0); err != nil {
+		return err
+	}
+	return partitionIndex(db, cfg, wPart, `"order"`, "order_idx", "o_w_id", 1)
 }
 
-func partitionOrderLine(db *pgx.ConnPool, wPart *partitioner, zones []string) {
-	partitionTable(db, wPart, zones, "order_line", "ol_w_id", 0)
-	partitionIndex(db, wPart, zones, "order_line", "order_line_fk", "ol_supply_w_id", 1)
+func partitionOrderLine(db *gosql.DB, cfg zoneConfig, wPart *partitioner) error {
+	return partitionTable(db, cfg, wPart, "order_line", "ol_w_id", 0)
 }
 
-func partitionStock(db *pgx.ConnPool, wPart, iPart *partitioner, zones []string) {
-	partitionTable(db, wPart, zones, "stock", "s_w_id", 0)
-	partitionIndex(db, iPart, zones, "stock", "stock_s_i_id_idx", "s_i_id", 1)
+func partitionStock(db *gosql.DB, cfg zoneConfig, wPart *partitioner) error {
+	return partitionTable(db, cfg, wPart, "stock", "s_w_id", 0)
 }
 
-func partitionCustomer(db *pgx.ConnPool, wPart *partitioner, zones []string) {
-	partitionTable(db, wPart, zones, "customer", "c_w_id", 0)
-	partitionIndex(db, wPart, zones, "customer", "customer_idx", "c_w_id", 1)
+func partitionCustomer(db *gosql.DB, cfg zoneConfig, wPart *partitioner) error {
+	if err := partitionTable(db, cfg, wPart, "customer", "c_w_id", 0); err != nil {
+		return err
+	}
+	return partitionIndex(db, cfg, wPart, "customer", "customer_idx", "c_w_id", 1)
 }
 
-func partitionHistory(db *pgx.ConnPool, wPart *partitioner, zones []string) {
-	const maxVal = math.MaxUint64
-	temp := make([]byte, 16)
-	rowids := make([]uuid.UUID, wPart.parts+1)
-	for i := 0; i < wPart.parts; i++ {
-		var err error
+func partitionHistory(db *gosql.DB, cfg zoneConfig, wPart *partitioner) error {
+	return partitionTable(db, cfg, wPart, "history", "h_w_id", 0)
+}
 
-		// We're splitting the UUID rowid column evenly into N partitions. The
-		// column is sorted lexicographically on the bytes of the UUID which means
-		// we should put the partitioning values at the front of the UUID.
-		binary.BigEndian.PutUint64(temp, uint64(i)*(maxVal/uint64(wPart.parts)))
-		rowids[i], err = uuid.FromBytes(temp)
-		if err != nil {
-			panic(err)
+// replicateColumns creates covering replicated indexes for a given table
+// for each of the zones provided.
+//
+// It is recommended to do this for columns that are immutable as it allows
+// lookups on those columns to be local within the provided zone. If there are
+// no zones, it assumes that each partition corresponds to a rack.
+func replicateColumns(
+	db *gosql.DB,
+	cfg zoneConfig,
+	wPart *partitioner,
+	name string,
+	pkColumns []string,
+	storedColumns []string,
+) error {
+	constraints := synthesizeConstraints(cfg, wPart)
+	for i, constraint := range constraints {
+		if _, err := db.Exec(
+			fmt.Sprintf(`CREATE UNIQUE INDEX %[1]s_idx_%[2]d ON %[1]s (%[3]s) STORING (%[4]s)`,
+				name, i, strings.Join(pkColumns, ","), strings.Join(storedColumns, ",")),
+		); err != nil {
+			return err
+		}
+		if _, err := db.Exec(fmt.Sprintf(
+			`ALTER INDEX %[1]s@%[1]s_idx_%[2]d
+CONFIGURE ZONE USING num_replicas = COPY FROM PARENT, constraints='{"%[3]s": 1}', lease_preferences='[[%[3]s]]'`,
+			name, i, constraint)); err != nil {
+			return err
 		}
 	}
+	return nil
+}
 
-	rowids[wPart.parts], _ = uuid.FromString("ffffffff-ffff-ffff-ffff-ffffffffffff")
+func replicateWarehouse(db *gosql.DB, cfg zoneConfig, wPart *partitioner) error {
+	return replicateColumns(db, cfg, wPart, "warehouse", []string{"w_id"}, []string{"w_tax"})
+}
 
-	var buf bytes.Buffer
-	buf.WriteString("ALTER TABLE history PARTITION BY RANGE (rowid) (\n")
-	for i := 0; i < wPart.parts; i++ {
-		fmt.Fprintf(&buf, "  PARTITION p0_%d VALUES FROM ('%s') to ('%s')", i, rowids[i], rowids[i+1])
-		if i+1 < wPart.parts {
-			buf.WriteString(",")
+func replicateDistrict(db *gosql.DB, cfg zoneConfig, wPart *partitioner) error {
+	return replicateColumns(db, cfg, wPart, "district", []string{"d_w_id", "d_id"},
+		[]string{"d_name", "d_street_1", "d_street_2", "d_city", "d_state", "d_zip"})
+}
+
+func replicateItem(db *gosql.DB, cfg zoneConfig, wPart *partitioner) error {
+	return replicateColumns(db, cfg, wPart, "item", []string{"i_id"},
+		[]string{"i_im_id", "i_name", "i_price", "i_data"})
+}
+
+func synthesizeConstraints(cfg zoneConfig, wPart *partitioner) []string {
+	var constraints []string
+	if len(cfg.zones) > 0 {
+		for _, zone := range cfg.zones {
+			constraints = append(constraints, "+zone="+zone)
 		}
-		buf.WriteString("\n")
+	} else {
+		// Assume we have parts number of racks which are zero indexed.
+		for i := 0; i < wPart.parts; i++ {
+			constraints = append(constraints, fmt.Sprintf("+rack=%d", i))
+		}
 	}
-	buf.WriteString(")\n")
-	if _, err := db.Exec(buf.String()); err != nil {
-		panic(fmt.Sprintf("Couldn't exec %s: %s\n", buf.String(), err))
-	}
-
-	for i := 0; i < wPart.parts; i++ {
-		configureZone(db, `history`, fmt.Sprintf("p0_%d", i), i, zones)
-	}
-
-	partitionIndex(db, wPart, zones, "history", "history_h_w_id_h_d_id_idx", "h_w_id", 1)
-	partitionIndex(db, wPart, zones, "history", "history_h_c_w_id_h_c_d_id_h_c_id_idx", "h_c_w_id", 2)
+	return constraints
 }
 
-func partitionItem(db *pgx.ConnPool, iPart *partitioner, zones []string) {
-	partitionTable(db, iPart, zones, "item", "i_id", 0)
-}
-
-func partitionTables(db *pgx.ConnPool, wPart *partitioner, zones []string) {
-	// Create a separate partitioning for the fixed-size items table and its
-	// associated indexes.
-	const nItems = 100000
-	iPart, err := makePartitioner(nItems, nItems, wPart.parts)
-	if err != nil {
-		panic(fmt.Sprintf("Couldn't create item partitioner: %s\n", err))
+func partitionTables(
+	db *gosql.DB, cfg zoneConfig, wPart *partitioner, replicateStaticColumns bool,
+) error {
+	if err := partitionWarehouse(db, cfg, wPart); err != nil {
+		return err
 	}
-
-	partitionWarehouse(db, wPart, zones)
-	partitionDistrict(db, wPart, zones)
-	partitionNewOrder(db, wPart, zones)
-	partitionOrder(db, wPart, zones)
-	partitionOrderLine(db, wPart, zones)
-	partitionStock(db, wPart, iPart, zones)
-	partitionCustomer(db, wPart, zones)
-	partitionHistory(db, wPart, zones)
-	partitionItem(db, iPart, zones)
+	if err := partitionDistrict(db, cfg, wPart); err != nil {
+		return err
+	}
+	if err := partitionNewOrder(db, cfg, wPart); err != nil {
+		return err
+	}
+	if err := partitionOrder(db, cfg, wPart); err != nil {
+		return err
+	}
+	if err := partitionOrderLine(db, cfg, wPart); err != nil {
+		return err
+	}
+	if err := partitionStock(db, cfg, wPart); err != nil {
+		return err
+	}
+	if err := partitionCustomer(db, cfg, wPart); err != nil {
+		return err
+	}
+	if err := partitionHistory(db, cfg, wPart); err != nil {
+		return err
+	}
+	if replicateStaticColumns {
+		if err := replicateDistrict(db, cfg, wPart); err != nil {
+			return err
+		}
+		if err := replicateWarehouse(db, cfg, wPart); err != nil {
+			return err
+		}
+	}
+	return replicateItem(db, cfg, wPart)
 }
 
-func isTableAlreadyPartitioned(db *pgx.ConnPool) (bool, error) {
+func partitionCount(db *gosql.DB) (int, error) {
 	var count int
-	if err := db.QueryRow(
-		// Check for the existence of a partition named p0_0, which indicates that the
-		// table has been partitioned already.
-		`SELECT count(*) FROM crdb_internal.partitions where name = 'p0_0'`,
-	).Scan(&count); err != nil {
+	if err := db.QueryRow(`
+		SELECT count(*)
+		FROM crdb_internal.tables t
+		JOIN crdb_internal.partitions p
+		USING (table_id)
+		WHERE t.name = 'warehouse'
+		AND p.name ~ 'p0_\d+'
+	`).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func indexExists(db *gosql.DB, table, index string) (bool, error) {
+	// Strip any quotes around the table name.
+	table = strings.ReplaceAll(table, `"`, ``)
+
+	var exists bool
+	if err := db.QueryRow(`
+		SELECT count(*) > 0
+		FROM information_schema.statistics
+		WHERE table_name = $1
+		AND   index_name = $2
+	`, table, index).Scan(&exists); err != nil {
 		return false, err
 	}
-
-	return count > 0, nil
+	return exists, nil
 }

@@ -1,36 +1,40 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package stop
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
+	"testing"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/util/caller"
+	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	opentracing "github.com/opentracing/opentracing-go"
+	"github.com/cockroachdb/errors"
 )
+
+func init() {
+	leaktest.PrintLeakedStoppers = PrintLeakedStoppers
+}
 
 const asyncTaskNamePrefix = "[async] "
 
@@ -44,7 +48,8 @@ var ErrUnavailable = &roachpb.NodeUnavailableError{}
 
 func register(s *Stopper) {
 	trackedStoppers.Lock()
-	trackedStoppers.stoppers = append(trackedStoppers.stoppers, s)
+	trackedStoppers.stoppers = append(trackedStoppers.stoppers,
+		stopperWithStack{s: s, createdAt: string(debug.Stack())})
 	trackedStoppers.Unlock()
 }
 
@@ -53,7 +58,7 @@ func unregister(s *Stopper) {
 	defer trackedStoppers.Unlock()
 	sl := trackedStoppers.stoppers
 	for i, tracked := range sl {
-		if tracked == s {
+		if tracked.s == s {
 			trackedStoppers.stoppers = sl[:i+copy(sl[i:], sl[i+1:])]
 			return
 		}
@@ -61,9 +66,14 @@ func unregister(s *Stopper) {
 	panic("attempt to unregister untracked stopper")
 }
 
+type stopperWithStack struct {
+	s         *Stopper
+	createdAt string // stack from NewStopper()
+}
+
 var trackedStoppers struct {
 	syncutil.Mutex
-	stoppers []*Stopper
+	stoppers []stopperWithStack
 }
 
 // HandleDebug responds with the list of stopper tasks actively running.
@@ -71,10 +81,21 @@ func HandleDebug(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	trackedStoppers.Lock()
 	defer trackedStoppers.Unlock()
-	for _, s := range trackedStoppers.stoppers {
+	for _, ss := range trackedStoppers.stoppers {
+		s := ss.s
 		s.mu.Lock()
 		fmt.Fprintf(w, "%p: %d tasks\n%s", s, s.mu.numTasks, s.runningTasksLocked())
 		s.mu.Unlock()
+	}
+}
+
+// PrintLeakedStoppers prints (using `t`) the creation site of each Stopper
+// for which `.Stop()` has not yet been called.
+func PrintLeakedStoppers(t testing.TB) {
+	trackedStoppers.Lock()
+	defer trackedStoppers.Unlock()
+	for _, tracked := range trackedStoppers.stoppers {
+		t.Logf("leaked stopper, created at:\n%s", tracked.createdAt)
 	}
 }
 
@@ -123,6 +144,8 @@ type Stopper struct {
 		idAlloc   int
 		qCancels  map[int]func()
 		sCancels  map[int]func()
+
+		stopCalled bool // turns all but first call to Stop into noop
 	}
 }
 
@@ -192,7 +215,7 @@ func (s *Stopper) RunWorker(ctx context.Context, f func(context.Context)) {
 		// Remove any associated span; we need to ensure this because the
 		// worker may run longer than the caller which presumably closes
 		// any spans it has created.
-		ctx = opentracing.ContextWithSpan(ctx, nil)
+		ctx = tracing.ContextWithSpan(ctx, nil)
 		defer s.Recover(ctx)
 		defer s.stop.Done()
 		f(ctx)
@@ -318,12 +341,11 @@ func (s *Stopper) RunAsyncTask(
 	go func() {
 		defer s.Recover(ctx)
 		defer s.runPostlude(taskName)
-		defer tracing.FinishSpan(span)
+		defer span.Finish()
 
 		f(ctx)
 	}()
 	return nil
-
 }
 
 // RunLimitedAsyncTask runs function f in a goroutine, using the given
@@ -332,44 +354,43 @@ func (s *Stopper) RunAsyncTask(
 // until the semaphore is available in order to push back on callers
 // that may be trying to create many tasks. If wait is false, returns
 // immediately with an error if the semaphore is not
-// available. Returns an error if the Stopper is quiescing, in which
-// case the function is not executed.
+// available. It is the caller's responsibility to ensure that sem is
+// closed when the stopper is quiesced. For quotapools which live for the
+// lifetime of the stopper, it is generally best to register the sem with the
+// stopper using AddCloser.
 func (s *Stopper) RunLimitedAsyncTask(
-	ctx context.Context, taskName string, sem chan struct{}, wait bool, f func(context.Context),
-) error {
+	ctx context.Context, taskName string, sem *quotapool.IntPool, wait bool, f func(context.Context),
+) (err error) {
 	// Wait for permission to run from the semaphore.
-	select {
-	case sem <- struct{}{}:
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-s.ShouldQuiesce():
-		return ErrUnavailable
-	default:
-		if !wait {
-			return ErrThrottled
-		}
-		log.Eventf(ctx, "stopper throttling task from %s due to semaphore", taskName)
-		// Retry the select without the default.
-		select {
-		case sem <- struct{}{}:
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-s.ShouldQuiesce():
-			return ErrUnavailable
-		}
+	var alloc *quotapool.IntAlloc
+	if wait {
+		alloc, err = sem.Acquire(ctx, 1)
+	} else {
+		alloc, err = sem.TryAcquire(ctx, 1)
 	}
+	if errors.Is(err, quotapool.ErrNotEnoughQuota) {
+		err = ErrThrottled
+	} else if quotapool.HasErrClosed(err) {
+		err = ErrUnavailable
+	}
+	if err != nil {
+		return err
+	}
+	defer func() {
+		// If the err is non-nil then we know that we did not start the async task
+		// and thus we need to release the acquired quota. If it is nil then we
+		// did start the task and it will release the quota.
+		if err != nil {
+			alloc.Release()
+		}
+	}()
 
 	// Check for canceled context: it's possible to get the semaphore even
 	// if the context is canceled.
-	select {
-	case <-ctx.Done():
-		<-sem
+	if ctx.Err() != nil {
 		return ctx.Err()
-	default:
 	}
-
 	if !s.runPrelude(taskName) {
-		<-sem
 		return ErrUnavailable
 	}
 
@@ -378,8 +399,8 @@ func (s *Stopper) RunLimitedAsyncTask(
 	go func() {
 		defer s.Recover(ctx)
 		defer s.runPostlude(taskName)
-		defer func() { <-sem }()
-		defer tracing.FinishSpan(span)
+		defer alloc.Release()
+		defer span.Finish()
 
 		f(ctx)
 	}()
@@ -448,6 +469,15 @@ func (s *Stopper) runningTasksLocked() TaskMap {
 // Stop signals all live workers to stop and then waits for each to
 // confirm it has stopped.
 func (s *Stopper) Stop(ctx context.Context) {
+	s.mu.Lock()
+	stopCalled := s.mu.stopCalled
+	s.mu.stopCalled = true
+	s.mu.Unlock()
+
+	if stopCalled {
+		return
+	}
+
 	defer s.Recover(ctx)
 	defer unregister(s)
 
@@ -529,12 +559,18 @@ func (s *Stopper) Quiesce(ctx context.Context) {
 		cancel()
 	}
 	if !s.mu.quiescing {
+		log.Infof(ctx, "quiescing")
 		s.mu.quiescing = true
 		close(s.quiescer)
 	}
 	for s.mu.numTasks > 0 {
-		log.Infof(ctx, "quiescing; tasks left:\n%s", s.runningTasksLocked())
+		t := time.AfterFunc(5*time.Second, func() {
+			// If we're waiting for 5+s without a task terminating, log the ones
+			// that remain.
+			log.Infof(ctx, "quiescing; tasks left:\n%s", s.RunningTasks())
+		})
 		// Unlock s.mu, wait for the signal, and lock s.mu.
 		s.mu.quiesce.Wait()
+		t.Stop()
 	}
 }

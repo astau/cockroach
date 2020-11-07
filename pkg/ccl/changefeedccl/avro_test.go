@@ -13,25 +13,34 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"math/rand"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/ccl/importccl"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
-func parseTableDesc(createTableStmt string) (*sqlbase.TableDescriptor, error) {
+func parseTableDesc(createTableStmt string) (catalog.TableDescriptor, error) {
 	ctx := context.Background()
 	stmt, err := parser.ParseOne(createTableStmt)
 	if err != nil {
@@ -42,18 +51,20 @@ func parseTableDesc(createTableStmt string) (*sqlbase.TableDescriptor, error) {
 		return nil, errors.Errorf("expected *tree.CreateTable got %T", stmt)
 	}
 	st := cluster.MakeTestingClusterSettings()
-	const parentID = sqlbase.ID(keys.MaxReservedDescID + 1)
-	const tableID = sqlbase.ID(keys.MaxReservedDescID + 2)
+	const parentID = descpb.ID(keys.MaxReservedDescID + 1)
+	const tableID = descpb.ID(keys.MaxReservedDescID + 2)
+	semaCtx := tree.MakeSemaContext()
 	mutDesc, err := importccl.MakeSimpleTableDescriptor(
-		ctx, st, createTable, parentID, tableID, importccl.NoFKs, hlc.UnixNano())
+		ctx, &semaCtx, st, createTable, parentID, keys.PublicSchemaID, tableID, importccl.NoFKs, hlc.UnixNano())
 	if err != nil {
 		return nil, err
 	}
-	return mutDesc.TableDesc(), mutDesc.TableDesc().ValidateTable(st)
+	return mutDesc, mutDesc.ValidateTable(ctx)
 }
 
-func parseValues(tableDesc *sqlbase.TableDescriptor, values string) ([]sqlbase.EncDatumRow, error) {
-	semaCtx := &tree.SemaContext{}
+func parseValues(tableDesc catalog.TableDescriptor, values string) ([]rowenc.EncDatumRow, error) {
+	ctx := context.Background()
+	semaCtx := tree.MakeSemaContext()
 	evalCtx := &tree.EvalContext{}
 
 	valuesStmt, err := parser.ParseOne(values)
@@ -69,106 +80,73 @@ func parseValues(tableDesc *sqlbase.TableDescriptor, values string) ([]sqlbase.E
 		return nil, errors.Errorf("expected *tree.ValuesClause got %T", selectStmt.Select)
 	}
 
-	var rows []sqlbase.EncDatumRow
+	var rows []rowenc.EncDatumRow
 	for _, rowTuple := range valuesClause.Rows {
-		var row sqlbase.EncDatumRow
+		var row rowenc.EncDatumRow
 		for colIdx, expr := range rowTuple {
-			col := tableDesc.Columns[colIdx]
-			typedExpr, err := sqlbase.SanitizeVarFreeExpr(
-				expr, col.Type.ToDatumType(), "avro", semaCtx, evalCtx, false /* allowImpure */)
+			col := tableDesc.GetColumnAtIdx(colIdx)
+			typedExpr, err := schemaexpr.SanitizeVarFreeExpr(
+				ctx, expr, col.Type, "avro", &semaCtx, tree.VolatilityStable)
 			if err != nil {
 				return nil, err
 			}
 			datum, err := typedExpr.Eval(evalCtx)
 			if err != nil {
-				return nil, errors.Wrap(err, typedExpr.String())
+				return nil, errors.Wrapf(err, "evaluating %s", typedExpr)
 			}
-			row = append(row, sqlbase.DatumToEncDatum(col.Type, datum))
+			row = append(row, rowenc.DatumToEncDatum(col.Type, datum))
 		}
 		rows = append(rows, row)
 	}
 	return rows, nil
 }
 
-func parseAvroSchema(j string) (*avroSchemaRecord, error) {
-	var s avroSchemaRecord
+func parseAvroSchema(j string) (*avroDataRecord, error) {
+	var s avroDataRecord
 	if err := json.Unmarshal([]byte(j), &s); err != nil {
 		return nil, err
 	}
-	// This avroSchemaRecord doesn't have any of the derived fields we need for
+	// This avroDataRecord doesn't have any of the derived fields we need for
 	// serde. Instead of duplicating the logic, fake out a TableDescriptor, so
 	// we can reuse tableToAvroSchema and get them for free.
-	tableDesc := &sqlbase.TableDescriptor{
+	tableDesc := descpb.TableDescriptor{
 		Name: AvroNameToSQLName(s.Name),
 	}
 	for _, f := range s.Fields {
-		// s.Fields[idx] has `Name` and `SchemaType` set but nonething else.
+		// s.Fields[idx] has `Name` and `SchemaType` set but nothing else.
 		// They're needed for serialization/deserialization, so fake out a
 		// column descriptor so that we can reuse columnDescToAvroSchema to get
 		// all the various fields of avroSchemaField populated for free.
-		colDesc, err := avroSchemaToColDesc(AvroNameToSQLName(f.Name), f.SchemaType)
+		colDesc, err := avroFieldMetadataToColDesc(f.Metadata)
 		if err != nil {
 			return nil, err
 		}
 		tableDesc.Columns = append(tableDesc.Columns, *colDesc)
 	}
-	return tableToAvroSchema(tableDesc)
+	return tableToAvroSchema(tabledesc.NewImmutable(tableDesc), avroSchemaNoSuffix)
 }
 
-func avroSchemaToColDesc(
-	name string, schemaType avroSchemaType,
-) (*sqlbase.ColumnDescriptor, error) {
-	colDesc := &sqlbase.ColumnDescriptor{Name: name}
-
-	union, ok := schemaType.([]interface{})
-	if ok {
-		if len(union) == 2 && union[0] == avroSchemaNull {
-			colDesc.Nullable = true
-			schemaType = union[1]
-		} else {
-			return nil, errors.Errorf(`unsupported union: %v`, union)
-		}
+func avroFieldMetadataToColDesc(metadata string) (*descpb.ColumnDescriptor, error) {
+	parsed, err := parser.ParseOne(`ALTER TABLE FOO ADD COLUMN ` + metadata)
+	if err != nil {
+		return nil, err
 	}
+	def := parsed.AST.(*tree.AlterTable).Cmds[0].(*tree.AlterTableAddColumn).ColumnDef
+	ctx := context.Background()
+	semaCtx := tree.MakeSemaContext()
+	col, _, _, err := tabledesc.MakeColumnDefDescs(ctx, def, &semaCtx, &tree.EvalContext{})
+	return col, err
+}
 
-	switch t := schemaType.(type) {
-	case string:
-		switch t {
-		case avroSchemaLong:
-			colDesc.Type = sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT}
-		case avroSchemaString:
-			colDesc.Type = sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_STRING}
-		case avroSchemaBoolean:
-			colDesc.Type = sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_BOOL}
-		case avroSchemaBytes:
-			colDesc.Type = sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_BYTES}
-		case avroSchemaDouble:
-			colDesc.Type = sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_FLOAT}
-		default:
-			return nil, errors.Errorf(`unknown schema type: %s`, t)
-		}
-	case map[string]interface{}:
-		switch t[`logicalType`] {
-		case `timestamp-micros`:
-			colDesc.Type = sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_TIMESTAMP}
-		case `decimal`:
-			colDesc.Type = sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_DECIMAL}
-			if p, ok := t[`precision`]; ok {
-				colDesc.Type.Precision = int32(p.(float64))
-			}
-			if s, ok := t[`scale`]; ok {
-				colDesc.Type.Width = int32(s.(float64))
-			}
-		default:
-			return nil, errors.Errorf(`unknown logical type: %s`, t[`logicalType`])
-		}
-	default:
-		return nil, errors.Errorf(`unknown schema type: %T %s`, schemaType, schemaType)
-	}
-	return colDesc, nil
+// randTime generates a random time.Time whose .UnixNano result doesn't
+// overflow an int64.
+func randTime(rng *rand.Rand) time.Time {
+	return timeutil.Unix(0, rng.Int63())
 }
 
 func TestAvroSchema(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	rng, _ := randutil.NewPseudoRand()
 
 	type test struct {
@@ -194,51 +172,69 @@ func TestAvroSchema(t *testing.T) {
 		},
 	}
 	// Generate a test for each column type with a random datum of that type.
-	for semTypeID, semTypeName := range sqlbase.ColumnType_SemanticType_name {
-		typ := sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_SemanticType(semTypeID)}
-		switch typ.SemanticType {
-		case sqlbase.ColumnType_DATE, sqlbase.ColumnType_INTERVAL, sqlbase.ColumnType_TIMESTAMPTZ,
-			sqlbase.ColumnType_COLLATEDSTRING, sqlbase.ColumnType_NAME, sqlbase.ColumnType_OID,
-			sqlbase.ColumnType_UUID, sqlbase.ColumnType_ARRAY, sqlbase.ColumnType_INET,
-			sqlbase.ColumnType_TIME, sqlbase.ColumnType_JSONB, sqlbase.ColumnType_BIT,
-			sqlbase.ColumnType_TUPLE:
+	for _, typ := range types.OidToType {
+		switch typ.Family() {
+		case types.AnyFamily, types.OidFamily, types.TupleFamily:
+			// These aren't expected to be needed for changefeeds.
 			continue
-			// TODO(dan): Implement these.
+		case types.IntervalFamily, types.ArrayFamily, types.BitFamily,
+			types.CollatedStringFamily:
+			// Implement these as customer demand dictates.
+			continue
 		}
-		datum := sqlbase.RandDatum(rng, typ, false /* nullOk */)
+		datum := rowenc.RandDatum(rng, typ, false /* nullOk */)
 		if datum == tree.DNull {
-			// DNull is returned by RandDatum for ColumnType_NULL or if the
+			// DNull is returned by RandDatum for types.UNKNOWN or if the
 			// column type is unimplemented in RandDatum. In either case, the
 			// correct thing to do is skip this one.
 			continue
 		}
-		switch typ.SemanticType {
-		case sqlbase.ColumnType_TIMESTAMP:
+		switch typ.Family() {
+		case types.TimestampFamily:
 			// Truncate to millisecond instead of microsecond because of a bug
 			// in the avro lib's deserialization code. The serialization seems
 			// to be fine and we only use deserialization for testing, so we
 			// should patch the bug but it's not currently affecting changefeed
 			// correctness.
-			t := datum.(*tree.DTimestamp).Time.Truncate(time.Millisecond)
-			datum = tree.MakeDTimestamp(t, time.Microsecond)
-		case sqlbase.ColumnType_DECIMAL:
+			// TODO(mjibson): goavro mishandles timestamps
+			// whose nanosecond representation overflows an
+			// int64, so restrict input to fit.
+			t := randTime(rng).Truncate(time.Millisecond)
+			datum = tree.MustMakeDTimestamp(t, time.Microsecond)
+		case types.TimestampTZFamily:
+			// See comments above for TimestampFamily.
+			t := randTime(rng).Truncate(time.Millisecond)
+			datum = tree.MustMakeDTimestampTZ(t, time.Microsecond)
+		case types.DecimalFamily:
 			// TODO(dan): Make RandDatum respect Precision and Width instead.
 			// TODO(dan): The precision is really meant to be in [1,10], but it
 			// sure looks like there's an off by one error in the avro library
 			// that makes this test flake if it picks precision of 1.
-			typ.Precision = rng.Int31n(10) + 2
-			typ.Width = rng.Int31n(typ.Precision + 1)
-			coeff := rng.Int63n(int64(math.Pow10(int(typ.Precision))))
-			datum = &tree.DDecimal{Decimal: *apd.New(coeff, -typ.Width)}
+			precision := rng.Int31n(10) + 2
+			scale := rng.Int31n(precision + 1)
+			typ = types.MakeDecimal(precision, scale)
+			coeff := rng.Int63n(int64(math.Pow10(int(precision))))
+			datum = &tree.DDecimal{Decimal: *apd.New(coeff, -scale)}
+		case types.DateFamily:
+			// TODO(mjibson): goavro mishandles dates whose
+			// nanosecond representation overflows an int64,
+			// so restrict input to fit.
+			var err error
+			datum, err = tree.NewDDateFromTime(randTime(rng))
+			if err != nil {
+				panic(err)
+			}
 		}
 		serializedDatum := tree.Serialize(datum)
+		// name can be "char" (with quotes), so needs to be escaped.
+		escapedName := fmt.Sprintf("%s_table", strings.Replace(typ.String(), "\"", "", -1))
 		// schema is used in a fmt.Sprintf to fill in the table name, so we have
 		// to escape any stray %s.
 		escapedDatum := strings.Replace(serializedDatum, `%`, `%%`, -1)
 		randTypeTest := test{
-			name:   semTypeName,
-			schema: fmt.Sprintf(`(a %s PRIMARY KEY)`, typ.SQLString()),
-			values: fmt.Sprintf(`(%s)`, escapedDatum),
+			name:   escapedName,
+			schema: fmt.Sprintf(`(a INT PRIMARY KEY, b %s)`, typ.SQLString()),
+			values: fmt.Sprintf(`(1, %s)`, escapedDatum),
 		}
 		tests = append(tests, randTypeTest)
 	}
@@ -248,7 +244,7 @@ func TestAvroSchema(t *testing.T) {
 			tableDesc, err := parseTableDesc(
 				fmt.Sprintf(`CREATE TABLE "%s" %s`, test.name, test.schema))
 			require.NoError(t, err)
-			origSchema, err := tableToAvroSchema(tableDesc)
+			origSchema, err := tableToAvroSchema(tableDesc, avroSchemaNoSuffix)
 			require.NoError(t, err)
 			jsonSchema := origSchema.codec.Schema()
 			roundtrippedSchema, err := parseAvroSchema(jsonSchema)
@@ -261,17 +257,20 @@ func TestAvroSchema(t *testing.T) {
 			require.NoError(t, err)
 
 			for _, row := range rows {
+				evalCtx := &tree.EvalContext{SessionData: &sessiondata.SessionData{}}
 				serialized, err := origSchema.textualFromRow(row)
 				require.NoError(t, err)
 				roundtripped, err := roundtrippedSchema.rowFromTextual(serialized)
 				require.NoError(t, err)
-				require.Equal(t, row, roundtripped)
+				require.Equal(t, 0, row[1].Datum.Compare(evalCtx, roundtripped[1].Datum),
+					`%s != %s`, row[1].Datum, roundtripped[1].Datum)
 
 				serialized, err = origSchema.BinaryFromRow(nil, row)
 				require.NoError(t, err)
 				roundtripped, err = roundtrippedSchema.RowFromBinary(serialized)
 				require.NoError(t, err)
-				require.Equal(t, row, roundtripped)
+				require.Equal(t, 0, row[1].Datum.Compare(evalCtx, roundtripped[1].Datum),
+					`%s != %s`, row[1].Datum, roundtripped[1].Datum)
 			}
 		})
 	}
@@ -279,16 +278,193 @@ func TestAvroSchema(t *testing.T) {
 	t.Run("escaping", func(t *testing.T) {
 		tableDesc, err := parseTableDesc(`CREATE TABLE "☃" (🍦 INT PRIMARY KEY)`)
 		require.NoError(t, err)
-		tableSchema, err := tableToAvroSchema(tableDesc)
+		tableSchema, err := tableToAvroSchema(tableDesc, avroSchemaNoSuffix)
 		require.NoError(t, err)
 		require.Equal(t,
-			`{"type":"record","name":"_u2603_","fields":[{"type":"long","name":"_u0001f366_"}]}`,
+			`{"type":"record","name":"_u2603_","fields":[`+
+				`{"type":["null","long"],"name":"_u0001f366_","default":null,`+
+				`"__crdb__":"🍦 INT8 NOT NULL"}]}`,
 			tableSchema.codec.Schema())
-		indexSchema, err := indexToAvroSchema(tableDesc, &tableDesc.PrimaryIndex)
+		indexSchema, err := indexToAvroSchema(tableDesc, tableDesc.GetPrimaryIndex())
 		require.NoError(t, err)
 		require.Equal(t,
-			`{"type":"record","name":"_u2603_","fields":[{"type":"long","name":"_u0001f366_"}]}`,
+			`{"type":"record","name":"_u2603_","fields":[`+
+				`{"type":["null","long"],"name":"_u0001f366_","default":null,`+
+				`"__crdb__":"🍦 INT8 NOT NULL"}]}`,
 			indexSchema.codec.Schema())
+	})
+
+	// This test shows what avro schema each sql column maps to, for easy
+	// reference.
+	t.Run("type_goldens", func(t *testing.T) {
+		goldens := map[string]string{
+			`BOOL`:         `["null","boolean"]`,
+			`BOX2D`:        `["null","string"]`,
+			`BYTES`:        `["null","bytes"]`,
+			`DATE`:         `["null",{"type":"int","logicalType":"date"}]`,
+			`FLOAT8`:       `["null","double"]`,
+			`GEOGRAPHY`:    `["null","bytes"]`,
+			`GEOMETRY`:     `["null","bytes"]`,
+			`INET`:         `["null","string"]`,
+			`INT8`:         `["null","long"]`,
+			`JSONB`:        `["null","string"]`,
+			`STRING`:       `["null","string"]`,
+			`TIME`:         `["null",{"type":"long","logicalType":"time-micros"}]`,
+			`TIMETZ`:       `["null","string"]`,
+			`TIMESTAMP`:    `["null",{"type":"long","logicalType":"timestamp-micros"}]`,
+			`TIMESTAMPTZ`:  `["null",{"type":"long","logicalType":"timestamp-micros"}]`,
+			`UUID`:         `["null","string"]`,
+			`DECIMAL(3,2)`: `["null",{"type":"bytes","logicalType":"decimal","precision":3,"scale":2}]`,
+		}
+
+		for _, typ := range types.Scalar {
+			switch typ.Family() {
+			case types.IntervalFamily, types.OidFamily, types.BitFamily:
+				continue
+			case types.DecimalFamily:
+				typ = types.MakeDecimal(3, 2)
+			}
+
+			colType := typ.SQLString()
+			tableDesc, err := parseTableDesc(`CREATE TABLE foo (pk INT PRIMARY KEY, a ` + colType + `)`)
+			require.NoError(t, err)
+			field, err := columnDescToAvroSchema(tableDesc.GetColumnAtIdx(1))
+			require.NoError(t, err)
+			schema, err := json.Marshal(field.SchemaType)
+			require.NoError(t, err)
+			require.Equal(t, goldens[colType], string(schema), `SQL type %s`, colType)
+
+			// Delete from goldens for the following assertion that we don't have any
+			// unexpectedly unused goldens.
+			delete(goldens, colType)
+		}
+		if len(goldens) > 0 {
+			t.Fatalf("expected all goldens to be consumed: %v", goldens)
+		}
+	})
+
+	// This test shows what avro value some sql datums map to, for easy reference.
+	// The avro golden strings are in the textual format defined in the spec.
+	t.Run("value_goldens", func(t *testing.T) {
+		goldens := []struct {
+			sqlType string
+			sql     string
+			avro    string
+		}{
+			{sqlType: `INT`, sql: `NULL`, avro: `null`},
+			{sqlType: `INT`,
+				sql:  `1`,
+				avro: `{"long":1}`},
+
+			{sqlType: `BOOL`, sql: `NULL`, avro: `null`},
+			{sqlType: `BOOL`,
+				sql:  `true`,
+				avro: `{"boolean":true}`},
+
+			{sqlType: `FLOAT`, sql: `NULL`, avro: `null`},
+			{sqlType: `FLOAT`,
+				sql:  `1.2`,
+				avro: `{"double":1.2}`},
+
+			{sqlType: `BOX2D`, sql: `NULL`, avro: `null`},
+			{sqlType: `BOX2D`, sql: `'BOX(1 2,3 4)'`, avro: `{"string":"BOX(1 2,3 4)"}`},
+			{sqlType: `GEOGRAPHY`, sql: `NULL`, avro: `null`},
+			{sqlType: `GEOGRAPHY`,
+				sql:  "'POINT(1.0 1.0)'",
+				avro: `{"bytes":"\u0001\u0001\u0000\u0000 \u00E6\u0010\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u00F0?\u0000\u0000\u0000\u0000\u0000\u0000\u00F0?"}`},
+			{sqlType: `GEOMETRY`, sql: `NULL`, avro: `null`},
+			{sqlType: `GEOMETRY`,
+				sql:  "'POINT(1.0 1.0)'",
+				avro: `{"bytes":"\u0001\u0001\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u00F0?\u0000\u0000\u0000\u0000\u0000\u0000\u00F0?"}`},
+
+			{sqlType: `STRING`, sql: `NULL`, avro: `null`},
+			{sqlType: `STRING`,
+				sql:  `'foo'`,
+				avro: `{"string":"foo"}`},
+
+			{sqlType: `BYTES`, sql: `NULL`, avro: `null`},
+			{sqlType: `BYTES`,
+				sql:  `'foo'`,
+				avro: `{"bytes":"foo"}`},
+
+			{sqlType: `DATE`, sql: `NULL`, avro: `null`},
+			{sqlType: `DATE`,
+				sql:  `'2019-01-02'`,
+				avro: `{"int.date":17898}`},
+
+			{sqlType: `TIME`, sql: `NULL`, avro: `null`},
+			{sqlType: `TIME`,
+				sql:  `'03:04:05'`,
+				avro: `{"long.time-micros":11045000000}`},
+
+			{sqlType: `TIMESTAMP`, sql: `NULL`, avro: `null`},
+			{sqlType: `TIMESTAMP`,
+				sql:  `'2019-01-02 03:04:05'`,
+				avro: `{"long.timestamp-micros":1546398245000000}`},
+
+			{sqlType: `TIMESTAMPTZ`, sql: `NULL`, avro: `null`},
+			{sqlType: `TIMESTAMPTZ`,
+				sql:  `'2019-01-02 03:04:05'`,
+				avro: `{"long.timestamp-micros":1546398245000000}`},
+
+			{sqlType: `DECIMAL(4,1)`, sql: `NULL`, avro: `null`},
+			{sqlType: `DECIMAL(4,1)`,
+				sql:  `1.2`,
+				avro: `{"bytes.decimal":"\f"}`},
+
+			{sqlType: `UUID`, sql: `NULL`, avro: `null`},
+			{sqlType: `UUID`,
+				sql:  `'27f4f4c9-e35a-45dd-9b79-5ff0f9b5fbb0'`,
+				avro: `{"string":"27f4f4c9-e35a-45dd-9b79-5ff0f9b5fbb0"}`},
+
+			{sqlType: `INET`, sql: `NULL`, avro: `null`},
+			{sqlType: `INET`,
+				sql:  `'190.0.0.0'`,
+				avro: `{"string":"190.0.0.0"}`},
+			{sqlType: `INET`,
+				sql:  `'190.0.0.0/24'`,
+				avro: `{"string":"190.0.0.0\/24"}`},
+			{sqlType: `INET`,
+				sql:  `'2001:4f8:3:ba:2e0:81ff:fe22:d1f1'`,
+				avro: `{"string":"2001:4f8:3:ba:2e0:81ff:fe22:d1f1"}`},
+			{sqlType: `INET`,
+				sql:  `'2001:4f8:3:ba:2e0:81ff:fe22:d1f1/120'`,
+				avro: `{"string":"2001:4f8:3:ba:2e0:81ff:fe22:d1f1\/120"}`},
+			{sqlType: `INET`,
+				sql:  `'::ffff:192.168.0.1/24'`,
+				avro: `{"string":"::ffff:192.168.0.1\/24"}`},
+
+			{sqlType: `JSONB`, sql: `NULL`, avro: `null`},
+			{sqlType: `JSONB`,
+				sql:  `'null'`,
+				avro: `{"string":"null"}`},
+			{sqlType: `JSONB`,
+				sql:  `'{"b": 1}'`,
+				avro: `{"string":"{\"b\": 1}"}`},
+		}
+
+		for _, test := range goldens {
+			tableDesc, err := parseTableDesc(
+				`CREATE TABLE foo (pk INT PRIMARY KEY, a ` + test.sqlType + `)`)
+			require.NoError(t, err)
+			rows, err := parseValues(tableDesc, `VALUES (1, `+test.sql+`)`)
+			require.NoError(t, err)
+
+			schema, err := tableToAvroSchema(tableDesc, avroSchemaNoSuffix)
+			require.NoError(t, err)
+			textual, err := schema.textualFromRow(rows[0])
+			require.NoError(t, err)
+			// Trim the outermost {}.
+			value := string(textual[1 : len(textual)-1])
+			// Strip out the pk field.
+			value = strings.Replace(value, `"pk":{"long":1}`, ``, -1)
+			// Trim the `,`, which could be on either side because of the avro library
+			// doesn't deterministically order the fields.
+			value = strings.Trim(value, `,`)
+			// Strip out the field name.
+			value = strings.Replace(value, `"a":`, ``, -1)
+			require.Equal(t, test.avro, value)
+		}
 	})
 }
 
@@ -313,8 +489,8 @@ func (f *avroSchemaField) defaultValueNative() (interface{}, bool) {
 // It'd be nice if our avro library handled this for us, but neither of the
 // popular golang once seem to have it implemented.
 func rowFromBinaryEvolved(
-	buf []byte, writerSchema, readerSchema *avroSchemaRecord,
-) (sqlbase.EncDatumRow, error) {
+	buf []byte, writerSchema, readerSchema *avroDataRecord,
+) (rowenc.EncDatumRow, error) {
 	native, newBuf, err := writerSchema.codec.NativeFromBinary(buf)
 	if err != nil {
 		return nil, err
@@ -330,7 +506,7 @@ func rowFromBinaryEvolved(
 	return readerSchema.rowFromNative(nativeMap)
 }
 
-func adjustNative(native map[string]interface{}, writerSchema, readerSchema *avroSchemaRecord) {
+func adjustNative(native map[string]interface{}, writerSchema, readerSchema *avroDataRecord) {
 	for _, writerField := range writerSchema.Fields {
 		if _, inReader := readerSchema.fieldIdxByName[writerField.Name]; !inReader {
 			// "If the writer's record contains a field with a name not present
@@ -354,6 +530,7 @@ func adjustNative(native map[string]interface{}, writerSchema, readerSchema *avr
 
 func TestAvroMigration(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	type test struct {
 		name           string
@@ -370,19 +547,18 @@ func TestAvroMigration(t *testing.T) {
 			readerSchema:   `(a INT PRIMARY KEY, b INT)`,
 			expectedValues: `(1, NULL)`,
 		},
-		// TODO(dan): add a column with a default value
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			writerDesc, err := parseTableDesc(
 				fmt.Sprintf(`CREATE TABLE "%s" %s`, test.name, test.writerSchema))
 			require.NoError(t, err)
-			writerSchema, err := tableToAvroSchema(writerDesc)
+			writerSchema, err := tableToAvroSchema(writerDesc, avroSchemaNoSuffix)
 			require.NoError(t, err)
 			readerDesc, err := parseTableDesc(
 				fmt.Sprintf(`CREATE TABLE "%s" %s`, test.name, test.readerSchema))
 			require.NoError(t, err)
-			readerSchema, err := tableToAvroSchema(readerDesc)
+			readerSchema, err := tableToAvroSchema(readerDesc, avroSchemaNoSuffix)
 			require.NoError(t, err)
 
 			writerRows, err := parseValues(writerDesc, `VALUES `+test.writerValues)
@@ -404,6 +580,7 @@ func TestAvroMigration(t *testing.T) {
 
 func TestDecimalRatRoundtrip(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	t.Run(`table`, func(t *testing.T) {
 		tests := []struct {

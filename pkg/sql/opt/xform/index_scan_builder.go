@@ -1,24 +1,22 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package xform
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/invertedexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
+	"github.com/cockroachdb/errors"
 )
 
 // indexScanBuilder composes a constrained, limited scan over a table index.
@@ -40,15 +38,16 @@ import (
 //   expr := sb.build()
 //
 type indexScanBuilder struct {
-	c                *CustomFuncs
-	f                *norm.Factory
-	mem              *memo.Memo
-	tabID            opt.TableID
-	pkCols           opt.ColSet
-	scanPrivate      memo.ScanPrivate
-	innerFilters     memo.FiltersExpr
-	outerFilters     memo.FiltersExpr
-	indexJoinPrivate memo.IndexJoinPrivate
+	c                     *CustomFuncs
+	f                     *norm.Factory
+	mem                   *memo.Memo
+	tabID                 opt.TableID
+	pkCols                opt.ColSet
+	scanPrivate           memo.ScanPrivate
+	innerFilters          memo.FiltersExpr
+	outerFilters          memo.FiltersExpr
+	invertedFilterPrivate memo.InvertedFilterPrivate
+	indexJoinPrivate      memo.IndexJoinPrivate
 }
 
 func (b *indexScanBuilder) init(c *CustomFuncs, tabID opt.TableID) {
@@ -64,7 +63,7 @@ func (b *indexScanBuilder) primaryKeyCols() opt.ColSet {
 	if b.pkCols.Empty() {
 		primaryIndex := b.c.e.mem.Metadata().Table(b.tabID).Index(cat.PrimaryIndex)
 		for i, cnt := 0, primaryIndex.KeyColumnCount(); i < cnt; i++ {
-			b.pkCols.Add(int(b.tabID.ColumnID(primaryIndex.Column(i).Ordinal)))
+			b.pkCols.Add(b.tabID.IndexColumnID(primaryIndex, i))
 		}
 	}
 	return b.pkCols
@@ -77,7 +76,30 @@ func (b *indexScanBuilder) setScan(scanPrivate *memo.ScanPrivate) {
 	b.scanPrivate = *scanPrivate
 	b.innerFilters = nil
 	b.outerFilters = nil
+	b.invertedFilterPrivate = memo.InvertedFilterPrivate{}
 	b.indexJoinPrivate = memo.IndexJoinPrivate{}
+}
+
+// addInvertedFilter wraps the input expression with an InvertedFilter
+// expression having the given span expression.
+func (b *indexScanBuilder) addInvertedFilter(
+	spanExpr *invertedexpr.SpanExpression,
+	pfState *invertedexpr.PreFiltererStateForInvertedFilterer,
+	invertedCol opt.ColumnID,
+) {
+	if spanExpr != nil {
+		if b.invertedFilterPrivate.InvertedColumn != 0 {
+			panic(errors.AssertionFailedf("cannot call addInvertedFilter twice"))
+		}
+		if b.indexJoinPrivate.Table != 0 {
+			panic(errors.AssertionFailedf("cannot add inverted filter after index join is added"))
+		}
+		b.invertedFilterPrivate = memo.InvertedFilterPrivate{
+			InvertedExpression: spanExpr,
+			PreFiltererState:   pfState,
+			InvertedColumn:     invertedCol,
+		}
+	}
 }
 
 // addSelect wraps the input expression with a Select expression having the
@@ -86,12 +108,12 @@ func (b *indexScanBuilder) addSelect(filters memo.FiltersExpr) {
 	if len(filters) != 0 {
 		if b.indexJoinPrivate.Table == 0 {
 			if b.innerFilters != nil {
-				panic("cannot call addSelect methods twice before index join is added")
+				panic(errors.AssertionFailedf("cannot call addSelect methods twice before index join is added"))
 			}
 			b.innerFilters = filters
 		} else {
 			if b.outerFilters != nil {
-				panic("cannot call addSelect methods twice after index join is added")
+				panic(errors.AssertionFailedf("cannot call addSelect methods twice after index join is added"))
 			}
 			b.outerFilters = filters
 		}
@@ -133,10 +155,10 @@ func (b *indexScanBuilder) addSelectAfterSplit(
 // produces the given set of columns by lookup in the primary index.
 func (b *indexScanBuilder) addIndexJoin(cols opt.ColSet) {
 	if b.indexJoinPrivate.Table != 0 {
-		panic("cannot call addIndexJoin twice")
+		panic(errors.AssertionFailedf("cannot call addIndexJoin twice"))
 	}
 	if b.outerFilters != nil {
-		panic("cannot add index join after an outer filter has been added")
+		panic(errors.AssertionFailedf("cannot add index join after an outer filter has been added"))
 	}
 	b.indexJoinPrivate = memo.IndexJoinPrivate{
 		Table: b.tabID,
@@ -156,7 +178,7 @@ func (b *indexScanBuilder) build(grp memo.RelExpr) {
 	// 2. Wrap scan in inner filter if it was added.
 	input := b.f.ConstructScan(&b.scanPrivate)
 	if len(b.innerFilters) != 0 {
-		if b.indexJoinPrivate.Table == 0 {
+		if b.indexJoinPrivate.Table == 0 && b.invertedFilterPrivate.InvertedColumn == 0 {
 			b.mem.AddSelectToGroup(&memo.SelectExpr{Input: input, Filters: b.innerFilters}, grp)
 			return
 		}
@@ -164,7 +186,20 @@ func (b *indexScanBuilder) build(grp memo.RelExpr) {
 		input = b.f.ConstructSelect(input, b.innerFilters)
 	}
 
-	// 3. Wrap input in index join if it was added.
+	// 3. Wrap input in inverted filter if it was added.
+	if b.invertedFilterPrivate.InvertedColumn != 0 {
+		if b.indexJoinPrivate.Table == 0 {
+			invertedFilter := &memo.InvertedFilterExpr{
+				Input: input, InvertedFilterPrivate: b.invertedFilterPrivate,
+			}
+			b.mem.AddInvertedFilterToGroup(invertedFilter, grp)
+			return
+		}
+
+		input = b.f.ConstructInvertedFilter(input, &b.invertedFilterPrivate)
+	}
+
+	// 4. Wrap input in index join if it was added.
 	if b.indexJoinPrivate.Table != 0 {
 		if len(b.outerFilters) == 0 {
 			indexJoin := &memo.IndexJoinExpr{Input: input, IndexJoinPrivate: b.indexJoinPrivate}
@@ -175,11 +210,11 @@ func (b *indexScanBuilder) build(grp memo.RelExpr) {
 		input = b.f.ConstructIndexJoin(input, &b.indexJoinPrivate)
 	}
 
-	// 4. Wrap input in outer filter (which must exist at this point).
+	// 5. Wrap input in outer filter (which must exist at this point).
 	if len(b.outerFilters) == 0 {
 		// indexJoinDef == 0: outerFilters == 0 handled by #1 and #2 above.
 		// indexJoinDef != 0: outerFilters == 0 handled by #3 above.
-		panic("outer filter cannot be 0 at this point")
+		panic(errors.AssertionFailedf("outer filter cannot be 0 at this point"))
 	}
 	b.mem.AddSelectToGroup(&memo.SelectExpr{Input: input, Filters: b.outerFilters}, grp)
 }

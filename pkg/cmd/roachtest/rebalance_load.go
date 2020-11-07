@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -24,10 +19,11 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 	"golang.org/x/sync/errgroup"
 )
 
-func registerRebalanceLoad(r *registry) {
+func registerRebalanceLoad(r *testRegistry) {
 	// This test creates a single table for kv to use and splits the table to
 	// have one range for every node in the cluster. Because even brand new
 	// clusters start with 20+ ranges in them, the number of new ranges in kv's
@@ -51,16 +47,17 @@ func registerRebalanceLoad(r *registry) {
 		maxDuration time.Duration,
 		concurrency int,
 	) {
-		roachNodes := c.Range(1, c.nodes-1)
-		appNode := c.Node(c.nodes)
+		roachNodes := c.Range(1, c.spec.NodeCount-1)
+		appNode := c.Node(c.spec.NodeCount)
+		splits := len(roachNodes) - 1 // n-1 splits => n ranges => 1 lease per node
 
 		c.Put(ctx, cockroach, "./cockroach", roachNodes)
-		args := startArgs("--sequential",
+		args := startArgs(
 			"--args=--vmodule=store_rebalancer=5,allocator=5,allocator_scorer=5,replicate_queue=5")
 		c.Start(ctx, t, roachNodes, args)
 
 		c.Put(ctx, workload, "./workload", appNode)
-		c.Run(ctx, appNode, `./workload init kv --drop {pgurl:1}`)
+		c.Run(ctx, appNode, fmt.Sprintf("./workload init kv --drop --splits=%d {pgurl:1}", splits))
 
 		var m *errgroup.Group // see comment in version.go
 		m, ctx = errgroup.WithContext(ctx)
@@ -73,18 +70,11 @@ func registerRebalanceLoad(r *registry) {
 		m.Go(func() error {
 			t.l.Printf("starting load generator\n")
 
-			quietL, err := t.l.ChildLogger("kv-0", quietStdout)
-			if err != nil {
-				return err
-			}
-			defer quietL.close()
-
-			splits := len(roachNodes) - 1 // n-1 splits => n ranges => 1 lease per node
-			err = c.RunL(ctx, quietL, appNode, fmt.Sprintf(
-				"./workload run kv --read-percent=95 --splits=%d --tolerate-errors --concurrency=%d "+
+			err := c.RunE(ctx, appNode, fmt.Sprintf(
+				"./workload run kv --read-percent=95 --tolerate-errors --concurrency=%d "+
 					"--duration=%v {pgurl:1-%d}",
-				splits, concurrency, maxDuration, len(roachNodes)))
-			if ctx.Err() == context.Canceled {
+				concurrency, maxDuration, len(roachNodes)))
+			if errors.Is(ctx.Err(), context.Canceled) {
 				// We got canceled either because lease balance was achieved or the
 				// other worker hit an error. In either case, it's not this worker's
 				// fault.
@@ -136,8 +126,9 @@ func registerRebalanceLoad(r *registry) {
 	concurrency := 128
 
 	r.Add(testSpec{
-		Name:       `rebalance-leases-by-load`,
-		Nodes:      nodes(4), // the last node is just used to generate load
+		Name:       `rebalance/by-load/leases`,
+		Owner:      OwnerKV,
+		Cluster:    makeClusterSpec(4), // the last node is just used to generate load
 		MinVersion: "v2.1.0",
 		Run: func(ctx context.Context, t *test, c *cluster) {
 			if local {
@@ -148,8 +139,9 @@ func registerRebalanceLoad(r *registry) {
 		},
 	})
 	r.Add(testSpec{
-		Name:       `rebalance-replicas-by-load`,
-		Nodes:      nodes(7), // the last node is just used to generate load
+		Name:       `rebalance/by-load/replicas`,
+		Owner:      OwnerKV,
+		Cluster:    makeClusterSpec(7), // the last node is just used to generate load
 		MinVersion: "v2.1.0",
 		Run: func(ctx context.Context, t *test, c *cluster) {
 			if local {
@@ -164,8 +156,18 @@ func registerRebalanceLoad(r *registry) {
 func isLoadEvenlyDistributed(l *logger, db *gosql.DB, numNodes int) (bool, error) {
 	rows, err := db.Query(
 		`select lease_holder, count(*) ` +
-			`from [show experimental_ranges from table kv.kv] ` +
+			`from [show ranges from table kv.kv] ` +
 			`group by lease_holder;`)
+	if err != nil {
+		// TODO(rafi): Remove experimental_ranges query once we stop testing 19.1 or
+		// earlier.
+		if strings.Contains(err.Error(), "syntax error at or near \"ranges\"") {
+			rows, err = db.Query(
+				`select lease_holder, count(*) ` +
+					`from [show experimental_ranges from table kv.kv] ` +
+					`group by lease_holder;`)
+		}
+	}
 	if err != nil {
 		return false, err
 	}

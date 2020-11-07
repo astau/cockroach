@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 // cmp-protocol connects to postgres and cockroach servers and compares
 // the binary and text pgwire encodings of SQL statements. Statements can
@@ -29,10 +25,11 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/cmp-protocol/pgconnect"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 var (
@@ -57,22 +54,21 @@ func main() {
 		go func() {
 			rng, _ := randutil.NewPseudoRand()
 			for {
-				typ := sqlbase.RandColumnType(rng)
-				sem := typ.SemanticType
+				typ := rowenc.RandType(rng)
+				sem := typ.Family()
 				switch sem {
-				case sqlbase.ColumnType_DECIMAL, // trailing zeros differ, ok
-					sqlbase.ColumnType_COLLATEDSTRING, // pg complains about utf8
-					sqlbase.ColumnType_INT2VECTOR,
-					sqlbase.ColumnType_OIDVECTOR,
-					sqlbase.ColumnType_OID,         // our 8-byte ints are usually out of range for pg
-					sqlbase.ColumnType_FLOAT,       // slight rounding differences at the end
-					sqlbase.ColumnType_TIMESTAMPTZ, // slight timezone differences
+				case types.DecimalFamily, // trailing zeros differ, ok
+					types.CollatedStringFamily, // pg complains about utf8
+					types.OidFamily,            // our 8-byte ints are usually out of range for pg
+					types.FloatFamily,          // slight rounding differences at the end
+					types.TimestampTZFamily,    // slight timezone differences
+					types.UnknownFamily,
 					// tested manually below:
-					sqlbase.ColumnType_ARRAY,
-					sqlbase.ColumnType_TUPLE:
+					types.ArrayFamily,
+					types.TupleFamily:
 					continue
 				}
-				datum := sqlbase.RandDatum(rng, typ, false /* null ok */)
+				datum := rowenc.RandDatum(rng, typ, false /* null ok */)
 				if datum == tree.DNull {
 					continue
 				}
@@ -100,13 +96,13 @@ func main() {
 	}
 }
 
-func pgTypeName(sem sqlbase.ColumnType_SemanticType) string {
+func pgTypeName(sem types.Family) string {
 	switch sem {
-	case sqlbase.ColumnType_STRING:
+	case types.StringFamily:
 		return "TEXT"
-	case sqlbase.ColumnType_BYTES:
+	case types.BytesFamily:
 		return "BYTEA"
-	case sqlbase.ColumnType_INT:
+	case types.IntFamily:
 		return "INT8"
 	default:
 		return sem.String()

@@ -1,31 +1,27 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
+import { Tooltip } from "antd";
 import React from "react";
-import classNames from "classnames";
-import Popper from "popper.js";
+import { AbstractTooltipProps } from "antd/es/tooltip";
+import classNames from "classnames/bind";
 
-import "./tooltip.styl";
+import styles from "./tooltip.module.styl";
 
-interface ToolTipWrapperProps {
+interface ToolTipWrapperProps extends AbstractTooltipProps {
   text: React.ReactNode;
   short?: boolean;
+  children?: React.ReactNode;
 }
 
-interface ToolTipWrapperState {
-  hovered: boolean;
-}
+const cx = classNames.bind(styles);
 
 /**
  * ToolTipWrapper wraps its children with an area that detects mouseover events
@@ -36,64 +32,23 @@ interface ToolTipWrapperState {
  * such as "float" will render parent elements unable to properly wrap their
  * contents.
  */
-export class ToolTipWrapper extends React.Component<ToolTipWrapperProps, ToolTipWrapperState> {
-  popperInstance: Popper;
-  content: React.RefObject<HTMLDivElement> = React.createRef();
-  text: React.RefObject<HTMLDivElement> = React.createRef();
 
-  constructor(props?: ToolTipWrapperProps, context?: any) {
-    super(props, context);
-    this.state = {
-      hovered: false,
-    };
-  }
+// tslint:disable-next-line: variable-name
+export const ToolTipWrapper = (props: ToolTipWrapperProps) => {
+  const { text, children, placement = "bottom" } = props;
+  const overlayClassName = cx("tooltip-wrapper", "tooltip__preset--white");
+  return (
+    <Tooltip
+      title={ text }
+      placement={placement}
+      overlayClassName={overlayClassName}
+      {...props}
+    >
+      {children}
+    </Tooltip>
+  );
+};
 
-  componentWillUnmount() {
-    if (this.popperInstance) {
-      this.popperInstance.destroy();
-    }
-  }
-
-  initPopper() {
-    // PopperOptions.eventsEnabled should be set to `false` to prevent
-    // performance issues on pages with a large number of tooltips
-    this.popperInstance = new Popper(this.content.current, this.text.current, {
-      placement: "auto",
-      eventsEnabled: false,
-    });
-  }
-
-  onMouseEnter = () => {
-    this.setState({hovered: true});
-    this.initPopper();
-  }
-
-  onMouseLeave = () => {
-    this.setState({hovered: false});
-  }
-
-  render() {
-    const { text, short } = this.props;
-    const { hovered } = this.state;
-    const tooltipClassNames = classNames({
-      "hover-tooltip": true,
-      "hover-tooltip--hovered": hovered,
-      "hover-tooltip--short": short,
-    });
-
-    return (
-      <div
-        className={tooltipClassNames}
-        onMouseEnter={this.onMouseEnter}
-        onMouseLeave={this.onMouseLeave}
-      >
-        <div className="hover-tooltip__content" ref={this.content}>
-          { this.props.children }
-        </div>
-        <div className="hover-tooltip__text" ref={this.text}>
-          { text }
-        </div>
-      </div>
-    );
-  }
-}
+ToolTipWrapper.defaultProps = {
+  placement: "bottom",
+};

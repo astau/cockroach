@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package install
 
@@ -44,7 +39,7 @@ sudo service cassandra stop;
     sudo mkdir -p "${thrift_dir}"
     sudo chmod 777 "${thrift_dir}"
     cd "${thrift_dir}"
-    curl "http://www-eu.apache.org/dist/thrift/0.10.0/thrift-0.10.0.tar.gz" | sudo tar xvz --strip-components 1
+    curl "https://downloads.apache.org/thrift/0.13.0/thrift-0.13.0.tar.gz" | sudo tar xvz --strip-components 1
     sudo ./configure --prefix=/usr
     sudo make -j$(nproc)
     sudo make install
@@ -59,7 +54,8 @@ sudo service cassandra stop;
     sudo rm -rf "${charybde_dir}" "${nemesis_path}" /usr/local/bin/charybdefs{,-nemesis}
     sudo mkdir -p "${charybde_dir}"
     sudo chmod 777 "${charybde_dir}"
-    git clone --depth 1 "https://github.com/scylladb/charybdefs.git" "${charybde_dir}"
+    # TODO(bilal): Change URL back to scylladb/charybdefs once https://github.com/scylladb/charybdefs/pull/21 is merged.
+    git clone --depth 1 "https://github.com/itsbilal/charybdefs.git" "${charybde_dir}"
 
     cd "${charybde_dir}"
     thrift -r --gen cpp server.thrift
@@ -112,7 +108,7 @@ sudo apt-get install -y gcc;
 sudo apt-get update;
 sudo apt-get install -y graphviz rlwrap;
 
-curl https://dl.google.com/go/go1.11.linux-amd64.tar.gz | sudo tar -C /usr/local -xz;
+curl https://dl.google.com/go/go1.12.linux-amd64.tar.gz | sudo tar -C /usr/local -xz;
 echo 'export PATH=$PATH:/usr/local/go/bin' | sudo tee /etc/profile.d/go.sh > /dev/null;
 sudo chmod +x /etc/profile.d/go.sh;
 `,
@@ -181,6 +177,8 @@ func Install(c *SyncedCluster, args []string) error {
 			return fmt.Errorf("unknown tool %q", arg)
 		}
 
+		// Ensure that we early exit if any of the shell statements fail.
+		cmd = "set -exuo pipefail;" + cmd
 		if err := do(arg, cmd); err != nil {
 			return err
 		}

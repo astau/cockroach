@@ -1,3 +1,13 @@
+// Copyright 2019 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 // Copyright (C) 2013-2018 by Maxim Bublis <b@codemonkey.ru>
 // Use of this source code is governed by a MIT-style
 // license that can be found in licenses/MIT-gofrs.txt.
@@ -9,8 +19,11 @@ package uuid
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"testing"
 	"time"
+
+	"github.com/cockroachdb/errors"
 )
 
 func TestUUID(t *testing.T) {
@@ -110,7 +123,7 @@ func TestMust(t *testing.T) {
 		if !ok {
 			t.Fatalf("panicked with %T, want error (%v)", r, sentinel)
 		}
-		if err != sentinel {
+		if !errors.Is(err, sentinel) {
 			t.Fatalf("panicked with %v, want %v", err, sentinel)
 		}
 	}()
@@ -164,5 +177,27 @@ func TestTimestampFromV1(t *testing.T) {
 		} else if tt.want != got {
 			t.Errorf("TimestampFromV1(%v) got %v, want %v", tt.u, got, tt.want)
 		}
+	}
+}
+
+func TestDeterministicV4(t *testing.T) {
+	// Test sortedness by enumerating everything in a small `n`.
+	var previous, current UUID
+	for i := 0; i < 10; i++ {
+		current.DeterministicV4(uint64(i), uint64(10))
+		if bytes.Compare(previous[:], current[:]) >= 0 {
+			t.Errorf(`%s should be less than %s`, previous, current)
+		}
+		copy(previous[:], current[:])
+	}
+
+	// Test uniqueness by enumerating adjacent `i`s in a big `n`.
+	previous, current = UUID{}, UUID{}
+	for i := 0; i < 10; i++ {
+		current.DeterministicV4(uint64(i), math.MaxUint64)
+		if bytes.Compare(previous[:], current[:]) >= 0 {
+			t.Errorf(`%s should be less than %s`, previous, current)
+		}
+		copy(previous[:], current[:])
 	}
 }

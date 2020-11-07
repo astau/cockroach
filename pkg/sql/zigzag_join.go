@@ -1,24 +1,20 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 )
 
 // zigzagJoinNode represents a zigzag join. A zigzag join uses multiple indexes
@@ -30,7 +26,7 @@ import (
 // constraints.
 //
 // For a more detailed description of zigzag joins, as well as when they can
-// be planned, see the comment in distsqlrun/zigzagjoiner.go.
+// be planned, see the comment in rowexec/zigzagjoiner.go.
 type zigzagJoinNode struct {
 	// sides contains information about each individual "side" of a
 	// zigzag join. Must contain 2 or more zigzagJoinSides.
@@ -38,13 +34,13 @@ type zigzagJoinNode struct {
 
 	// columns are the produced columns, namely the columns in all
 	// indexes in 'sides' - in the same order as sides.
-	columns sqlbase.ResultColumns
+	columns colinfo.ResultColumns
 
 	// onCond is any ON condition to be used in conjunction with the implicit
 	// equality condition on keyCols.
 	onCond tree.TypedExpr
 
-	props physicalProps
+	reqOrdering ReqOrdering
 }
 
 // zigzagJoinSide contains information about one "side" of the zigzag
@@ -65,7 +61,6 @@ type zigzagJoinSide struct {
 	fixedVals *valuesNode
 }
 
-// startExec is part of the execStartable interface.
 func (zj *zigzagJoinNode) startExec(params runParams) error {
 	panic("zigzag joins cannot be executed outside of distsql")
 }

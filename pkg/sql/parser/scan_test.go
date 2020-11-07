@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package parser
 
@@ -21,9 +17,9 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/errors"
 )
 
 func TestScanner(t *testing.T) {
@@ -66,9 +62,11 @@ func TestScanner(t *testing.T) {
 		{`^`, []int{'^'}},
 		{`$`, []int{'$'}},
 		{`&`, []int{'&'}},
-		{`&&`, []int{INET_CONTAINS_OR_CONTAINED_BY}},
+		{`&&`, []int{AND_AND}},
 		{`|`, []int{'|'}},
 		{`||`, []int{CONCAT}},
+		{`|/`, []int{SQRT}},
+		{`||/`, []int{CBRT}},
 		{`#`, []int{'#'}},
 		{`~`, []int{'~'}},
 		{`!~`, []int{NOT_REGMATCH}},
@@ -81,6 +79,21 @@ func TestScanner(t *testing.T) {
 		{`select a from b`, []int{SELECT, IDENT, FROM, IDENT}},
 		{`"a" "b"`, []int{IDENT, IDENT}},
 		{`'a'`, []int{SCONST}},
+		{`$$a$$`, []int{SCONST}},
+		{`$a$b$a$`, []int{SCONST}},
+		{`$a$b b$a$`, []int{SCONST}},
+		{`$a$ $a$`, []int{SCONST}},
+		{`$a$1$b$2$b$3$a$`, []int{SCONST}},
+		{`$a$1$b$2$b3$a$`, []int{SCONST}},
+		{`$a$1$$3$a$`, []int{SCONST}},
+		{`$a$1$$3$a$`, []int{SCONST}},
+		{`$a$1$3$a$`, []int{SCONST}},
+		{`$ab$1$a$ab$`, []int{SCONST}},
+		{`$ab1$ab$ab1$`, []int{SCONST}},
+		{`$ab1$ab12$ab1$`, []int{SCONST}},
+		{`$$~!@#$%^&*()_+:",./<>?;'$$`, []int{SCONST}},
+		{`$$hello
+world$$`, []int{SCONST}},
 		{`b'a'`, []int{BCONST}},
 		{`b'\xff'`, []int{BCONST}},
 		{`B'10101'`, []int{BITCONST}},
@@ -155,12 +168,12 @@ foo`, "", "foo"},
 }
 
 func TestScanKeyword(t *testing.T) {
-	for kwName, kwID := range lex.Keywords {
+	for _, kwName := range lex.KeywordNames {
 		s := makeScanner(kwName)
 		var lval sqlSymType
 		s.scan(&lval)
-		if int32(kwID.Tok) != lval.id {
-			t.Errorf("%s: expected %d, but found %d", kwName, kwID.Tok, lval.id)
+		if id := lex.GetKeywordID(kwName); id != lval.id {
+			t.Errorf("%s: expected %d, but found %d", kwName, id, lval.id)
 		}
 	}
 }
@@ -292,6 +305,23 @@ world`},
 		{`X'626172'`, `bar`},
 		{`X'FF'`, "\xff"},
 		{`B'100101'`, "100101"},
+		{`$$a$$`, "a"},
+		{`$a$b$a$`, "b"},
+		{`$a$b b$a$`, "b b"},
+		{`$a$ $a$`, " "},
+		{`$a$1$b$2$b$3$a$`, "1$b$2$b$3"},
+		{`$a$1$b$2$b3$a$`, "1$b$2$b3"},
+		{`$a$1$$3$a$`, "1$$3"},
+		{`$a$1$3$a$`, "1$3"},
+		{`$ab$1$a$ab$`, "1$a"},
+		{`$ab1$ab$ab1$`, "ab"},
+		{`$ab1$ab12$ab1$`, "ab12"},
+		{`$$~!@#$%^&*()_+:",./<>?;'$$`, "~!@#$%^&*()_+:\",./<>?;'"},
+		{`$$hello
+world$$`, `hello
+world`},
+		{`$$a`, `unterminated string`},
+		{`$a$a$$`, `unterminated string`},
 	}
 	for _, d := range testData {
 		s := makeScanner(d.sql)
@@ -333,7 +363,7 @@ func TestScanError(t *testing.T) {
 		if lval.id != ERROR {
 			t.Errorf("%s: expected ERROR, but found %d", d.sql, lval.id)
 		}
-		if !testutils.IsError(pgerror.NewError(pgerror.CodeInternalError, lval.str), d.err) {
+		if !testutils.IsError(errors.Newf("%s", lval.str), d.err) {
 			t.Errorf("%s: expected %s, but found %v", d.sql, d.err, lval.str)
 		}
 	}
@@ -443,6 +473,10 @@ func TestLastLexicalToken(t *testing.T) {
 		{
 			s:   `SELECT 'unfinished`,
 			res: ERROR,
+		},
+		{
+			s:   `SELECT e'\xaa';`, // invalid token but last token is semicolon
+			res: ';',
 		},
 	}
 

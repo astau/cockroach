@@ -1,8 +1,18 @@
+// Copyright 2019 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import { assert } from "chai";
 import moment from "moment";
 
-import { delay, channel } from "redux-saga";
-import { call } from "redux-saga/effects";
+import { channel } from "redux-saga";
+import { delay, call } from "redux-saga/effects";
 import { expectSaga, testSaga } from "redux-saga-test-plan";
 
 import {
@@ -29,7 +39,7 @@ describe("Query Management Saga", function() {
         refreshInterval: moment.duration(50),
         retryDelay: moment.duration(500),
         querySaga: function* () {
-            yield call(delay, 0);
+            yield delay(0);
             yield call(() => queryCounterCalled++);
         },
     };
@@ -56,7 +66,7 @@ describe("Query Management Saga", function() {
             it("immediately runs a saga when refresh is called", function() {
                 return expectSaga(queryManagerSaga)
                     .dispatch(refresh(testQueryCounter))
-                    .run()
+                    .silentRun()
                     .then(() => {
                         assert.equal(queryCounterCalled, 1);
                     });
@@ -65,7 +75,7 @@ describe("Query Management Saga", function() {
                 return expectSaga(queryManagerSaga)
                     .dispatch(refresh(testQueryCounter))
                     .dispatch(refresh(testQueryCounter))
-                    .run()
+                    .silentRun()
                     .then(() => {
                         assert.equal(queryCounterCalled, 1);
                     });
@@ -75,7 +85,7 @@ describe("Query Management Saga", function() {
                     .dispatch(refresh(testQueryCounter))
                     .delay(10)
                     .dispatch(refresh(testQueryCounter))
-                    .run()
+                    .silentRun()
                     .then(() => {
                         assert.equal(queryCounterCalled, 2);
                     });
@@ -84,7 +94,7 @@ describe("Query Management Saga", function() {
                 return expectSaga(queryManagerSaga)
                     .withReducer(queryManagerReducer)
                     .dispatch(refresh(testQueryError))
-                    .run()
+                    .silentRun()
                     .then(runResult => {
                         assert.isObject(runResult.storeState[testQueryError.id]);
                         assert.equal(runResult.storeState[testQueryError.id].lastError, sentinelError);
@@ -97,7 +107,7 @@ describe("Query Management Saga", function() {
                     .delay(10)
                     .dispatch(refresh(testQueryCounter))
                     .dispatch(stopAutoRefresh(testQueryCounter))
-                    .run()
+                    .silentRun()
                     .then(() => {
                         assert.equal(queryCounterCalled, 2);
                     });
@@ -108,7 +118,7 @@ describe("Query Management Saga", function() {
                 return expectSaga(queryManagerSaga)
                     .dispatch(autoRefresh(testQueryCounter))
                     .dispatch(stopAutoRefresh(testQueryCounter))
-                    .run()
+                    .silentRun()
                     .then(() => {
                         assert.equal(queryCounterCalled, 1);
                     });
@@ -118,7 +128,7 @@ describe("Query Management Saga", function() {
                     .dispatch(refresh(testQueryCounter))
                     .dispatch(autoRefresh(testQueryCounter))
                     .dispatch(stopAutoRefresh(testQueryCounter))
-                    .run()
+                    .silentRun()
                     .then(() => {
                         assert.equal(queryCounterCalled, 1);
                     });
@@ -131,6 +141,7 @@ describe("Query Management Saga", function() {
                 let queryCalled = 0;
                 const selfStopQuery = {
                     id: "selfStopQuery",
+                    refreshInterval: moment.duration(50),
                     querySaga: function* (): IterableIterator<void> {
                         queryCalled++;
                         if (queryCalled > 3) {
@@ -138,11 +149,11 @@ describe("Query Management Saga", function() {
                         }
                     },
                 };
-                tester
-                    .dispatch(autoRefresh(testQueryCounter))
-                    .dispatch(autoRefresh(testQueryCounter))
-                    .dispatch(autoRefresh(testQueryCounter))
-                    .run()
+                return tester
+                    .dispatch(autoRefresh(selfStopQuery))
+                    .dispatch(autoRefresh(selfStopQuery))
+                    .dispatch(autoRefresh(selfStopQuery))
+                    .silentRun(250)
                     .then(() => {
                         assert.equal(queryCalled, 5);
                     });
@@ -150,7 +161,7 @@ describe("Query Management Saga", function() {
             it("Uses retry delay when errors are encountered", function() {
                 return expectSaga(queryManagerSaga)
                     .dispatch(autoRefresh(testQueryError))
-                    .run({timeout: 200})
+                    .silentRun(200)
                     .then(() => {
                         // RefreshTimeout is high enough that it would only be
                         // called once.
@@ -169,7 +180,7 @@ describe("Query Management Saga", function() {
                     .withReducer(queryManagerReducer)
                     .dispatch(refresh(neverResolveQuery))
                     .dispatch(refresh(testQueryCounter))
-                    .run({timeout: 10})
+                    .silentRun()
                     .then(runResult => {
                         assert.isTrue(runResult.storeState[neverResolveQuery.id].isRunning);
                         assert.isFalse(runResult.storeState[testQueryCounter.id].isRunning);
@@ -193,7 +204,7 @@ describe("Query Management Saga", function() {
                     const tester = expectSaga(queryManagerSaga)
                         .dispatch(refresh(explicitResolveQuery));
 
-                    const testFinished = tester.run();
+                    const testFinished = tester.silentRun();
                     await delay(0);
 
                     // Query is now in progress, waiting on explicit resolve to

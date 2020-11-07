@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql_test
 
@@ -20,37 +16,33 @@ import (
 	"fmt"
 	"math"
 	"net/url"
-	"reflect"
 	"strings"
 	"testing"
-	"time"
 	"unicode/utf8"
 
-	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
+	"github.com/cockroachdb/cockroach/pkg/sql/lex"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/kr/pretty"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 func TestShowCreateTable(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	if _, err := sqlDB.Exec(`
+    SET CLUSTER SETTING sql.cross_db_fks.enabled = TRUE;
 		CREATE DATABASE d;
 		SET DATABASE = d;
 		CREATE TABLE items (
@@ -79,14 +71,14 @@ func TestShowCreateTable(t *testing.T) {
 	FAMILY "primary" (i, v, t, rowid),
 	FAMILY fam_1_s (s)
 )`,
-			expect: `CREATE TABLE %s (
+			expect: `CREATE TABLE public.%s (
 	i INT8 NULL,
 	s STRING NULL,
 	v FLOAT8 NOT NULL,
 	t TIMESTAMP NULL DEFAULT now():::TIMESTAMP,
 	FAMILY "primary" (i, v, t, rowid),
 	FAMILY fam_1_s (s),
-	CONSTRAINT check_i CHECK (i > 0)
+	CONSTRAINT check_i CHECK (i > 0:::INT8)
 )`,
 		},
 		{
@@ -98,14 +90,14 @@ func TestShowCreateTable(t *testing.T) {
 	FAMILY "primary" (i, v, t, rowid),
 	FAMILY fam_1_s (s)
 )`,
-			expect: `CREATE TABLE %s (
+			expect: `CREATE TABLE public.%s (
 	i INT8 NULL,
 	s STRING NULL,
 	v FLOAT8 NOT NULL,
 	t TIMESTAMP NULL DEFAULT now():::TIMESTAMP,
 	FAMILY "primary" (i, v, t, rowid),
 	FAMILY fam_1_s (s),
-	CONSTRAINT check_i CHECK (i > 0)
+	CONSTRAINT check_i CHECK (i > 0:::INT8)
 )`,
 		},
 		{
@@ -116,19 +108,19 @@ func TestShowCreateTable(t *testing.T) {
 	FAMILY "primary" (i, rowid),
 	FAMILY fam_1_s (s)
 )`,
-			expect: `CREATE TABLE %s (
+			expect: `CREATE TABLE public.%s (
 	i INT8 NULL,
 	s STRING NULL,
 	FAMILY "primary" (i, rowid),
 	FAMILY fam_1_s (s),
-	CONSTRAINT ck CHECK (i > 0)
+	CONSTRAINT ck CHECK (i > 0:::INT8)
 )`,
 		},
 		{
 			stmt: `CREATE TABLE %s (
 	i INT8 PRIMARY KEY
 )`,
-			expect: `CREATE TABLE %s (
+			expect: `CREATE TABLE public.%s (
 	i INT8 NOT NULL,
 	CONSTRAINT "primary" PRIMARY KEY (i ASC),
 	FAMILY "primary" (i)
@@ -142,7 +134,7 @@ func TestShowCreateTable(t *testing.T) {
 				CREATE INDEX idx_if on %[1]s (f, i) STORING (s, d);
 				CREATE UNIQUE INDEX on %[1]s (d);
 			`,
-			expect: `CREATE TABLE %s (
+			expect: `CREATE TABLE public.%s (
 	i INT8 NULL,
 	f FLOAT8 NULL,
 	s STRING NULL,
@@ -159,6 +151,11 @@ func TestShowCreateTable(t *testing.T) {
 	CONSTRAINT "pri""mary" PRIMARY KEY ("te""st" ASC),
 	FAMILY "primary" ("te""st")
 )`,
+			expect: `CREATE TABLE public.%s (
+	"te""st" INT8 NOT NULL,
+	CONSTRAINT "pri""mary" PRIMARY KEY ("te""st" ASC),
+	FAMILY "primary" ("te""st")
+)`,
 		},
 		{
 			stmt: `CREATE TABLE %s (
@@ -166,7 +163,7 @@ func TestShowCreateTable(t *testing.T) {
 	b int8,
 	index c(a asc, b desc)
 )`,
-			expect: `CREATE TABLE %s (
+			expect: `CREATE TABLE public.%s (
 	a INT8 NULL,
 	b INT8 NULL,
 	INDEX c (a ASC, b DESC),
@@ -182,14 +179,12 @@ func TestShowCreateTable(t *testing.T) {
 	FOREIGN KEY (i, j) REFERENCES items (a, b),
 	k int REFERENCES items (c)
 )`,
-			expect: `CREATE TABLE %s (
+			expect: `CREATE TABLE public.%s (
 	i INT8 NULL,
 	j INT8 NULL,
 	k INT8 NULL,
-	CONSTRAINT fk_i_ref_items FOREIGN KEY (i, j) REFERENCES items (a, b),
-	INDEX %[1]s_auto_index_fk_i_ref_items (i ASC, j ASC),
-	CONSTRAINT fk_k_ref_items FOREIGN KEY (k) REFERENCES items (c),
-	INDEX %[1]s_auto_index_fk_k_ref_items (k ASC),
+	CONSTRAINT fk_i_ref_items FOREIGN KEY (i, j) REFERENCES public.items(a, b),
+	CONSTRAINT fk_k_ref_items FOREIGN KEY (k) REFERENCES public.items(c),
 	FAMILY "primary" (i, j, k, rowid)
 )`,
 		},
@@ -202,14 +197,12 @@ func TestShowCreateTable(t *testing.T) {
 	k int REFERENCES items (c) MATCH FULL,
 	FOREIGN KEY (i, j) REFERENCES items (a, b) MATCH FULL
 )`,
-			expect: `CREATE TABLE %s (
+			expect: `CREATE TABLE public.%s (
 	i INT8 NULL,
 	j INT8 NULL,
 	k INT8 NULL,
-	CONSTRAINT fk_i_ref_items FOREIGN KEY (i, j) REFERENCES items (a, b) MATCH FULL,
-	INDEX %[1]s_auto_index_fk_i_ref_items (i ASC, j ASC),
-	CONSTRAINT fk_k_ref_items FOREIGN KEY (k) REFERENCES items (c) MATCH FULL,
-	INDEX %[1]s_auto_index_fk_k_ref_items (k ASC),
+	CONSTRAINT fk_i_ref_items FOREIGN KEY (i, j) REFERENCES public.items(a, b) MATCH FULL,
+	CONSTRAINT fk_k_ref_items FOREIGN KEY (k) REFERENCES public.items(c) MATCH FULL,
 	FAMILY "primary" (i, j, k, rowid)
 )`,
 		},
@@ -220,10 +213,9 @@ func TestShowCreateTable(t *testing.T) {
 	x INT8,
 	CONSTRAINT fk_ref FOREIGN KEY (x) REFERENCES o.foo (x)
 )`,
-			expect: `CREATE TABLE %s (
+			expect: `CREATE TABLE public.%s (
 	x INT8 NULL,
-	CONSTRAINT fk_ref FOREIGN KEY (x) REFERENCES o.public.foo (x),
-	INDEX %[1]s_auto_index_fk_ref (x ASC),
+	CONSTRAINT fk_ref FOREIGN KEY (x) REFERENCES o.public.foo(x),
 	FAMILY "primary" (x, rowid)
 )`,
 		},
@@ -236,14 +228,12 @@ func TestShowCreateTable(t *testing.T) {
 	FOREIGN KEY (i, j) REFERENCES items (a, b) ON DELETE SET DEFAULT,
 	k int8 REFERENCES items (c) ON DELETE SET NULL
 )`,
-			expect: `CREATE TABLE %s (
+			expect: `CREATE TABLE public.%s (
 	i INT8 NULL DEFAULT 123:::INT8,
 	j INT8 NULL DEFAULT 123:::INT8,
 	k INT8 NULL,
-	CONSTRAINT fk_i_ref_items FOREIGN KEY (i, j) REFERENCES items (a, b) ON DELETE SET DEFAULT,
-	INDEX %[1]s_auto_index_fk_i_ref_items (i ASC, j ASC),
-	CONSTRAINT fk_k_ref_items FOREIGN KEY (k) REFERENCES items (c) ON DELETE SET NULL,
-	INDEX %[1]s_auto_index_fk_k_ref_items (k ASC),
+	CONSTRAINT fk_i_ref_items FOREIGN KEY (i, j) REFERENCES public.items(a, b) ON DELETE SET DEFAULT,
+	CONSTRAINT fk_k_ref_items FOREIGN KEY (k) REFERENCES public.items(c) ON DELETE SET NULL,
 	FAMILY "primary" (i, j, k, rowid)
 )`,
 		},
@@ -255,12 +245,12 @@ func TestShowCreateTable(t *testing.T) {
 	b INT8,
 	PRIMARY KEY (a, b)
 ) INTERLEAVE IN PARENT items (a, b)`,
-			expect: `CREATE TABLE %s (
+			expect: `CREATE TABLE public.%s (
 	a INT8 NOT NULL,
 	b INT8 NOT NULL,
 	CONSTRAINT "primary" PRIMARY KEY (a ASC, b ASC),
 	FAMILY "primary" (a, b)
-) INTERLEAVE IN PARENT items (a, b)`,
+) INTERLEAVE IN PARENT public.items (a, b)`,
 		},
 		// Check that INTERLEAVE dependencies outside of the current
 		// database are prefixed by their db name.
@@ -268,7 +258,7 @@ func TestShowCreateTable(t *testing.T) {
 			stmt: `CREATE TABLE %s (
 	x INT8 PRIMARY KEY
 ) INTERLEAVE IN PARENT o.foo (x)`,
-			expect: `CREATE TABLE %s (
+			expect: `CREATE TABLE public.%s (
 	x INT8 NOT NULL,
 	CONSTRAINT "primary" PRIMARY KEY (x ASC),
 	FAMILY "primary" (x)
@@ -285,15 +275,13 @@ func TestShowCreateTable(t *testing.T) {
 	FOREIGN KEY (i, j) REFERENCES items (a, b) MATCH SIMPLE ON DELETE SET DEFAULT,
 	FOREIGN KEY (k, l) REFERENCES items (a, b) MATCH FULL ON UPDATE CASCADE
 )`,
-			expect: `CREATE TABLE %s (
+			expect: `CREATE TABLE public.%s (
 	i INT8 NULL DEFAULT 1:::INT8,
 	j INT8 NULL DEFAULT 2:::INT8,
 	k INT8 NULL DEFAULT 3:::INT8,
 	l INT8 NULL DEFAULT 4:::INT8,
-	CONSTRAINT fk_i_ref_items FOREIGN KEY (i, j) REFERENCES items (a, b) ON DELETE SET DEFAULT,
-	INDEX %[1]s_auto_index_fk_i_ref_items (i ASC, j ASC),
-	CONSTRAINT fk_k_ref_items FOREIGN KEY (k, l) REFERENCES items (a, b) MATCH FULL ON UPDATE CASCADE,
-	INDEX %[1]s_auto_index_fk_k_ref_items (k ASC, l ASC),
+	CONSTRAINT fk_i_ref_items FOREIGN KEY (i, j) REFERENCES public.items(a, b) ON DELETE SET DEFAULT,
+	CONSTRAINT fk_k_ref_items FOREIGN KEY (k, l) REFERENCES public.items(a, b) MATCH FULL ON UPDATE CASCADE,
 	FAMILY "primary" (i, j, k, l, rowid)
 )`,
 		},
@@ -345,10 +333,11 @@ func TestShowCreateTable(t *testing.T) {
 
 func TestShowCreateView(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	if _, err := sqlDB.Exec(`
 		CREATE DATABASE d;
@@ -364,35 +353,35 @@ func TestShowCreateView(t *testing.T) {
 	}{
 		{
 			`CREATE VIEW %s AS SELECT i, s, v, t FROM t`,
-			`CREATE VIEW %s (i, s, v, t) AS SELECT i, s, v, t FROM d.public.t`,
+			`CREATE VIEW public.%s (i, s, v, t) AS SELECT i, s, v, t FROM d.public.t`,
 		},
 		{
 			`CREATE VIEW %s AS SELECT i, s, t FROM t`,
-			`CREATE VIEW %s (i, s, t) AS SELECT i, s, t FROM d.public.t`,
+			`CREATE VIEW public.%s (i, s, t) AS SELECT i, s, t FROM d.public.t`,
 		},
 		{
 			`CREATE VIEW %s AS SELECT t.i, t.s, t.t FROM t`,
-			`CREATE VIEW %s (i, s, t) AS SELECT t.i, t.s, t.t FROM d.public.t`,
+			`CREATE VIEW public.%s (i, s, t) AS SELECT t.i, t.s, t.t FROM d.public.t`,
 		},
 		{
 			`CREATE VIEW %s AS SELECT foo.i, foo.s, foo.t FROM t AS foo WHERE foo.i > 3`,
-			`CREATE VIEW %s (i, s, t) AS SELECT foo.i, foo.s, foo.t FROM d.public.t AS foo WHERE foo.i > 3`,
+			`CREATE VIEW public.%s (i, s, t) AS SELECT foo.i, foo.s, foo.t FROM d.public.t AS foo WHERE foo.i > 3`,
 		},
 		{
 			`CREATE VIEW %s AS SELECT count(*) FROM t`,
-			`CREATE VIEW %s (count) AS SELECT count(*) FROM d.public.t`,
+			`CREATE VIEW public.%s (count) AS SELECT count(*) FROM d.public.t`,
 		},
 		{
 			`CREATE VIEW %s AS SELECT s, count(*) FROM t GROUP BY s HAVING count(*) > 3:::INT8`,
-			`CREATE VIEW %s (s, count) AS SELECT s, count(*) FROM d.public.t GROUP BY s HAVING count(*) > 3:::INT8`,
+			`CREATE VIEW public.%s (s, count) AS SELECT s, count(*) FROM d.public.t GROUP BY s HAVING count(*) > 3:::INT8`,
 		},
 		{
 			`CREATE VIEW %s (a, b, c, d) AS SELECT i, s, v, t FROM t`,
-			`CREATE VIEW %s (a, b, c, d) AS SELECT i, s, v, t FROM d.public.t`,
+			`CREATE VIEW public.%s (a, b, c, d) AS SELECT i, s, v, t FROM d.public.t`,
 		},
 		{
 			`CREATE VIEW %s (a, b) AS SELECT i, v FROM t`,
-			`CREATE VIEW %s (a, b) AS SELECT i, v FROM d.public.t`,
+			`CREATE VIEW public.%s (a, b) AS SELECT i, v FROM d.public.t`,
 		},
 	}
 	for i, test := range tests {
@@ -439,10 +428,11 @@ func TestShowCreateView(t *testing.T) {
 
 func TestShowCreateSequence(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	if _, err := sqlDB.Exec(`
 		CREATE DATABASE d;
@@ -457,19 +447,19 @@ func TestShowCreateSequence(t *testing.T) {
 	}{
 		{
 			`CREATE SEQUENCE %s`,
-			`CREATE SEQUENCE %s MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 1`,
+			`CREATE SEQUENCE public.%s MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 1`,
 		},
 		{
 			`CREATE SEQUENCE %s INCREMENT BY 5`,
-			`CREATE SEQUENCE %s MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 5 START 1`,
+			`CREATE SEQUENCE public.%s MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 5 START 1`,
 		},
 		{
 			`CREATE SEQUENCE %s START WITH 5`,
-			`CREATE SEQUENCE %s MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 5`,
+			`CREATE SEQUENCE public.%s MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 5`,
 		},
 		{
 			`CREATE SEQUENCE %s INCREMENT 5 MAXVALUE 10000 START 10 MINVALUE 0`,
-			`CREATE SEQUENCE %s MINVALUE 0 MAXVALUE 10000 INCREMENT 5 START 10`,
+			`CREATE SEQUENCE public.%s MINVALUE 0 MAXVALUE 10000 INCREMENT 5 START 10`,
 		},
 	}
 	for i, test := range tests {
@@ -516,6 +506,7 @@ func TestShowCreateSequence(t *testing.T) {
 
 func TestShowQueries(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	const multiByte = "💩"
 	const selectBase = "SELECT * FROM "
@@ -584,7 +575,6 @@ func TestShowQueries(t *testing.T) {
 					return
 				}
 			}
-			fmt.Println("tf", stmts)
 			if err := rows.Err(); err != nil {
 				failure = err
 				return
@@ -602,7 +592,7 @@ func TestShowQueries(t *testing.T) {
 		}
 	}
 
-	tc := serverutils.StartTestCluster(t, 2, /* numNodes */
+	tc := serverutils.StartNewTestCluster(t, 2, /* numNodes */
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
 			ServerArgs: base.TestServerArgs{
@@ -612,7 +602,7 @@ func TestShowQueries(t *testing.T) {
 				},
 			},
 		})
-	defer tc.Stopper().Stop(context.TODO())
+	defer tc.Stopper().Stop(context.Background())
 
 	conn1 = tc.ServerConn(0)
 	conn2 = tc.ServerConn(1)
@@ -633,7 +623,7 @@ func TestShowQueries(t *testing.T) {
 	// Now check the behavior on error.
 	tc.StopServer(1)
 
-	rows, err := conn1.Query(`SELECT node_id, query FROM [SHOW CLUSTER QUERIES]`)
+	rows, err := conn1.Query(`SELECT node_id, query FROM [SHOW ALL CLUSTER QUERIES]`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -665,11 +655,12 @@ func TestShowQueries(t *testing.T) {
 
 func TestShowSessions(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	var conn *gosql.DB
 
-	tc := serverutils.StartTestCluster(t, 2 /* numNodes */, base.TestClusterArgs{})
-	defer tc.Stopper().Stop(context.TODO())
+	tc := serverutils.StartNewTestCluster(t, 2 /* numNodes */, base.TestClusterArgs{})
+	defer tc.Stopper().Stop(context.Background())
 
 	conn = tc.ServerConn(0)
 	sqlutils.CreateTable(t, conn, "t", "num INT", 0, nil)
@@ -678,7 +669,7 @@ func TestShowSessions(t *testing.T) {
 	var showSessions = fmt.Sprintf(`
 	select node_id, (now() - session_start)::float from
 		[show cluster sessions] where application_name not like '%s%%'
-	`, sql.InternalAppNamePrefix)
+	`, catconstants.InternalAppNamePrefix)
 
 	rows, err := conn.Query(showSessions)
 	if err != nil {
@@ -744,7 +735,7 @@ func TestShowSessions(t *testing.T) {
 	// Now check the behavior on error.
 	tc.StopServer(1)
 
-	rows, err = conn.Query(`SELECT node_id, active_queries FROM [SHOW CLUSTER SESSIONS]`)
+	rows, err = conn.Query(`SELECT node_id, active_queries FROM [SHOW ALL CLUSTER SESSIONS]`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -776,338 +767,230 @@ func TestShowSessions(t *testing.T) {
 
 func TestShowSessionPrivileges(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	params, _ := tests.CreateTestServerParams()
 	params.Insecure = true
 	s, rawSQLDBroot, _ := serverutils.StartServer(t, params)
 	sqlDBroot := sqlutils.MakeSQLRunner(rawSQLDBroot)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
-	// Prepare a non-root session.
-	_ = sqlDBroot.Exec(t, `CREATE USER nonroot`)
-	pgURL := url.URL{
-		Scheme:   "postgres",
-		User:     url.User("nonroot"),
-		Host:     s.ServingAddr(),
-		RawQuery: "sslmode=disable",
-	}
-	rawSQLDBnonroot, err := gosql.Open("postgres", pgURL.String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rawSQLDBnonroot.Close()
-	sqlDBnonroot := sqlutils.MakeSQLRunner(rawSQLDBnonroot)
+	// Create three users: one with no special permissions, one with the
+	// VIEWACTIVITY role option, and one admin. We'll check that the VIEWACTIVITY
+	// users and the admin can see all sessions and the unpermissioned user can
+	// only see their own session.
+	_ = sqlDBroot.Exec(t, `CREATE USER noperms`)
+	_ = sqlDBroot.Exec(t, `CREATE USER viewactivity VIEWACTIVITY`)
+	_ = sqlDBroot.Exec(t, `CREATE USER adminuser`)
+	_ = sqlDBroot.Exec(t, `GRANT admin TO adminuser`)
 
-	// Ensure the non-root session is open.
-	sqlDBnonroot.Exec(t, `SELECT version()`)
-
-	t.Run("root", func(t *testing.T) {
-		// Verify that the root session can use SHOW SESSIONS properly and
-		// can observe other sessions than its own.
-		rows := sqlDBroot.Query(t, `SELECT user_name FROM [SHOW CLUSTER SESSIONS]`)
-		defer rows.Close()
-		counts := map[string]int{}
-		for rows.Next() {
-			var userName string
-			if err := rows.Scan(&userName); err != nil {
-				t.Fatal(err)
-			}
-			counts[userName]++
-		}
-		if counts[security.RootUser] == 0 {
-			t.Fatalf("root session is unable to see its own session: %+v", counts)
-		}
-		if counts["nonroot"] == 0 {
-			t.Fatal("root session is unable to see non-root session")
-		}
-	})
-
-	t.Run("non-root", func(t *testing.T) {
-		// Verify that the non-root session can use SHOW SESSIONS properly
-		// and cannot observe other sessions than its own.
-		rows := sqlDBnonroot.Query(t, `SELECT user_name FROM [SHOW CLUSTER SESSIONS]`)
-		defer rows.Close()
-		counts := map[string]int{}
-		for rows.Next() {
-			var userName string
-			if err := rows.Scan(&userName); err != nil {
-				t.Fatal(err)
-			}
-			counts[userName]++
-		}
-		if counts["nonroot"] == 0 {
-			t.Fatal("non-root session is unable to see its own session")
-		}
-		if len(counts) > 1 {
-			t.Fatalf("non-root session is able to see other sessions: %+v", counts)
-		}
-	})
-}
-
-// TestShowJobs manually inserts a row into system.jobs and checks that the
-// encoded protobuf payload is properly decoded and visible in
-// crdb_internal.jobs.
-func TestShowJobs(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	params, _ := tests.CreateTestServerParams()
-	s, rawSQLDB, _ := serverutils.StartServer(t, params)
-	sqlDB := sqlutils.MakeSQLRunner(rawSQLDB)
-	defer s.Stopper().Stop(context.TODO())
-
-	// row represents a row returned from crdb_internal.jobs, but
-	// *not* a row in system.jobs.
-	type row struct {
-		id                int64
-		typ               string
-		status            string
-		description       string
-		username          string
-		err               string
-		created           time.Time
-		started           time.Time
-		finished          time.Time
-		modified          time.Time
-		fractionCompleted float32
-		highWater         hlc.Timestamp
-		coordinatorID     roachpb.NodeID
-		details           jobspb.Details
+	type user struct {
+		username             string
+		canViewOtherSessions bool
+		sqlRunner            *sqlutils.SQLRunner
 	}
 
-	for _, in := range []row{
-		{
-			id:          42,
-			typ:         "SCHEMA CHANGE",
-			status:      "superfailed",
-			description: "failjob",
-			username:    "failure",
-			err:         "boom",
-			// lib/pq returns time.Time objects with goofy locations, which breaks
-			// reflect.DeepEqual without this time.FixedZone song and dance.
-			// See: https://github.com/lib/pq/issues/329
-			created:           timeutil.Unix(1, 0).In(time.FixedZone("", 0)),
-			started:           timeutil.Unix(2, 0).In(time.FixedZone("", 0)),
-			finished:          timeutil.Unix(3, 0).In(time.FixedZone("", 0)),
-			modified:          timeutil.Unix(4, 0).In(time.FixedZone("", 0)),
-			fractionCompleted: 0.42,
-			coordinatorID:     7,
-			details:           jobspb.SchemaChangeDetails{},
-		},
-		{
-			id:          43,
-			typ:         "CHANGEFEED",
-			status:      "running",
-			description: "persistent feed",
-			username:    "persistent",
-			err:         "",
-			// lib/pq returns time.Time objects with goofy locations, which breaks
-			// reflect.DeepEqual without this time.FixedZone song and dance.
-			// See: https://github.com/lib/pq/issues/329
-			created:  timeutil.Unix(1, 0).In(time.FixedZone("", 0)),
-			started:  timeutil.Unix(2, 0).In(time.FixedZone("", 0)),
-			finished: timeutil.Unix(3, 0).In(time.FixedZone("", 0)),
-			modified: timeutil.Unix(4, 0).In(time.FixedZone("", 0)),
-			highWater: hlc.Timestamp{
-				WallTime: 1533143242000000,
-				Logical:  4,
-			},
-			coordinatorID: 7,
-			details:       jobspb.ChangefeedDetails{},
-		},
-	} {
-		t.Run("", func(t *testing.T) {
-			// system.jobs is part proper SQL columns, part protobuf, so we can't use the
-			// row struct directly.
-			inPayload, err := protoutil.Marshal(&jobspb.Payload{
-				Description:    in.description,
-				StartedMicros:  in.started.UnixNano() / time.Microsecond.Nanoseconds(),
-				FinishedMicros: in.finished.UnixNano() / time.Microsecond.Nanoseconds(),
-				Username:       in.username,
-				Lease: &jobspb.Lease{
-					NodeID: 7,
-				},
-				Error:   in.err,
-				Details: jobspb.WrapPayloadDetails(in.details),
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
+	users := []user{
+		{"noperms", false, nil},
+		{"viewactivity", true, nil},
+		{"adminuser", true, nil},
+	}
+	for i, tc := range users {
+		pgURL := url.URL{
+			Scheme:   "postgres",
+			User:     url.User(tc.username),
+			Host:     s.ServingSQLAddr(),
+			RawQuery: "sslmode=disable",
+		}
+		db, err := gosql.Open("postgres", pgURL.String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		users[i].sqlRunner = sqlutils.MakeSQLRunner(db)
 
-			progress := &jobspb.Progress{
-				ModifiedMicros: in.modified.UnixNano() / time.Microsecond.Nanoseconds(),
-			}
-			if in.highWater != (hlc.Timestamp{}) {
-				progress.Progress = &jobspb.Progress_HighWater{
-					HighWater: &in.highWater,
-				}
-			} else {
-				progress.Progress = &jobspb.Progress_FractionCompleted{
-					FractionCompleted: in.fractionCompleted,
-				}
-			}
-			inProgress, err := protoutil.Marshal(progress)
-			if err != nil {
-				t.Fatal(err)
-			}
-			sqlDB.Exec(t,
-				`INSERT INTO system.jobs (id, status, created, payload, progress) VALUES ($1, $2, $3, $4, $5)`,
-				in.id, in.status, in.created, inPayload, inProgress,
-			)
+		// Ensure the session is open.
+		users[i].sqlRunner.Exec(t, `SELECT version()`)
+	}
 
-			var out row
-			var maybeFractionCompleted *float32
-			var decimalHighWater *apd.Decimal
-			sqlDB.QueryRow(t, `
-      SELECT job_id, job_type, status, created, description, started, finished, modified,
-             fraction_completed, high_water_timestamp, user_name, ifnull(error, ''), coordinator_id
-        FROM crdb_internal.jobs WHERE job_id = $1`, in.id).Scan(
-				&out.id, &out.typ, &out.status, &out.created, &out.description, &out.started,
-				&out.finished, &out.modified, &maybeFractionCompleted, &decimalHighWater, &out.username,
-				&out.err, &out.coordinatorID,
-			)
-
-			if decimalHighWater != nil {
-				var err error
-				out.highWater, err = tree.DecimalToHLC(decimalHighWater)
-				if err != nil {
+	for _, u := range users {
+		t.Run(u.username, func(t *testing.T) {
+			rows := u.sqlRunner.Query(t, `SELECT user_name FROM [SHOW CLUSTER SESSIONS]`)
+			defer rows.Close()
+			counts := map[string]int{}
+			for rows.Next() {
+				var userName string
+				if err := rows.Scan(&userName); err != nil {
 					t.Fatal(err)
 				}
+				counts[userName]++
 			}
-
-			if maybeFractionCompleted != nil {
-				out.fractionCompleted = *maybeFractionCompleted
+			if err := rows.Err(); err != nil {
+				t.Fatal(err)
 			}
-
-			// details field is not explicitly checked for equality; its value is
-			// confirmed via the job_type field, which is dependent on the details
-			// field.
-			out.details = in.details
-
-			if !reflect.DeepEqual(in, out) {
-				diff := strings.Join(pretty.Diff(in, out), "\n")
-				t.Fatalf("in job did not match out job:\n%s", diff)
+			for _, u2 := range users {
+				if u.canViewOtherSessions || u.username == u2.username {
+					if counts[u2.username] == 0 {
+						t.Fatalf(
+							"%s session is unable to see %s session: %+v", u.username, u2.username, counts)
+					}
+				} else if counts[u2.username] > 0 {
+					t.Fatalf(
+						"%s session should not be able to see %s session: %+v", u.username, u2.username, counts)
+				}
 			}
 		})
 	}
 }
 
-func TestShowJobsWithError(t *testing.T) {
+func TestLintClusterSettingNames(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
-	// Create at least 4 row, ensuring the last 3 rows are corrupted.
-	if _, err := sqlDB.Exec(`
-     -- Ensure there is at least one row in system.jobs.
-     CREATE TABLE foo(x INT); ALTER TABLE foo ADD COLUMN y INT;
-     -- Create a corrupted payload field from the first row.
-     INSERT INTO system.jobs(id, status, payload, progress) SELECT id+1, status, '\xaaaa'::BYTES, progress FROM system.jobs ORDER BY id LIMIT 1;
-     -- Create a corrupted progress field.
-     INSERT INTO system.jobs(id, status, payload, progress) SELECT id+2, status, payload, '\xaaaa'::BYTES FROM system.jobs ORDER BY id LIMIT 1;
-     -- Corrupt both fields.
-     INSERT INTO system.jobs(id, status, payload, progress) SELECT id+3, status, '\xaaaa'::BYTES, '\xaaaa'::BYTES FROM system.jobs ORDER BY id LIMIT 1;
-     -- Test what happens with a NULL progress field (which is a valid value).
-     INSERT INTO system.jobs(id, status, payload, progress) SELECT id+4, status, payload, NULL::BYTES FROM system.jobs ORDER BY id LIMIT 1;
-     INSERT INTO system.jobs(id, status, payload, progress) SELECT id+5, status, '\xaaaa'::BYTES, NULL::BYTES FROM system.jobs ORDER BY id LIMIT 1;
-	`); err != nil {
-		t.Fatal(err)
-	}
-
-	// Extract the last 4 rows from the query.
-	rows, err := sqlDB.Query(`
-  WITH a AS (SELECT job_id, description, fraction_completed, error FROM [SHOW JOBS] ORDER BY job_id DESC LIMIT 6)
-  SELECT ifnull(description, 'NULL'), ifnull(fraction_completed, -1)::string, ifnull(error,'NULL') FROM a ORDER BY job_id ASC`)
+	rows, err := sqlDB.Query(`SELECT variable, setting_type, description FROM [SHOW ALL CLUSTER SETTINGS]`)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer rows.Close()
 
-	var desc, frac, errStr string
+	for rows.Next() {
+		var varName, sType, desc string
+		if err := rows.Scan(&varName, &sType, &desc); err != nil {
+			t.Fatal(err)
+		}
 
-	// Valid row.
-	rowNum := 0
-	if !rows.Next() {
-		t.Fatalf("%d too few rows", rowNum)
-	}
-	if err := rows.Scan(&desc, &frac, &errStr); err != nil {
-		t.Fatalf("%d: %v", rowNum, err)
-	}
-	t.Logf("row %d: %q %q %v", rowNum, desc, errStr, frac)
-	if desc == "NULL" || errStr != "" || frac[0] == '-' {
-		t.Fatalf("%d: invalid row", rowNum)
-	}
-	rowNum++
+		if strings.ToLower(varName) != varName {
+			t.Errorf("%s: variable name must be all lowercase", varName)
+		}
 
-	// Corrupted payload but valid progress.
-	if !rows.Next() {
-		t.Fatalf("%d: too few rows", rowNum)
-	}
-	if err := rows.Scan(&desc, &frac, &errStr); err != nil {
-		t.Fatalf("%d: %v", rowNum, err)
-	}
-	t.Logf("row %d: %q %q %v", rowNum, desc, errStr, frac)
-	if desc != "NULL" || !strings.HasPrefix(errStr, "error decoding payload") || frac[0] == '-' {
-		t.Fatalf("%d: invalid row", rowNum)
-	}
-	rowNum++
+		suffixSuggestions := map[string]string{
+			"_ttl":     ".ttl",
+			"_enabled": ".enabled",
+			"_timeout": ".timeout",
+		}
 
-	// Corrupted progress but valid payload.
-	if !rows.Next() {
-		t.Fatalf("%d: too few rows", rowNum)
-	}
-	if err := rows.Scan(&desc, &frac, &errStr); err != nil {
-		t.Fatalf("%d: %v", rowNum, err)
-	}
-	t.Logf("row %d: %q %q %v", rowNum, desc, errStr, frac)
-	if desc == "NULL" || !strings.HasPrefix(errStr, "error decoding progress") || frac[0] != '-' {
-		t.Fatalf("%d: invalid row", rowNum)
-	}
-	rowNum++
+		nameErr := func() error {
+			segments := strings.Split(varName, ".")
+			for _, segment := range segments {
+				if strings.TrimSpace(segment) != segment {
+					return errors.Errorf("%s: part %q has heading or trailing whitespace", varName, segment)
+				}
+				tokens, ok := parser.Tokens(segment)
+				if !ok {
+					return errors.Errorf("%s: part %q does not scan properly", varName, segment)
+				}
+				if len(tokens) == 0 || len(tokens) > 1 {
+					return errors.Errorf("%s: part %q has invalid structure", varName, segment)
+				}
+				if tokens[0].TokenID != parser.IDENT {
+					cat, ok := lex.KeywordsCategories[tokens[0].Str]
+					if !ok {
+						return errors.Errorf("%s: part %q has invalid structure", varName, segment)
+					}
+					if cat == "R" {
+						return errors.Errorf("%s: part %q is a reserved keyword", varName, segment)
+					}
+				}
+			}
 
-	// Both payload and progress corrupted.
-	if !rows.Next() {
-		t.Fatalf("%d: too few rows", rowNum)
-	}
-	if err := rows.Scan(&desc, &frac, &errStr); err != nil {
-		t.Fatalf("%d: %v", rowNum, err)
-	}
-	t.Logf("row: %q %q %v", desc, errStr, frac)
-	if desc != "NULL" ||
-		!strings.Contains(errStr, "error decoding payload") ||
-		!strings.Contains(errStr, "error decoding progress") ||
-		frac[0] != '-' {
-		t.Fatalf("%d: invalid row", rowNum)
-	}
-	rowNum++
+			for suffix, repl := range suffixSuggestions {
+				if strings.HasSuffix(varName, suffix) {
+					return errors.Errorf("%s: use %q instead of %q", varName, repl, suffix)
+				}
+			}
 
-	// Valid payload and missing progress.
-	if !rows.Next() {
-		t.Fatalf("%d too few rows", rowNum)
-	}
-	if err := rows.Scan(&desc, &frac, &errStr); err != nil {
-		t.Fatalf("%d: %v", rowNum, err)
-	}
-	t.Logf("row %d: %q %q %v", rowNum, desc, errStr, frac)
-	if desc == "NULL" || errStr != "" || frac[0] != '-' {
-		t.Fatalf("%d: invalid row", rowNum)
-	}
-	rowNum++
+			if sType == "b" && !strings.HasSuffix(varName, ".enabled") {
+				return errors.Errorf("%s: use .enabled for booleans", varName)
+			}
 
-	// Invalid payload and missing progress.
-	if !rows.Next() {
-		t.Fatalf("%d too few rows", rowNum)
+			return nil
+		}()
+		if nameErr != nil {
+			var grandFathered = map[string]string{
+				"server.declined_reservation_timeout":                `server.declined_reservation_timeout: use ".timeout" instead of "_timeout"`,
+				"server.failed_reservation_timeout":                  `server.failed_reservation_timeout: use ".timeout" instead of "_timeout"`,
+				"server.web_session_timeout":                         `server.web_session_timeout: use ".timeout" instead of "_timeout"`,
+				"sql.distsql.flow_stream_timeout":                    `sql.distsql.flow_stream_timeout: use ".timeout" instead of "_timeout"`,
+				"debug.panic_on_failed_assertions":                   `debug.panic_on_failed_assertions: use .enabled for booleans`,
+				"diagnostics.reporting.send_crash_reports":           `diagnostics.reporting.send_crash_reports: use .enabled for booleans`,
+				"kv.closed_timestamp.follower_reads_enabled":         `kv.closed_timestamp.follower_reads_enabled: use ".enabled" instead of "_enabled"`,
+				"kv.raft_log.disable_synchronization_unsafe":         `kv.raft_log.disable_synchronization_unsafe: use .enabled for booleans`,
+				"kv.range_merge.queue_enabled":                       `kv.range_merge.queue_enabled: use ".enabled" instead of "_enabled"`,
+				"kv.range_split.by_load_enabled":                     `kv.range_split.by_load_enabled: use ".enabled" instead of "_enabled"`,
+				"kv.transaction.parallel_commits_enabled":            `kv.transaction.parallel_commits_enabled: use ".enabled" instead of "_enabled"`,
+				"kv.transaction.write_pipelining_enabled":            `kv.transaction.write_pipelining_enabled: use ".enabled" instead of "_enabled"`,
+				"server.clock.forward_jump_check_enabled":            `server.clock.forward_jump_check_enabled: use ".enabled" instead of "_enabled"`,
+				"sql.defaults.experimental_optimizer_mutations":      `sql.defaults.experimental_optimizer_mutations: use .enabled for booleans`,
+				"sql.distsql.distribute_index_joins":                 `sql.distsql.distribute_index_joins: use .enabled for booleans`,
+				"sql.metrics.statement_details.dump_to_logs":         `sql.metrics.statement_details.dump_to_logs: use .enabled for booleans`,
+				"sql.metrics.statement_details.sample_logical_plans": `sql.metrics.statement_details.sample_logical_plans: use .enabled for booleans`,
+				"sql.trace.log_statement_execute":                    `sql.trace.log_statement_execute: use .enabled for booleans`,
+				"trace.debug.enable":                                 `trace.debug.enable: use .enabled for booleans`,
+				"cloudstorage.gs.default.key":                        `cloudstorage.gs.default.key: part "default" is a reserved keyword`,
+				// These two settings have been deprecated in favor of a new (better named) setting
+				// but the old name is still around to support migrations.
+				// TODO(knz): remove these cases when these settings are retired.
+				"timeseries.storage.10s_resolution_ttl": `timeseries.storage.10s_resolution_ttl: part "10s_resolution_ttl" has invalid structure`,
+				"timeseries.storage.30m_resolution_ttl": `timeseries.storage.30m_resolution_ttl: part "30m_resolution_ttl" has invalid structure`,
+
+				// sql.defaults.idle_in_session_timeout uses the _timeout suffix stay
+				// consistent with the corresponding session variable
+				// idle_in_session_timeout.
+				"sql.defaults.idle_in_session_timeout": `sql.defaults.idle_in_session_timeout: use ".timeout" instead of "_timeout"`,
+			}
+			expectedErr, found := grandFathered[varName]
+			if !found || expectedErr != nameErr.Error() {
+				t.Error(nameErr)
+			}
+		}
+
+		if strings.TrimSpace(desc) != desc {
+			t.Errorf("%s: description %q has heading or trailing whitespace", varName, desc)
+		}
+
+		if len(desc) == 0 {
+			t.Errorf("%s: description is empty", varName)
+		}
+
+		if len(desc) > 0 {
+			if strings.ToLower(desc[0:1]) != desc[0:1] {
+				t.Errorf("%s: description %q must not start with capital", varName, desc)
+			}
+			if sType != "e" && strings.Contains(desc, ". ") != (desc[len(desc)-1] == '.') {
+				// TODO(knz): this check doesn't work with the way enum values are added to their descriptions.
+				t.Errorf("%s: description %q must end with period if and only if it contains a secondary sentence", varName, desc)
+			}
+		}
 	}
-	if err := rows.Scan(&desc, &frac, &errStr); err != nil {
-		t.Fatalf("%d: %v", rowNum, err)
-	}
-	t.Logf("row %d: %q %q %v", rowNum, desc, errStr, frac)
-	if desc != "NULL" ||
-		!strings.Contains(errStr, "error decoding payload") ||
-		strings.Contains(errStr, "error decoding progress") ||
-		frac[0] != '-' {
-		t.Fatalf("%d: invalid row", rowNum)
-	}
-	rowNum++
+
+}
+
+// TestCancelQueriesRace can be stressed to try and reproduce a race
+// between SHOW QUERIES and currently executing statements. For
+// more details, see #28033.
+func TestCancelQueriesRace(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.Background())
+
+	waiter := make(chan struct{})
+	go func() {
+		_, _ = sqlDB.ExecContext(ctx, `SELECT pg_sleep(10)`)
+		close(waiter)
+	}()
+	_, _ = sqlDB.ExecContext(ctx, `CANCEL QUERIES (
+		SELECT query_id FROM [SHOW QUERIES] WHERE query LIKE 'SELECT pg_sleep%'
+	)`)
+	_, _ = sqlDB.ExecContext(ctx, `CANCEL QUERIES (
+		SELECT query_id FROM [SHOW QUERIES] WHERE query LIKE 'SELECT pg_sleep%'
+	)`)
+
+	cancel()
+	<-waiter
 }

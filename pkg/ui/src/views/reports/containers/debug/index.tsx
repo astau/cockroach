@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 import _ from "lodash";
 import React from "react";
@@ -59,7 +55,7 @@ function DebugTableRow(props: { title: string, children?: React.ReactNode }) {
 function DebugTable(props: { heading: string, children?: React.ReactNode }) {
   return (
     <div>
-      <h2>{props.heading}</h2>
+      <h2 className="base-heading">{props.heading}</h2>
       <table className="debug-table">
         <tbody>
           {props.children}
@@ -86,10 +82,8 @@ function DebugPanelLink(props: { name: string, url: string,  note: string }) {
 export default function Debug() {
   return (
     <div className="section">
-      <Helmet>
-        <title>Debug</title>
-      </Helmet>
-      <h1>Advanced Debugging</h1>
+      <Helmet title="Debug" />
+      <h1 className="base-heading">Advanced Debugging</h1>
       <div className="debug-header">
         <InfoBox>
           <p>
@@ -118,14 +112,14 @@ export default function Debug() {
           note="View ranges in your cluster that are unavailable, underreplicated, slow, or have other problems."
         />
         <DebugPanelLink
-          name="Network Latency"
-          url="#/reports/network"
-          note="Check latencies between all nodes in your cluster."
-        />
-        <DebugPanelLink
           name="Data Distribution and Zone Configs"
           url="#/data-distribution"
           note="View the distribution of table data across nodes and verify zone configuration."
+        />
+        <DebugPanelLink
+          name="Statement Diagnostics History"
+          url="#/reports/statements/diagnosticshistory"
+          note="View the history of statement diagnostics requests"
         />
         <PanelTitle>Configuration</PanelTitle>
         <DebugPanelLink
@@ -152,6 +146,11 @@ export default function Debug() {
             url="#/reports/nodes?locality=region=us-east"
             note="#/reports/nodes?locality=[regex]"
           />
+          <DebugTableLink
+            name="Decommissioned node history"
+            url="#/reports/nodes/history"
+            note="#/reports/nodes/history"
+          />
         </DebugTableRow>
         <DebugTableRow title="Stores">
           <DebugTableLink name="Stores on this node" url="#/reports/stores/local" />
@@ -159,18 +158,6 @@ export default function Debug() {
             name="Stores on a specific node"
             url="#/reports/stores/1"
             note="#/reports/stores/[node_id]"
-          />
-        </DebugTableRow>
-        <DebugTableRow title="Network">
-          <DebugTableLink
-            name="Latency filtered by node IDs"
-            url="#/reports/network?node_ids=1,2"
-            note="#/reports/network?node_ids=[node_id{,node_id...}]"
-          />
-          <DebugTableLink
-            name="Latency filtered by locality (regex)"
-            url="#/reports/network?locality=region=us-east"
-            note="#/reports/network?locality=[regex]"
           />
         </DebugTableRow>
         <DebugTableRow title="Security">
@@ -218,22 +205,24 @@ export default function Debug() {
         <DebugTableRow title="Stopper">
           <DebugTableLink name="Active Tasks" url="/debug/stopper" />
         </DebugTableRow>
-        <DebugTableRow title="Profiling UI">
+        <DebugTableRow title="Profiling UI/pprof">
           <DebugTableLink name="Heap" url="/debug/pprof/ui/heap/" />
-          <DebugTableLink name="Profile" url="/debug/pprof/ui/profile/" />
+          <DebugTableLink name="Profile" url="/debug/pprof/ui/profile/?seconds=5&amp;labels=true" />
           <DebugTableLink name="Block" url="/debug/pprof/ui/block/" />
           <DebugTableLink name="Mutex" url="/debug/pprof/ui/mutex/" />
           <DebugTableLink name="Thread Create" url="/debug/pprof/ui/threadcreate/" />
           <DebugTableLink name="Goroutines" url="/debug/pprof/ui/goroutine/" />
         </DebugTableRow>
-        <DebugTableRow title="Profiling Raw">
-          <DebugTableLink name="Heap" url="/debug/pprof/heap?debug=1" />
-          <DebugTableLink name="Profile" url="/debug/pprof/profile?debug=1" />
-          <DebugTableLink name="Block" url="/debug/pprof/block?debug=1" />
-          <DebugTableLink name="Mutex" url="/debug/pprof/mutex?debug=1" />
-          <DebugTableLink name="Thread Create" url="/debug/pprof/threadcreate?debug=1" />
-          <DebugTableLink name="Goroutines" url="/debug/pprof/goroutine?debug=1" />
-          <DebugTableLink name="All Goroutines" url="/debug/pprof/goroutine?debug=2" />
+        <DebugTableRow title="Goroutines">
+          <DebugTableLink name="UI" url="/debug/pprof/goroutineui" />
+          <DebugTableLink name="UI (count)" url="/debug/pprof/goroutineui?sort=count" />
+          <DebugTableLink name="UI (wait)" url="/debug/pprof/goroutineui?sort=wait" />
+          <DebugTableLink name="Raw" url="/debug/pprof/goroutine?debug=2" />
+        </DebugTableRow>
+        <DebugTableRow title="Threads">
+          <DebugTableLink name="Raw" url="/debug/threads" />
+        </DebugTableRow>
+        <DebugTableRow title="Runtime Trace">
           <DebugTableLink name="Trace" url="/debug/pprof/trace?debug=1" />
         </DebugTableRow>
       </DebugTable>
@@ -303,6 +292,11 @@ export default function Debug() {
             name="Stacks"
             url="/_status/stacks/local"
             note="/_status/stacks/[node_id]"
+          />
+          <DebugTableLink
+            name="Engine Stats"
+            url="/_status/enginestats/local"
+            note="/_status/enginestats/[node_id]"
           />
           <DebugTableLink
             name="Certificates"

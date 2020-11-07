@@ -1,9 +1,14 @@
-# LogicTest: local-opt
+# LogicTest: local
 
 #
 # Tests that verify DistSQL support and auto mode determination.
 # The cluster size or distsql mode aren't important for these tests.
 #
+
+# "local" logic test configuration overrides the DistSQL mode to 'off', but
+# we're interested in behavior with 'auto' in this test file.
+statement ok
+SET distsql=auto
 
 statement ok
 CREATE TABLE kv (k INT PRIMARY KEY, v INT)
@@ -13,7 +18,7 @@ query BT colnames
 EXPLAIN (DISTSQL) SELECT 1
 ----
 automatic  url
-false      https://cockroachdb.github.io/distsqlplan/decode.html#eJyMj7GKwzAQRPv7CjO14ORWf-DmLqQNKoS0GIOiNVopBIz-PVgq0rqcNzM77IHEgf7ckwTmgRlWYc_sSYTziUZgCW8YrbClvZYTWwXPmWAOlK1EgkFk7-L0crGSTPpXQyFQcVvs-abAtXzbUtxKMHNT1xfuJDsnoUuXdbMKFFYaXwjX7OmW2feZIf97r4NAUoY7D7GkYTXbfj4BAAD__xM4YY8=
+false      https://cockroachdb.github.io/distsqlplan/decode.html#eJyMj0FLxDAUhO_-ijAnhYDtNTfRHgplXe0eBOkhJI-lEPtqXipCyX-XTQ5ee5xvZt7wdsh3gEH3cR6e-pO6f-nHy_g2PKixG7rni2qhsbCnk_0igflEi0ljjexIhOMN7SXQ-1-YRmNe1i3d8KThOBLMjjSnQDAI7GxQPzZsJKp5bKDhKdk5lHzW4C39tyXZK8G0WR9feCdZeRE6dLnJkwb5K9UvhLfo6BzZlZkqX0uvAE-SqttW0S_VylO--wsAAP__NiFqpA==
 
 # Check the JSON column is still there, albeit hidden.
 query T colnames
@@ -39,11 +44,11 @@ SELECT automatic FROM [EXPLAIN (DISTSQL) SELECT * FROM kv WHERE k>1]
 ----
 false
 
-# Partial scan with filter - distribute.
+# Partial scan with filter - don't distribute.
 query B
 SELECT automatic FROM [EXPLAIN (DISTSQL) SELECT * FROM kv WHERE k>1 AND v=1]
 ----
-true
+false
 
 # Sort - distribute.
 query B
@@ -64,10 +69,11 @@ SELECT automatic FROM [EXPLAIN (DISTSQL) SELECT * FROM kv LIMIT 1]
 true
 
 # Soft limit in scan - don't distribute.
+# TODO(yuzefovich): soft limits are currently ignored in scans.
 query B
 SELECT automatic FROM [EXPLAIN (DISTSQL) SELECT * FROM kv UNION SELECT * FROM kv LIMIT 1]
 ----
-false
+true
 
 # Limit after sort - distribute.
 query B
@@ -111,8 +117,8 @@ SELECT automatic FROM [EXPLAIN (DISTSQL) SELECT * FROM abc WHERE b=1 AND c%2=0]
 ----
 false
 
-# Index join with filter on index scan - distribute.
+# Index join with filter on index scan - don't distribute.
 query B
 SELECT automatic FROM [EXPLAIN (DISTSQL) SELECT * FROM abc WHERE b=1 AND a%2=0]
 ----
-true
+false

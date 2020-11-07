@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package log
 
@@ -20,9 +16,8 @@ import (
 	"regexp"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/util/log/logtags"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	opentracing "github.com/opentracing/opentracing-go"
+	"github.com/cockroachdb/logtags"
 	"golang.org/x/net/trace"
 )
 
@@ -59,25 +54,20 @@ func compareTraces(expected, actual events) bool {
 
 // noLogV returns a verbosity level that will not result in VEvents and
 // VErrEvents being logged.
-func noLogV() int32 {
-	return int32(logging.verbosity.get() + 1)
+func noLogV() Level {
+	return logging.vmoduleConfig.verbosity.get() + 1
 }
 
 func TestTrace(t *testing.T) {
 	ctx := context.Background()
 
-	// The test below merely cares about observing events in traces.
-	// Do not pollute the test's stderr with them.
-	logging.stderrThreshold = Severity_FATAL
-
 	// Events to context without a trace should be no-ops.
 	Event(ctx, "should-not-show-up")
 
 	tracer := tracing.NewTracer()
-	tracer.SetForceRealSpans(true)
-	sp := tracer.StartSpan("s")
-	tracing.StartRecording(sp, tracing.SingleNodeRecording)
-	ctxWithSpan := opentracing.ContextWithSpan(ctx, sp)
+	sp := tracer.StartSpan("s", tracing.WithForceRealSpan())
+	sp.StartRecording(tracing.SingleNodeRecording)
+	ctxWithSpan := tracing.ContextWithSpan(ctx, sp)
 	Event(ctxWithSpan, "test1")
 	VEvent(ctxWithSpan, noLogV(), "test2")
 	VErrEvent(ctxWithSpan, noLogV(), "testerr")
@@ -88,8 +78,8 @@ func TestTrace(t *testing.T) {
 
 	sp.Finish()
 
-	if err := tracing.TestingCheckRecordedSpans(tracing.GetRecording(sp), `
-		span s:
+	if err := tracing.TestingCheckRecordedSpans(sp.GetRecording(), `
+		Span s:
 		  event: test1
 		  event: test2
 		  event: testerr
@@ -104,10 +94,9 @@ func TestTraceWithTags(t *testing.T) {
 	ctx = logtags.AddTag(ctx, "tag", 1)
 
 	tracer := tracing.NewTracer()
-	tracer.SetForceRealSpans(true)
-	sp := tracer.StartSpan("s")
-	ctxWithSpan := opentracing.ContextWithSpan(ctx, sp)
-	tracing.StartRecording(sp, tracing.SingleNodeRecording)
+	sp := tracer.StartSpan("s", tracing.WithForceRealSpan())
+	ctxWithSpan := tracing.ContextWithSpan(ctx, sp)
+	sp.StartRecording(tracing.SingleNodeRecording)
 
 	Event(ctxWithSpan, "test1")
 	VEvent(ctxWithSpan, noLogV(), "test2")
@@ -115,8 +104,8 @@ func TestTraceWithTags(t *testing.T) {
 	Info(ctxWithSpan, "log")
 
 	sp.Finish()
-	if err := tracing.TestingCheckRecordedSpans(tracing.GetRecording(sp), `
-		span s:
+	if err := tracing.TestingCheckRecordedSpans(sp.GetRecording(), `
+		Span s:
 		  event: [tag=1] test1
 		  event: [tag=1] test2
 		  event: [tag=1] testerr
@@ -191,10 +180,9 @@ func TestEventLogAndTrace(t *testing.T) {
 	VErrEvent(ctxWithEventLog, noLogV(), "testerr")
 
 	tracer := tracing.NewTracer()
-	tracer.SetForceRealSpans(true)
-	sp := tracer.StartSpan("s")
-	tracing.StartRecording(sp, tracing.SingleNodeRecording)
-	ctxWithBoth := opentracing.ContextWithSpan(ctxWithEventLog, sp)
+	sp := tracer.StartSpan("s", tracing.WithForceRealSpan())
+	sp.StartRecording(tracing.SingleNodeRecording)
+	ctxWithBoth := tracing.ContextWithSpan(ctxWithEventLog, sp)
 	// Events should only go to the trace.
 	Event(ctxWithBoth, "test3")
 	VEventf(ctxWithBoth, noLogV(), "test4")
@@ -206,8 +194,8 @@ func TestEventLogAndTrace(t *testing.T) {
 	sp.Finish()
 	el.Finish()
 
-	if err := tracing.TestingCheckRecordedSpans(tracing.GetRecording(sp), `
-		span s:
+	if err := tracing.TestingCheckRecordedSpans(sp.GetRecording(), `
+		Span s:
 		  event: test3
 		  event: test4
 		  event: test5err
@@ -215,8 +203,13 @@ func TestEventLogAndTrace(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	elExpected := "[test1 test2 testerr(err) test6 finish]"
-	if evStr := fmt.Sprint(el.ev); evStr != elExpected {
+	elExpected := regexp.MustCompile(`^\[` +
+		`util/log/trace_test\.go:\d+ test1 ` +
+		`util/log/trace_test\.go:\d+ test2 ` +
+		`util/log/trace_test\.go:\d+ testerr\(err\) ` +
+		`util/log/trace_test\.go:\d+ test6 ` +
+		`finish\]$`)
+	if evStr := fmt.Sprint(el.ev); !elExpected.MatchString(evStr) {
 		t.Errorf("expected events '%s', got '%s'", elExpected, evStr)
 	}
 }

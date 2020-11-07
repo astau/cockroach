@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package encoding
 
@@ -21,7 +17,7 @@ import (
 	"math/rand"
 	"testing"
 
-	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 )
 
@@ -473,6 +469,46 @@ func TestNonsortingEncodeDecimalRoundtrip(t *testing.T) {
 				t.Fatalf("expected %s, got %s", expect, s)
 			}
 		})
+	}
+}
+
+func TestDecodeMultipleDecimalsIntoNonsortingDecimal(t *testing.T) {
+	tcs := []struct {
+		value []string
+	}{
+		{
+			[]string{"1.0", "5.0", "7.0"},
+		},
+		{
+			[]string{"1.0", "-1.0", "0.0"},
+		},
+		{
+			[]string{"1.0", "-1.0", "10.0"},
+		},
+		{
+			[]string{"nan", "1.0", "-1.0"},
+		},
+		{
+			[]string{"-1.0", "inf", "5.0"},
+		},
+	}
+
+	for _, tc := range tcs {
+		var actual apd.Decimal
+		for _, num := range tc.value {
+			expected, _, err := apd.NewFromString(num)
+			if err != nil {
+				t.Fatal(err)
+			}
+			enc := EncodeNonsortingDecimal(nil, expected)
+			err = DecodeIntoNonsortingDecimal(&actual, enc, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if actual.Cmp(expected) != 0 {
+				t.Errorf("unexpected mismatch for %v, got %v", expected, &actual)
+			}
+		}
 	}
 }
 

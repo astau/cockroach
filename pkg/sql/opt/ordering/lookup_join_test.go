@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package ordering
 
@@ -27,7 +23,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/testcat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/testexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/util"
 )
 
 func TestLookupJoinProvided(t *testing.T) {
@@ -39,16 +34,17 @@ func TestLookupJoinProvided(t *testing.T) {
 	}
 	evalCtx := tree.NewTestingEvalContext(nil /* st */)
 	var f norm.Factory
-	f.Init(evalCtx)
+	f.Init(evalCtx, tc)
 	md := f.Metadata()
-	tab := md.AddTable(tc.Table(tree.NewUnqualifiedTableName("t")))
+	tn := tree.NewUnqualifiedTableName("t")
+	tab := md.AddTable(tc.Table(tn), tn)
 
 	if c1 := tab.ColumnID(0); c1 != 1 {
 		t.Fatalf("unexpected ID for column c1: %d\n", c1)
 	}
 
-	c := func(cols ...int) opt.ColSet {
-		return util.MakeFastIntSet(cols...)
+	c := func(cols ...opt.ColumnID) opt.ColSet {
+		return opt.MakeColSet(cols...)
 	}
 
 	testCases := []struct {
@@ -100,17 +96,18 @@ func TestLookupJoinProvided(t *testing.T) {
 			input := &testexpr.Instance{
 				Rel: &props.Relational{},
 				Provided: &physical.Provided{
-					Ordering: parseOrdering(tc.input),
+					Ordering: physical.ParseOrdering(tc.input),
 				},
 			}
 			lookupJoin := f.Memo().MemoizeLookupJoin(
 				input,
 				nil, /* FiltersExpr */
 				&memo.LookupJoinPrivate{
-					Table:   tab,
-					Index:   cat.PrimaryIndex,
-					KeyCols: tc.keyCols,
-					Cols:    tc.outCols,
+					JoinType: opt.InnerJoinOp,
+					Table:    tab,
+					Index:    cat.PrimaryIndex,
+					KeyCols:  tc.keyCols,
+					Cols:     tc.outCols,
 				},
 			)
 			req := physical.ParseOrderingChoice(tc.required)

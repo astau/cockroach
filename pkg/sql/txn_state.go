@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -18,21 +14,19 @@ import (
 	"context"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/log/logtags"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	opentracing "github.com/opentracing/opentracing-go"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // txnState contains state associated with an ongoing SQL txn; it constitutes
@@ -53,7 +47,14 @@ type txnState struct {
 	mu struct {
 		syncutil.RWMutex
 
-		txn *client.Txn
+		txn *kv.Txn
+
+		// txnStart records the time that txn started.
+		txnStart time.Time
+
+		// stmtCount keeps track of the number of statements that the transaction
+		// has executed.
+		stmtCount int
 	}
 
 	// connCtx is the connection's context. This is the parent of Ctx.
@@ -65,7 +66,7 @@ type txnState struct {
 
 	// sp is the span corresponding to the SQL txn. These are often root spans, as
 	// SQL txns are frequently the level at which we do tracing.
-	sp opentracing.Span
+	sp *tracing.Span
 	// recordingThreshold, is not zero, indicates that sp is recording and that
 	// the recording should be dumped to the log if execution of the transaction
 	// took more than this.
@@ -87,12 +88,13 @@ type txnState struct {
 	// The transaction's read only state.
 	readOnly bool
 
+	// Set to true when the current transaction is using a historical timestamp
+	// through the use of AS OF SYSTEM TIME.
+	isHistorical bool
+
 	// mon tracks txn-bound objects like the running state of
 	// planNode in the midst of performing a computation.
 	mon *mon.BytesMonitor
-
-	// The schema change closures to run when this txn is done.
-	schemaChangers schemaChangerCollection
 
 	// adv is overwritten after every transition. It represents instructions for
 	// for moving the cursor over the stream of input statements to the next
@@ -104,10 +106,6 @@ type txnState struct {
 	// txnAbortCount is incremented whenever the state transitions to
 	// stateAborted.
 	txnAbortCount *metric.Counter
-
-	// activeSavepointName stores the name of the active savepoint,
-	// or is empty if no savepoint is active.
-	activeSavepointName tree.Name
 }
 
 // txnType represents the type of a SQL transaction.
@@ -131,47 +129,51 @@ const (
 // 	 used for everything that happens within this SQL transaction.
 // txnType: The type of the starting txn.
 // sqlTimestamp: The timestamp to report for current_timestamp(), now() etc.
-// priority: The transaction's priority.
+// historicalTimestamp: If non-nil indicates that the transaction is historical
+//   and should be fixed to this timestamp.
+// priority: The transaction's priority. Pass roachpb.UnspecifiedUserPriority if the txn arg is
+//   not nil.
 // readOnly: The read-only character of the new txn.
 // txn: If not nil, this txn will be used instead of creating a new txn. If so,
-//      all the other arguments need to correspond to the attributes of this txn.
+//   all the other arguments need to correspond to the attributes of this txn
+//   (unless otherwise specified).
 // tranCtx: A bag of extra execution context.
 func (ts *txnState) resetForNewSQLTxn(
 	connCtx context.Context,
 	txnType txnType,
 	sqlTimestamp time.Time,
+	historicalTimestamp *hlc.Timestamp,
 	priority roachpb.UserPriority,
 	readOnly tree.ReadWriteMode,
-	txn *client.Txn,
+	txn *kv.Txn,
 	tranCtx transitionCtx,
 ) {
 	// Reset state vars to defaults.
 	ts.sqlTimestamp = sqlTimestamp
+	ts.isHistorical = false
 
 	// Create a context for this transaction. It will include a root span that
 	// will contain everything executed as part of the upcoming SQL txn, including
 	// (automatic or user-directed) retries. The span is closed by finishSQLTxn().
 	// TODO(andrei): figure out how to close these spans on server shutdown? Ties
 	// into a larger discussion about how to drain SQL and rollback open txns.
-	var sp opentracing.Span
+	var sp *tracing.Span
 	opName := sqlTxnName
 
-	// Create a span for the new txn. The span is always Recordable to support the
+	// Create a span for the new txn. The span is always WithForceRealSpan to support the
 	// use of session tracing, which may start recording on it.
-	// TODO(andrei): We should use tracing.EnsureChildSpan() as that's much more
-	// efficient that StartSpan (and also it'd be simpler), but that interface
-	// doesn't current support the Recordable option.
-	if parentSp := opentracing.SpanFromContext(connCtx); parentSp != nil {
+	if parentSp := tracing.SpanFromContext(connCtx); parentSp != nil {
 		// Create a child span for this SQL txn.
 		sp = parentSp.Tracer().StartSpan(
 			opName,
-			opentracing.ChildOf(parentSp.Context()), tracing.Recordable,
-			tracing.LogTagsFromCtx(connCtx),
+			tracing.WithParent(parentSp),
+			tracing.WithCtxLogTags(connCtx),
+			tracing.WithForceRealSpan(),
 		)
 	} else {
 		// Create a root span for this SQL txn.
-		sp = tranCtx.tracer.(*tracing.Tracer).StartRootSpan(
-			opName, logtags.FromContext(connCtx), tracing.RecordableSpan)
+		sp = tranCtx.tracer.StartSpan(
+			opName, tracing.WithCtxLogTags(connCtx), tracing.WithForceRealSpan())
 	}
 
 	if txnType == implicitTxn {
@@ -181,41 +183,40 @@ func (ts *txnState) resetForNewSQLTxn(
 	alreadyRecording := tranCtx.sessionTracing.Enabled()
 	duration := traceTxnThreshold.Get(&tranCtx.settings.SV)
 	if !alreadyRecording && (duration > 0) {
-		tracing.StartRecording(sp, tracing.SnowballRecording)
+		sp.StartRecording(tracing.SnowballRecording)
 		ts.recordingThreshold = duration
 		ts.recordingStart = timeutil.Now()
 	}
 
 	// Put the new span in the context.
-	txnCtx := opentracing.ContextWithSpan(connCtx, sp)
-
-	if !tracing.IsRecordable(sp) {
-		log.Fatalf(connCtx, "non-recordable transaction span of type: %T", sp)
-	}
+	txnCtx := tracing.ContextWithSpan(connCtx, sp)
 
 	ts.sp = sp
 	ts.Ctx, ts.cancel = contextutil.WithCancel(txnCtx)
 
 	ts.mon.Start(ts.Ctx, tranCtx.connMon, mon.BoundAccount{} /* reserved */)
-
 	ts.mu.Lock()
+	ts.mu.stmtCount = 0
 	if txn == nil {
-		ts.mu.txn = client.NewTxn(ts.Ctx, tranCtx.db, tranCtx.nodeID, client.RootTxn)
+		ts.mu.txn = kv.NewTxnWithSteppingEnabled(ts.Ctx, tranCtx.db, tranCtx.nodeIDOrZero)
 		ts.mu.txn.SetDebugName(opName)
+		if err := ts.setPriorityLocked(priority); err != nil {
+			panic(err)
+		}
 	} else {
+		if priority != roachpb.UnspecifiedUserPriority {
+			panic(errors.AssertionFailedf("unexpected priority when using an existing txn: %s", priority))
+		}
 		ts.mu.txn = txn
 	}
+	ts.mu.txnStart = timeutil.Now()
 	ts.mu.Unlock()
-
-	if err := ts.setPriority(priority); err != nil {
-		panic(err)
+	if historicalTimestamp != nil {
+		ts.setHistoricalTimestamp(ts.Ctx, *historicalTimestamp)
 	}
 	if err := ts.setReadOnlyMode(readOnly); err != nil {
 		panic(err)
 	}
-
-	// Discard the old schemaChangers, if any.
-	ts.schemaChangers = schemaChangerCollection{}
 }
 
 // finishSQLTxn finalizes a transaction's results and closes the root span for
@@ -228,20 +229,20 @@ func (ts *txnState) finishSQLTxn() {
 		ts.cancel = nil
 	}
 	if ts.sp == nil {
-		panic("No span in context? Was resetForNewSQLTxn() called previously?")
+		panic(errors.AssertionFailedf("No span in context? Was resetForNewSQLTxn() called previously?"))
 	}
 
 	if ts.recordingThreshold > 0 {
-		if r := tracing.GetRecording(ts.sp); r != nil {
+		if r := ts.sp.GetRecording(); r != nil {
 			if elapsed := timeutil.Since(ts.recordingStart); elapsed >= ts.recordingThreshold {
-				dump := tracing.FormatRecordedSpans(r)
+				dump := r.String()
 				if len(dump) > 0 {
 					log.Infof(ts.Ctx, "SQL txn took %s, exceeding tracing threshold of %s:\n%s",
 						elapsed, ts.recordingThreshold, dump)
 				}
 			}
 		} else {
-			log.Warning(ts.Ctx, "Missing trace when sampled was enabled.")
+			log.Warning(ts.Ctx, "missing trace when sampled was enabled")
 		}
 	}
 
@@ -250,6 +251,7 @@ func (ts *txnState) finishSQLTxn() {
 	ts.Ctx = nil
 	ts.mu.Lock()
 	ts.mu.txn = nil
+	ts.mu.txnStart = time.Time{}
 	ts.mu.Unlock()
 	ts.recordingThreshold = 0
 }
@@ -278,11 +280,28 @@ func (ts *txnState) finishExternalTxn() {
 	ts.mu.Unlock()
 }
 
+func (ts *txnState) setHistoricalTimestamp(ctx context.Context, historicalTimestamp hlc.Timestamp) {
+	ts.mu.Lock()
+	ts.mu.txn.SetFixedTimestamp(ctx, historicalTimestamp)
+	ts.mu.Unlock()
+	ts.isHistorical = true
+}
+
+// getReadTimestamp returns the transaction's current read timestamp.
+func (ts *txnState) getReadTimestamp() hlc.Timestamp {
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+	return ts.mu.txn.ReadTimestamp()
+}
+
 func (ts *txnState) setPriority(userPriority roachpb.UserPriority) error {
 	ts.mu.Lock()
-	err := ts.mu.txn.SetUserPriority(userPriority)
-	ts.mu.Unlock()
-	if err != nil {
+	defer ts.mu.Unlock()
+	return ts.setPriorityLocked(userPriority)
+}
+
+func (ts *txnState) setPriorityLocked(userPriority roachpb.UserPriority) error {
+	if err := ts.mu.txn.SetUserPriority(userPriority); err != nil {
 		return err
 	}
 	ts.priority = userPriority
@@ -296,9 +315,12 @@ func (ts *txnState) setReadOnlyMode(mode tree.ReadWriteMode) error {
 	case tree.ReadOnly:
 		ts.readOnly = true
 	case tree.ReadWrite:
+		if ts.isHistorical {
+			return tree.ErrAsOfSpecifiedWithReadWrite
+		}
 		ts.readOnly = false
 	default:
-		return errors.Errorf("unknown read mode: %s", mode)
+		return errors.AssertionFailedf("unknown read mode: %s", errors.Safe(mode))
 	}
 	return nil
 }
@@ -338,6 +360,7 @@ const (
 	noEvent txnEvent = iota
 
 	// txnStart means that the statement that just ran started a new transaction.
+	// Note that when a transaction is restarted, txnStart event is not emitted.
 	txnStart
 	// txnCommit means that the transaction has committed (successfully). This
 	// doesn't mean that the SQL txn is necessarily "finished" - this event can be
@@ -346,16 +369,15 @@ const (
 	// This event is produced both when entering the CommitWait state and also
 	// when leaving it.
 	txnCommit
-	// txnAborted means that the transaction will not commit. This doesn't mean
-	// that the SQL txn is necessarily "finished" - the connection might be in the
-	// Aborted state.
-	// This event is produced both when entering the Aborted state sometimes when
-	// leaving it.
-	txnAborted
-	// txnRestart means that the transaction is expecting a retry. The iteration
-	// of the txn just finished will not commit.
-	// This event is produced both when entering the RetryWait state and sometimes
-	// when exiting it.
+	// txnRollback means that the SQL transaction has been rolled back (completely
+	// rolled back, not to a savepoint). It is generated when an implicit
+	// transaction fails and when an explicit transaction runs a ROLLBACK.
+	txnRollback
+	// txnRestart means that the transaction is restarting. The iteration of the
+	// txn just finished will not commit. It is generated when we're about to
+	// auto-retry a txn and after a rollback to a savepoint placed at the start of
+	// the transaction. This allows such savepoints to reset more state than other
+	// savepoints.
 	txnRestart
 )
 
@@ -382,15 +404,15 @@ type advanceInfo struct {
 
 // transitionCtx is a bag of fields needed by some state machine events.
 type transitionCtx struct {
-	db     *client.DB
-	nodeID roachpb.NodeID
-	clock  *hlc.Clock
+	db           *kv.DB
+	nodeIDOrZero roachpb.NodeID // zero on SQL tenant servers, see #48008
+	clock        *hlc.Clock
 	// connMon is the connExecutor's monitor. New transactions will create a child
 	// monitor tracking txn-scoped objects.
 	connMon *mon.BytesMonitor
 	// The Tracer used to create root spans for new txns if the parent ctx doesn't
 	// have a span.
-	tracer opentracing.Tracer
+	tracer *tracing.Tracer
 	// sessionTracing provides access to the session's tracing interface. The
 	// state machine needs to see if session tracing is enabled.
 	sessionTracing *SessionTracing

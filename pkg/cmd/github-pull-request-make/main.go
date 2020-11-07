@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 // This utility detects new tests added in a given pull request, and runs them
 // under stress in our CI infrastructure.
@@ -39,6 +35,7 @@ import (
 	"strings"
 	"time"
 
+	_ "github.com/cockroachdb/cockroach/pkg/testutils/buildutil"
 	"github.com/google/go-github/github"
 	"golang.org/x/oauth2"
 )
@@ -77,9 +74,9 @@ func pkgsFromDiff(r io.Reader) (map[string]pkg, error) {
 	var inPrefix bool
 	for reader := bufio.NewReader(r); ; {
 		line, isPrefix, err := reader.ReadLine()
-		switch err {
-		case nil:
-		case io.EOF:
+		switch {
+		case err == nil:
+		case err == io.EOF:
 			return pkgs, nil
 		default:
 			return nil, err
@@ -259,18 +256,21 @@ func main() {
 			log.Fatal(err)
 		}
 		if len(pkgs) > 0 {
-			// 5 minutes total seems OK, but at least a minute per test.
-			duration := (5 * time.Minute) / time.Duration(len(pkgs))
-			if duration < time.Minute {
-				duration = time.Minute
-			}
-			// Use a timeout shorter than the duration so that hanging tests don't
-			// get a free pass.
-			timeout := (3 * duration) / 4
 			for name, pkg := range pkgs {
+				// 20 minutes total seems OK, but at least 2 minutes per test.
+				// This should be reduced. See #46941.
+				duration := (20 * time.Minute) / time.Duration(len(pkgs))
+				minDuration := (2 * time.Minute) * time.Duration(len(pkg.tests))
+				if duration < minDuration {
+					duration = minDuration
+				}
+				// Use a timeout shorter than the duration so that hanging tests don't
+				// get a free pass.
+				timeout := (3 * duration) / 4
+
 				tests := "-"
 				if len(pkg.tests) > 0 {
-					tests = "(" + strings.Join(pkg.tests, "|") + ")"
+					tests = "(" + strings.Join(pkg.tests, "$$|") + "$$)"
 				}
 
 				cmd := exec.Command(
@@ -279,6 +279,7 @@ func main() {
 					fmt.Sprintf("PKG=./%s", name),
 					fmt.Sprintf("TESTS=%s", tests),
 					fmt.Sprintf("TESTTIMEOUT=%s", timeout),
+					fmt.Sprintf("GOTESTFLAGS=-json"), // allow TeamCity to parse failures
 					fmt.Sprintf("STRESSFLAGS=-stderr -maxfails 1 -maxtime %s", duration),
 				)
 				cmd.Env = append(os.Environ(), "COCKROACH_NIGHTLY_STRESS=true")

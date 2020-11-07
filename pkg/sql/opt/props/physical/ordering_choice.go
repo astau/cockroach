@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package physical
 
@@ -24,7 +20,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/errors"
 )
 
 // OrderingChoice defines the set of possible row orderings that are provided or
@@ -125,7 +121,7 @@ func ParseOrderingChoice(s string) OrderingChoice {
 	//     matches[2]: opt(5,6)
 	matches := optRegex.FindStringSubmatch(s)
 	if matches == nil {
-		panic(fmt.Sprintf("could not parse ordering choice: %s", s))
+		panic(errors.AssertionFailedf("could not parse ordering choice: %s", s))
 	}
 
 	// Handle Any case.
@@ -155,7 +151,7 @@ func ParseOrderingChoice(s string) OrderingChoice {
 		if len(ordColMatches[1]) != 0 {
 			// Single column in equivalence group.
 			id, _ := strconv.Atoi(ordColMatches[1])
-			colChoice.Group.Add(id)
+			colChoice.Group.Add(opt.ColumnID(id))
 		} else {
 			// Split multiple columns in equivalence group by pipe:
 			//   1|2:
@@ -163,7 +159,7 @@ func ParseOrderingChoice(s string) OrderingChoice {
 			//     2
 			for _, idStr := range strings.Split(ordColMatches[2], "|") {
 				id, _ := strconv.Atoi(idStr)
-				colChoice.Group.Add(id)
+				colChoice.Group.Add(opt.ColumnID(id))
 			}
 		}
 
@@ -177,11 +173,28 @@ func ParseOrderingChoice(s string) OrderingChoice {
 	if len(matches[2]) != 0 {
 		for _, idStr := range strings.Split(matches[2], ",") {
 			id, _ := strconv.Atoi(idStr)
-			ordering.Optional.Add(id)
+			ordering.Optional.Add(opt.ColumnID(id))
 		}
 	}
 
 	return ordering
+}
+
+// ParseOrdering parses a simple opt.Ordering; for example: "+1,-3".
+//
+// The input string is expected to be valid; ParseOrdering will panic if it is
+// not.
+func ParseOrdering(str string) opt.Ordering {
+	prov := ParseOrderingChoice(str)
+	if !prov.Optional.Empty() {
+		panic(errors.AssertionFailedf("invalid ordering %s", str))
+	}
+	for i := range prov.Columns {
+		if prov.Columns[i].Group.Len() != 1 {
+			panic(errors.AssertionFailedf("invalid ordering %s", str))
+		}
+	}
+	return prov.ToOrdering()
 }
 
 // Any is true if this instance allows any ordering (any length, any columns).
@@ -191,10 +204,10 @@ func (oc *OrderingChoice) Any() bool {
 
 // FromOrdering sets this OrderingChoice to the given opt.Ordering.
 func (oc *OrderingChoice) FromOrdering(ord opt.Ordering) {
-	oc.Optional = util.FastIntSet{}
+	oc.Optional = opt.ColSet{}
 	oc.Columns = make([]OrderingColumnChoice, len(ord))
 	for i := range ord {
-		oc.Columns[i].Group.Add(int(ord[i].ID()))
+		oc.Columns[i].Group.Add(ord[i].ID())
 		oc.Columns[i].Descending = ord[i].Descending()
 	}
 }
@@ -206,9 +219,9 @@ func (oc *OrderingChoice) FromOrderingWithOptCols(ord opt.Ordering, optCols opt.
 	oc.Optional = optCols.Copy()
 	oc.Columns = make([]OrderingColumnChoice, 0, len(ord))
 	for i := range ord {
-		if !oc.Optional.Contains(int(ord[i].ID())) {
+		if !oc.Optional.Contains(ord[i].ID()) {
 			oc.Columns = append(oc.Columns, OrderingColumnChoice{
-				Group:      util.MakeFastIntSet(int(ord[i].ID())),
+				Group:      opt.MakeColSet(ord[i].ID()),
 				Descending: ord[i].Descending(),
 			})
 		}
@@ -383,7 +396,7 @@ func (oc *OrderingChoice) Intersection(other *OrderingChoice) OrderingChoice {
 			right++
 
 		default:
-			panic("non-intersecting sets")
+			panic(errors.AssertionFailedf("non-intersecting sets"))
 		}
 	}
 	// An ordering matched a prefix of the other. Append the tail of the other
@@ -440,14 +453,14 @@ func (oc *OrderingChoice) CanProjectCols(cs opt.ColSet) bool {
 // instance matches the given column. The column matches if its id is part of
 // the equivalence group and if it has the same direction.
 func (oc *OrderingChoice) MatchesAt(index int, col opt.OrderingColumn) bool {
-	if oc.Optional.Contains(int(col.ID())) {
+	if oc.Optional.Contains(col.ID()) {
 		return true
 	}
 	choice := &oc.Columns[index]
 	if choice.Descending != col.Descending() {
 		return false
 	}
-	if !choice.Group.Contains(int(col.ID())) {
+	if !choice.Group.Contains(col.ID()) {
 		return false
 	}
 	return true
@@ -458,7 +471,8 @@ func (oc *OrderingChoice) MatchesAt(index int, col opt.OrderingColumn) bool {
 // the only ordering choice.
 func (oc *OrderingChoice) AppendCol(id opt.ColumnID, descending bool) {
 	ordCol := OrderingColumnChoice{Descending: descending}
-	ordCol.Group.Add(int(id))
+	ordCol.Group.Add(id)
+	oc.Optional.Remove(id)
 	oc.Columns = append(oc.Columns, ordCol)
 }
 
@@ -466,7 +480,7 @@ func (oc *OrderingChoice) AppendCol(id opt.ColumnID, descending bool) {
 // ordering column array.
 func (oc *OrderingChoice) Copy() OrderingChoice {
 	var other OrderingChoice
-	other.Optional = oc.Optional
+	other.Optional = oc.Optional.Copy()
 	other.Columns = make([]OrderingColumnChoice, len(oc.Columns))
 	copy(other.Columns, oc.Columns)
 	return other
@@ -609,8 +623,74 @@ func (oc *OrderingChoice) ProjectCols(cols opt.ColSet) {
 		if !oc.Columns[i].Group.SubsetOf(cols) {
 			oc.Columns[i].Group = oc.Columns[i].Group.Intersection(cols)
 			if oc.Columns[i].Group.Empty() {
-				panic("no columns left from group")
+				panic(errors.AssertionFailedf("no columns left from group"))
 			}
+		}
+	}
+}
+
+// PrefixIntersection computes an OrderingChoice which:
+//  - implies <oc> (this instance), and
+//  - implies a "segmented ordering", which is any ordering which starts with a
+//    permutation of all columns in <prefix> followed by the <suffix> ordering.
+//
+// Note that <prefix> and <suffix> cannot have any columns in common.
+//
+// Such an ordering can be computed via the following rules:
+//
+//  - if <prefix> and <suffix> are empty: return this instance.
+//
+//  - if <oc> is empty: generate an arbitrary segmented ordering.
+//
+//  - if the first column of <oc> is either in <prefix> or is the first column
+//    of <suffix> while <prefix> is empty: this column is the first column of
+//    the result; calculate the rest recursively.
+//
+func (oc OrderingChoice) PrefixIntersection(
+	prefix opt.ColSet, suffix []OrderingColumnChoice,
+) (_ OrderingChoice, ok bool) {
+	var result OrderingChoice
+	oc = oc.Copy()
+
+	prefix = prefix.Copy()
+
+	for {
+		switch {
+		case prefix.Empty() && len(suffix) == 0:
+			// Any ordering is allowed by <prefix>+<suffix>, so use <oc> directly.
+			result.Columns = append(result.Columns, oc.Columns...)
+			return result, true
+		case len(oc.Columns) == 0:
+			// Any ordering is allowed by <oc>, so pick an arbitrary ordering of the
+			// columns in <prefix> then append suffix.
+			// TODO(justin): investigate picking an order more intelligently here.
+			for col, ok := prefix.Next(0); ok; col, ok = prefix.Next(col + 1) {
+				result.AppendCol(col, false /* descending */)
+			}
+
+			result.Columns = append(result.Columns, suffix...)
+			return result, true
+		case prefix.Empty() && len(oc.Columns) > 0 && len(suffix) > 0 &&
+			oc.Columns[0].Group.Intersects(suffix[0].Group) &&
+			oc.Columns[0].Descending == suffix[0].Descending:
+			// <prefix> is empty, and <suffix> and <oc> agree on the first column, so
+			// emit that column, remove it from both, and loop.
+			newCol := oc.Columns[0]
+			newCol.Group = oc.Columns[0].Group.Intersection(suffix[0].Group)
+			result.Columns = append(result.Columns, newCol)
+
+			oc.Columns = oc.Columns[1:]
+			suffix = suffix[1:]
+		case len(oc.Columns) > 0 && prefix.Intersects(oc.Columns[0].Group):
+			// <prefix> contains the first column in <oc>, so emit it and remove it
+			// from both.
+			result.Columns = append(result.Columns, oc.Columns[0])
+
+			prefix.DifferenceWith(oc.Columns[0].Group)
+			oc.Columns = oc.Columns[1:]
+		default:
+			// If no rule applied, fail.
+			return OrderingChoice{}, false
 		}
 	}
 }
@@ -627,12 +707,12 @@ func (oc *OrderingChoice) Equals(rhs *OrderingChoice) bool {
 
 	for i := range oc.Columns {
 		left := &oc.Columns[i]
-		right := &rhs.Columns[i]
+		y := &rhs.Columns[i]
 
-		if left.Descending != right.Descending {
+		if left.Descending != y.Descending {
 			return false
 		}
-		if !left.Group.Equals(right.Group) {
+		if !left.Group.Equals(y.Group) {
 			return false
 		}
 	}
@@ -701,7 +781,7 @@ func (oc OrderingChoice) Format(buf *bytes.Buffer) {
 func (oc *OrderingColumnChoice) AnyID() opt.ColumnID {
 	id, ok := oc.Group.Next(0)
 	if !ok {
-		panic("column choice group should have at least one column id")
+		panic(errors.AssertionFailedf("column choice group should have at least one column id"))
 	}
-	return opt.ColumnID(id)
+	return id
 }

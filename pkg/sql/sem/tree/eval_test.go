@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tree_test
 
@@ -21,6 +17,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/execbuilder"
@@ -29,74 +26,87 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	_ "github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/datadriven"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/datadriven"
+	"github.com/stretchr/testify/require"
 )
 
 func TestEval(t *testing.T) {
-	ctx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
-	// We have to manually close this account because we're doing the evaluations
-	// ourselves.
-	defer ctx.Mon.Stop(context.Background())
-	defer ctx.ActiveMemAcc.Close(context.Background())
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+	evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+	defer evalCtx.Stop(ctx)
 
-	walk := func(t *testing.T, getExpr func(tree.TypedExpr) (tree.TypedExpr, error)) {
+	walk := func(t *testing.T, getExpr func(*testing.T, *datadriven.TestData) string) {
 		datadriven.Walk(t, filepath.Join("testdata", "eval"), func(t *testing.T, path string) {
-			datadriven.RunTest(t, path, func(d *datadriven.TestData) string {
+			datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
 				if d.Cmd != "eval" {
 					t.Fatalf("unsupported command %s", d.Cmd)
 				}
-				expr, err := parser.ParseExpr(d.Input)
-				if err != nil {
-					t.Fatalf("%s: %v", d.Input, err)
-				}
-				// expr.TypeCheck to avoid constant folding.
-				typedExpr, err := expr.TypeCheck(nil, types.Any)
-				if err != nil {
-					t.Fatalf("%s: %v", d.Input, err)
-				}
-				t.Logf("Type checked expression: %s", typedExpr)
-
-				e, err := getExpr(typedExpr)
-				if err != nil {
-					t.Fatalf("%s: %v", typedExpr, err)
-				}
-				r, err := e.Eval(ctx)
-				if err != nil {
-					t.Fatalf("%s: %v", e, err)
-				}
-				return r.String() + "\n"
+				return getExpr(t, d) + "\n"
 			})
 		})
 	}
 
+	walkExpr := func(t *testing.T, getExpr func(tree.Expr) (tree.TypedExpr, error)) {
+		walk(t, func(t *testing.T, d *datadriven.TestData) string {
+			expr, err := parser.ParseExpr(d.Input)
+			if err != nil {
+				t.Fatalf("%s: %v", d.Input, err)
+			}
+			e, err := getExpr(expr)
+			if err != nil {
+				return fmt.Sprint(err)
+			}
+			r, err := e.Eval(evalCtx)
+			if err != nil {
+				return fmt.Sprint(err)
+			}
+			return r.String()
+		})
+	}
+
 	t.Run("opt", func(t *testing.T) {
-		walk(t, func(e tree.TypedExpr) (tree.TypedExpr, error) {
-			return optBuildScalar(ctx, e)
+		walkExpr(t, func(e tree.Expr) (tree.TypedExpr, error) {
+			return optBuildScalar(evalCtx, e)
 		})
 	})
 
 	t.Run("no-opt", func(t *testing.T) {
-		walk(t, func(e tree.TypedExpr) (tree.TypedExpr, error) {
-			return ctx.NormalizeExpr(e)
+		walkExpr(t, func(e tree.Expr) (tree.TypedExpr, error) {
+			// expr.TypeCheck to avoid constant folding.
+			semaCtx := tree.MakeSemaContext()
+			typedExpr, err := e.TypeCheck(ctx, &semaCtx, types.Any)
+			if err != nil {
+				return nil, err
+			}
+			return evalCtx.NormalizeExpr(typedExpr)
 		})
 	})
 }
 
-func optBuildScalar(evalCtx *tree.EvalContext, e tree.TypedExpr) (tree.TypedExpr, error) {
+func optBuildScalar(evalCtx *tree.EvalContext, e tree.Expr) (tree.TypedExpr, error) {
 	var o xform.Optimizer
-	o.Init(evalCtx)
-	b := optbuilder.NewScalar(context.TODO(), &tree.SemaContext{}, evalCtx, o.Factory())
-	b.AllowUnsupportedExpr = true
+	o.Init(evalCtx, nil /* catalog */)
+	ctx := context.Background()
+	semaCtx := tree.MakeSemaContext()
+	b := optbuilder.NewScalar(ctx, &semaCtx, evalCtx, o.Factory())
 	if err := b.Build(e); err != nil {
 		return nil, err
 	}
 
-	bld := execbuilder.New(nil /* factory */, o.Memo(), o.Memo().RootExpr(), evalCtx)
-	ivh := tree.MakeIndexedVarHelper(nil /* container */, 0)
-
-	expr, err := bld.BuildScalar(&ivh)
+	bld := execbuilder.New(
+		nil /* factory */, o.Memo(), nil /* catalog */, o.Memo().RootExpr(),
+		evalCtx, false, /* allowAutoCommit */
+	)
+	expr, err := bld.BuildScalar()
 	if err != nil {
 		return nil, err
 	}
@@ -104,6 +114,8 @@ func optBuildScalar(evalCtx *tree.EvalContext, e tree.TypedExpr) (tree.TypedExpr
 }
 
 func TestTimeConversion(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	tests := []struct {
 		start     string
 		format    string
@@ -123,10 +135,9 @@ func TestTimeConversion(t *testing.T) {
 		// %e (+ %Y %m)
 		{`2006 10  3`, `%Y %m %e`, `2006-10-03 00:00:00+00:00`, ``, ``},
 		// %f (+ %c)
-		{`Wed Oct 5 01:02:03 2016 .123`, `%c .%f`, `2016-10-05 01:02:03.123+00:00`, `.%f`, `.123000000`},
-		{`Wed Oct 5 01:02:03 2016 .123456`, `%c .%f`, `2016-10-05 01:02:03.123456+00:00`, `.%f`, `.123456000`},
-		{`Wed Oct 5 01:02:03 2016 .123456789`, `%c .%f`, `2016-10-05 01:02:03.123457+00:00`, `.%f`, `.123457000`},
-		{`Wed Oct 5 01:02:03 2016 .999999999`, `%c .%f`, `2016-10-05 01:02:04+00:00`, `.%f`, `.000000000`},
+		{`Wed Oct 5 01:02:03 2016 .123`, `%c .%f`, `2016-10-05 01:02:03.123+00:00`, `.%f`, `.123000`},
+		{`Wed Oct 5 01:02:03 2016 .123456`, `%c .%f`, `2016-10-05 01:02:03.123456+00:00`, `.%f`, `.123456`},
+		{`Wed Oct 5 01:02:03 2016 .999999`, `%c .%f`, `2016-10-05 01:02:03.999999+00:00`, `.%f`, `.999999`},
 		// %F
 		{`2006-10-03`, `%F`, `2006-10-03 00:00:00+00:00`, ``, ``},
 		// %h (+ %Y %d)
@@ -188,7 +199,8 @@ func TestTimeConversion(t *testing.T) {
 			t.Errorf("%s: %v", exprStr, err)
 			continue
 		}
-		typedExpr, err := expr.TypeCheck(nil, types.Timestamp)
+		semaCtx := tree.MakeSemaContext()
+		typedExpr, err := expr.TypeCheck(context.Background(), &semaCtx, types.Timestamp)
 		if err != nil {
 			t.Errorf("%s: %v", exprStr, err)
 			continue
@@ -227,7 +239,7 @@ func TestTimeConversion(t *testing.T) {
 			t.Errorf("%s: %v", exprStr, err)
 			continue
 		}
-		typedExpr, err = expr.TypeCheck(nil, types.Timestamp)
+		typedExpr, err = expr.TypeCheck(context.Background(), &semaCtx, types.Timestamp)
 		if err != nil {
 			t.Errorf("%s: %v", exprStr, err)
 			continue
@@ -250,12 +262,15 @@ func TestTimeConversion(t *testing.T) {
 }
 
 func TestEvalError(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	testData := []struct {
 		expr     string
 		expected string
 	}{
-		{`1 % 0`, `zero modulus`},
+		{`1 % 0`, `division by zero`},
 		{`1 / 0`, `division by zero`},
+		{`1::float / 0::float`, `division by zero`},
 		{`1 // 0`, `division by zero`},
 		{`1.5 / 0`, `division by zero`},
 		{`'11h2m'::interval / 0`, `division by zero`},
@@ -271,7 +286,7 @@ func TestEvalError(t *testing.T) {
 		{`'baz'::decimal`,
 			`could not parse "baz" as type decimal`},
 		{`'2010-09-28 12:00:00.1q'::date`,
-			`could not parse "2010-09-28 12:00:00.1q" as type date`},
+			`parsing as type date: could not parse "2010-09-28 12:00:00.1q"`},
 		{`'12:00:00q'::time`, `could not parse "12:00:00q" as type time`},
 		{`'2010-09-28 12:00.1 MST'::timestamp`,
 			`unimplemented: timestamp abbreviations not supported`},
@@ -339,12 +354,14 @@ func TestEvalError(t *testing.T) {
 		{`B'1001' | B'101'`, `cannot OR bit strings of different sizes`},
 		{`B'1001' # B'101'`, `cannot XOR bit strings of different sizes`},
 	}
+	ctx := context.Background()
 	for _, d := range testData {
 		expr, err := parser.ParseExpr(d.expr)
 		if err != nil {
 			t.Fatalf("%s: %v", d.expr, err)
 		}
-		typedExpr, err := tree.TypeCheck(expr, nil, types.Any)
+		semaCtx := tree.MakeSemaContext()
+		typedExpr, err := tree.TypeCheck(ctx, expr, &semaCtx, types.Any)
 		if err == nil {
 			evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 			defer evalCtx.Stop(context.Background())
@@ -353,5 +370,21 @@ func TestEvalError(t *testing.T) {
 		if !testutils.IsError(err, strings.Replace(regexp.QuoteMeta(d.expected), `\.\*`, `.*`, -1)) {
 			t.Errorf("%s: expected %s, but found %v", d.expr, d.expected, err)
 		}
+	}
+}
+
+func TestHLCTimestampDecimalRoundTrip(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	rng, _ := randutil.NewPseudoRand()
+	for i := 0; i < 100; i++ {
+		ts := hlc.Timestamp{WallTime: rng.Int63(), Logical: rng.Int31()}
+		dec := tree.TimestampToDecimalDatum(ts)
+		approx, err := tree.DecimalToInexactDTimestamp(dec)
+		require.NoError(t, err)
+		// The expected timestamp is at the microsecond precision.
+		expectedTsDatum := tree.MustMakeDTimestamp(timeutil.Unix(0, ts.WallTime), time.Microsecond)
+		require.True(t, expectedTsDatum.Equal(approx.Time))
 	}
 }

@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -20,7 +15,7 @@ import (
 	"fmt"
 )
 
-func registerInterleaved(r *registry) {
+func registerInterleaved(r *testRegistry) {
 	type config struct {
 		eastName        string
 		westName        string
@@ -39,15 +34,16 @@ func registerInterleaved(r *registry) {
 		c *cluster,
 		config config,
 	) {
-		cockroachWest := c.Range(1, 3)
-		workloadWest := c.Node(4)
-		cockroachEast := c.Range(5, 7)
-		workloadEast := c.Node(8)
-		cockroachCentral := c.Range(9, 11)
-		workloadCentral := c.Node(12)
-
-		cockroachNodes := cockroachWest.merge(cockroachEast.merge(cockroachCentral))
-		workloadNodes := workloadWest.merge(workloadEast.merge(workloadCentral))
+		numZones, numRoachNodes, numLoadNodes := 3, 9, 3
+		loadGroups := makeLoadGroups(c, numZones, numRoachNodes, numLoadNodes)
+		cockroachWest := loadGroups[0].roachNodes
+		workloadWest := loadGroups[0].loadNodes
+		cockroachEast := loadGroups[1].roachNodes
+		workloadEast := loadGroups[1].loadNodes
+		cockroachCentral := loadGroups[2].roachNodes
+		workloadCentral := loadGroups[2].loadNodes
+		cockroachNodes := loadGroups.roachNodes()
+		workloadNodes := loadGroups.loadNodes()
 
 		c.l.Printf("cockroach nodes: %s", cockroachNodes.String()[1:])
 		c.l.Printf("workload nodes: %s", workloadNodes.String()[1:])
@@ -71,7 +67,7 @@ func registerInterleaved(r *registry) {
 		c.Run(ctx, cockroachEast.randNode(), cmdInit)
 
 		duration := " --duration " + ifLocal("10s", "10m")
-		histograms := " --histograms logs/stats.json"
+		histograms := " --histograms=" + perfArtifactsDir + "/stats.json"
 
 		createCmd := func(locality string, cockroachNodes nodeListOption) string {
 			return fmt.Sprintf(
@@ -108,33 +104,29 @@ func registerInterleaved(r *registry) {
 		t.Status("running workload")
 		m := newMonitor(ctx, c, cockroachNodes)
 
-		runLocality := func(name string, node nodeListOption, cmd string) {
+		runLocality := func(node nodeListOption, cmd string) {
 			m.Go(func(ctx context.Context) error {
-				l, err := t.l.ChildLogger(name)
-				if err != nil {
-					t.Fatal(err)
-				}
-				defer l.close()
-				return c.RunL(ctx, l, node, cmd)
+				return c.RunE(ctx, node, cmd)
 			})
 		}
 
-		runLocality("west", workloadWest, createCmd("west", cockroachWest))
-		runLocality("east", workloadEast, createCmd("east", cockroachEast))
-		runLocality("central", workloadCentral, cmdCentral)
+		runLocality(workloadWest, createCmd("west", cockroachWest))
+		runLocality(workloadEast, createCmd("east", cockroachEast))
+		runLocality(workloadCentral, cmdCentral)
 
 		m.Wait()
 	}
 
 	r.Add(testSpec{
-		Name:  "interleavedpartitioned",
-		Nodes: nodes(12, geo(), zones("us-west1-b,us-east4-b,us-central1-a")),
+		Name:    "interleavedpartitioned",
+		Owner:   OwnerPartitioning,
+		Cluster: makeClusterSpec(12, geo(), zones("us-east1-b,us-west1-b,europe-west2-b")),
 		Run: func(ctx context.Context, t *test, c *cluster) {
 			runInterleaved(ctx, t, c,
 				config{
-					eastName:        `us-east4-b`,
+					eastName:        `europe-west2-b`,
 					westName:        `us-west1-b`,
-					centralName:     `us-central1-a`,
+					centralName:     `us-east1-b`, // us-east is central between us-west and eu-west
 					initSessions:    1000,
 					insertPercent:   80,
 					retrievePercent: 10,

@@ -1,28 +1,25 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package memo
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 // Memo is a data structure for efficiently storing a forest of query plans.
@@ -132,18 +129,25 @@ type Memo struct {
 	// memEstimate is the approximate memory usage of the memo, in bytes.
 	memEstimate int64
 
-	// locName is the location which the memo is compiled against. This determines
-	// the timezone, which is used for time-related data type construction and
-	// comparisons. If the location changes, then this memo is invalidated.
-	locName string
+	// The following are selected fields from SessionData which can affect
+	// planning. We need to cross-check these before reusing a cached memo.
+	reorderJoinsLimit       int
+	zigzagJoinEnabled       bool
+	useHistograms           bool
+	useMultiColStats        bool
+	safeUpdates             bool
+	preferLookupJoinsForFKs bool
+	saveTablesPrefix        string
 
-	// dbName is the current database at the time the memo was compiled. If this
-	// changes, then the memo is invalidated.
-	dbName string
+	// curID is the highest currently in-use scalar expression ID.
+	curID opt.ScalarID
 
-	// searchPath is the current search path at the time the memo was compiled.
-	// If this changes, then the memo is invalidated.
-	searchPath sessiondata.SearchPath
+	// curWithID is the highest currently in-use WITH ID.
+	curWithID opt.WithID
+
+	newGroupFn func(opt.Expr)
+
+	// WARNING: if you add more members, add initialization code in Init.
 }
 
 // Init initializes a new empty memo instance, or resets existing state so it
@@ -159,9 +163,23 @@ func (m *Memo) Init(evalCtx *tree.EvalContext) {
 	m.rootExpr = nil
 	m.rootProps = nil
 	m.memEstimate = 0
-	m.locName = evalCtx.GetLocation().String()
-	m.dbName = evalCtx.SessionData.Database
-	m.searchPath = evalCtx.SessionData.SearchPath
+
+	m.reorderJoinsLimit = evalCtx.SessionData.ReorderJoinsLimit
+	m.zigzagJoinEnabled = evalCtx.SessionData.ZigzagJoinEnabled
+	m.useHistograms = evalCtx.SessionData.OptimizerUseHistograms
+	m.useMultiColStats = evalCtx.SessionData.OptimizerUseMultiColStats
+	m.safeUpdates = evalCtx.SessionData.SafeUpdates
+	m.preferLookupJoinsForFKs = evalCtx.SessionData.PreferLookupJoinsForFKs
+	m.saveTablesPrefix = evalCtx.SessionData.SaveTablesPrefix
+
+	m.curID = 0
+	m.curWithID = 0
+}
+
+// NotifyOnNewGroup sets a callback function which is invoked each time we
+// create a new memo group.
+func (m *Memo) NotifyOnNewGroup(fn func(opt.Expr)) {
+	m.newGroupFn = fn
 }
 
 // IsEmpty returns true if there are no expressions in the memo.
@@ -214,10 +232,8 @@ func (m *Memo) SetRoot(e RelExpr, phys *physical.Required) {
 }
 
 // SetScalarRoot stores the root memo expression when it is a scalar expression.
+// Used only for testing.
 func (m *Memo) SetScalarRoot(scalar opt.ScalarExpr) {
-	if m.rootExpr != nil {
-		panic("cannot set scalar root multiple times")
-	}
 	m.rootExpr = scalar
 }
 
@@ -226,7 +242,7 @@ func (m *Memo) SetScalarRoot(scalar opt.ScalarExpr) {
 func (m *Memo) HasPlaceholders() bool {
 	rel, ok := m.rootExpr.(RelExpr)
 	if !ok {
-		panic(fmt.Sprintf("placeholders only supported when memo root is relational"))
+		panic(errors.AssertionFailedf("placeholders only supported when memo root is relational"))
 	}
 
 	return rel.Relational().HasPlaceholder
@@ -253,18 +269,15 @@ func (m *Memo) HasPlaceholders() bool {
 func (m *Memo) IsStale(
 	ctx context.Context, evalCtx *tree.EvalContext, catalog cat.Catalog,
 ) (bool, error) {
-	// Memo is stale if the current database has changed.
-	if m.dbName != evalCtx.SessionData.Database {
-		return true, nil
-	}
-
-	// Memo is stale if the search path has changed.
-	if !m.searchPath.Equals(&evalCtx.SessionData.SearchPath) {
-		return true, nil
-	}
-
-	// Memo is stale if the location has changed.
-	if m.locName != evalCtx.GetLocation().String() {
+	// Memo is stale if fields from SessionData that can affect planning have
+	// changed.
+	if m.reorderJoinsLimit != evalCtx.SessionData.ReorderJoinsLimit ||
+		m.zigzagJoinEnabled != evalCtx.SessionData.ZigzagJoinEnabled ||
+		m.useHistograms != evalCtx.SessionData.OptimizerUseHistograms ||
+		m.useMultiColStats != evalCtx.SessionData.OptimizerUseMultiColStats ||
+		m.safeUpdates != evalCtx.SessionData.SafeUpdates ||
+		m.preferLookupJoinsForFKs != evalCtx.SessionData.PreferLookupJoinsForFKs ||
+		m.saveTablesPrefix != evalCtx.SessionData.SaveTablesPrefix {
 		return true, nil
 	}
 
@@ -302,11 +315,11 @@ func (m *Memo) SetBestProps(
 		if e.RequiredPhysical() != required ||
 			!e.ProvidedPhysical().Equals(provided) ||
 			e.Cost() != cost {
-			panic(fmt.Sprintf(
+			panic(errors.AssertionFailedf(
 				"cannot overwrite %s / %s (%.9g) with %s / %s (%.9g)",
 				e.RequiredPhysical(),
 				e.ProvidedPhysical(),
-				e.Cost(),
+				log.Safe(e.Cost()),
 				required.String(),
 				provided.String(), // Call String() so provided doesn't escape.
 				cost,
@@ -332,4 +345,55 @@ func (m *Memo) IsOptimized() bool {
 	// assigned.
 	rel, ok := m.rootExpr.(RelExpr)
 	return ok && rel.RequiredPhysical() != nil
+}
+
+// NextID returns a new unique ScalarID to number expressions with.
+func (m *Memo) NextID() opt.ScalarID {
+	m.curID++
+	return m.curID
+}
+
+// RequestColStat calculates and returns the column statistic calculated on the
+// relational expression.
+func (m *Memo) RequestColStat(
+	expr RelExpr, cols opt.ColSet,
+) (colStat *props.ColumnStatistic, ok bool) {
+	// When SetRoot is called, the statistics builder may have been cleared.
+	// If this happens, we can't serve the request anymore.
+	if m.logPropsBuilder.sb.md != nil {
+		return m.logPropsBuilder.sb.colStat(cols, expr), true
+	}
+	return nil, false
+}
+
+// RowsProcessed calculates and returns the number of rows processed by the
+// relational expression. It is currently only supported for joins.
+func (m *Memo) RowsProcessed(expr RelExpr) (_ float64, ok bool) {
+	// When SetRoot is called, the statistics builder may have been cleared.
+	// If this happens, we can't serve the request anymore.
+	if m.logPropsBuilder.sb.md != nil {
+		return m.logPropsBuilder.sb.rowsProcessed(expr), true
+	}
+	return 0, false
+}
+
+// NextWithID returns a not-yet-assigned identifier for a WITH expression.
+func (m *Memo) NextWithID() opt.WithID {
+	m.curWithID++
+	return m.curWithID
+}
+
+// ClearColStats clears all column statistics from every relational expression
+// in the memo. This is used to free up the potentially large amount of memory
+// used by histograms.
+func (m *Memo) ClearColStats(parent opt.Expr) {
+	for i, n := 0, parent.ChildCount(); i < n; i++ {
+		child := parent.Child(i)
+		m.ClearColStats(child)
+	}
+
+	switch t := parent.(type) {
+	case RelExpr:
+		t.Relational().Stats.ColStats = props.ColStatsMap{}
+	}
 }

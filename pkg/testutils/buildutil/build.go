@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package buildutil
 
@@ -20,21 +16,32 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
+	"github.com/cockroachdb/errors"
 )
+
+func short(in string) string {
+	return strings.Replace(in, "github.com/cockroachdb/cockroach/pkg/", "./pkg/", -1)
+}
 
 // VerifyNoImports verifies that a package doesn't depend (directly or
 // indirectly) on forbidden packages. The forbidden packages are specified as
 // either exact matches or prefix matches.
+// A match is not reported if the package that includes the forbidden package
+// is listed in the allowlist.
 // If GOPATH isn't set, it is an indication that the source is not available and
 // the test is skipped.
 func VerifyNoImports(
-	t testing.TB, pkgPath string, cgo bool, forbiddenPkgs, forbiddenPrefixes []string,
+	t testing.TB,
+	pkgPath string,
+	cgo bool,
+	forbiddenPkgs, forbiddenPrefixes []string,
+	allowlist ...string,
 ) {
 
 	// Skip test if source is not available.
 	if build.Default.GOPATH == "" {
-		t.Skip("GOPATH isn't set")
+		skip.IgnoreLint(t, "GOPATH isn't set")
 	}
 
 	buildContext := build.Default
@@ -42,22 +49,30 @@ func VerifyNoImports(
 
 	checked := make(map[string]struct{})
 
-	short := func(in string) string {
-		return strings.Replace(in, "github.com/cockroachdb/cockroach/pkg/", "./pkg/", -1)
-	}
-
 	var check func(string) error
 	check = func(path string) error {
-		pkg, err := buildContext.Import(path, "", 0)
+		pkg, err := buildContext.Import(path, "", build.FindOnly)
 		if err != nil {
 			t.Fatal(err)
 		}
 		for _, imp := range pkg.Imports {
 			for _, forbidden := range forbiddenPkgs {
 				if forbidden == imp {
-					return errors.Errorf("%s imports %s, which is forbidden", short(path), short(imp))
+					allowlisted := false
+					for _, w := range allowlist {
+						if path == w {
+							allowlisted = true
+							break
+						}
+					}
+					if !allowlisted {
+						return errors.Errorf("%s imports %s, which is forbidden", short(path), short(imp))
+					}
 				}
-				if forbidden == "c-deps" && imp == "C" && strings.HasPrefix(path, "github.com/cockroachdb/cockroach/pkg") {
+				if forbidden == "c-deps" &&
+					imp == "C" &&
+					strings.HasPrefix(path, "github.com/cockroachdb/cockroach/pkg") &&
+					path != "github.com/cockroachdb/cockroach/pkg/geo/geoproj" {
 					for _, name := range pkg.CgoFiles {
 						if strings.Contains(name, "zcgo_flags") {
 							return errors.Errorf("%s imports %s (%s), which is forbidden", short(path), short(imp), name)

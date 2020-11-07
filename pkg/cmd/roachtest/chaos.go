@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -19,6 +15,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 )
 
 // ChaosTimer configures a chaos schedule.
@@ -86,24 +83,44 @@ func (ch *Chaos) Runner(c *cluster, m *monitor) func(context.Context) error {
 
 			if ch.DrainAndQuit {
 				l.Printf("stopping and draining %v\n", target)
-				c.Stop(ctx, target, stopArgs("--sig=15"))
+				if err := c.StopE(ctx, target, stopArgs("--sig=15")); err != nil {
+					return errors.Wrapf(err, "could not stop node %s", target)
+				}
 			} else {
 				l.Printf("killing %v\n", target)
-				c.Stop(ctx, target)
+				if err := c.StopE(ctx, target); err != nil {
+					return errors.Wrapf(err, "could not stop node %s", target)
+				}
 			}
 
 			select {
 			case <-ch.Stopper:
+				// NB: the roachtest harness checks that at the end of the test,
+				// all nodes that have data also have a running process.
 				l.Printf("restarting %v (chaos is done)\n", target)
-				c.Start(ctx, c.t.(*test), target)
+				if err := c.StartE(ctx, target); err != nil {
+					return errors.Wrapf(err, "could not restart node %s", target)
+				}
 				return nil
 			case <-ctx.Done():
+				// NB: the roachtest harness checks that at the end of the test,
+				// all nodes that have data also have a running process.
+				l.Printf("restarting %v (chaos is done)\n", target)
+				// Use a one-off context to restart the node because ours is
+				// already canceled.
+				tCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				if err := c.StartE(tCtx, target); err != nil {
+					return errors.Wrapf(err, "could not restart node %s", target)
+				}
 				return ctx.Err()
 			case <-time.After(downTime):
 			}
 			l.Printf("restarting %v after %s of downtime\n", target, downTime)
 			t.Reset(period)
-			c.Start(ctx, c.t.(*test), target)
+			if err := c.StartE(ctx, target); err != nil {
+				return errors.Wrapf(err, "could not restart node %s", target)
+			}
 		}
 	}
 }

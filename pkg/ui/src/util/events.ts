@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 import * as protobuf from "protobufjs/minimal";
 
@@ -32,10 +28,16 @@ export function getEventDescription(e: Event$Properties): string {
     case eventTypes.DROP_DATABASE:
       const tableDropText = getDroppedObjectsText(info);
       return `Database Dropped: User ${info.User} dropped database ${info.DatabaseName}. ${tableDropText}`;
+    case eventTypes.RENAME_DATABASE:
+      return `Database Renamed: User ${info.User} renamed database ${info.DatabaseName} to ${info.NewDatabaseName}`;
+    case eventTypes.ALTER_DATABASE_OWNER:
+      return `Database Owner Altered: User ${info.User} altered the owner of database ${info.DatabaseName} to ${info.Owner}`;
     case eventTypes.CREATE_TABLE:
       return `Table Created: User ${info.User} created table ${info.TableName}`;
     case eventTypes.DROP_TABLE:
       return `Table Dropped: User ${info.User} dropped table ${info.TableName}`;
+    case eventTypes.RENAME_TABLE:
+      return `Table Renamed: User ${info.User} renamed table ${info.TableName} to ${info.NewTableName}`;
     case eventTypes.TRUNCATE_TABLE:
       return `Table Truncated: User ${info.User} truncated table ${info.TableName}`;
     case eventTypes.ALTER_TABLE:
@@ -64,6 +66,8 @@ export function getEventDescription(e: Event$Properties): string {
       return `Schema Change Rollback Completed: Rollback of schema change with ID ${info.MutationID} was completed.`;
     case eventTypes.NODE_JOIN:
       return `Node Joined: Node ${targetId} joined the cluster`;
+    case eventTypes.NODE_DECOMMISSIONING:
+      return `Node Decommissioning: Node ${targetId} was marked as decommissioning`;
     case eventTypes.NODE_DECOMMISSIONED:
       return `Node Decommissioned: Node ${targetId} was decommissioned`;
     case eventTypes.NODE_RECOMMISSIONED:
@@ -76,9 +80,31 @@ export function getEventDescription(e: Event$Properties): string {
       }
       return `Cluster Setting Changed: User ${info.User} changed ${info.SettingName}`;
     case eventTypes.SET_ZONE_CONFIG:
-    return `Zone Config Changed: User ${info.User} set the zone config for ${info.Target} to ${info.Config}`;
+      return `Zone Config Changed: User ${info.User} set the zone config for ${info.Target} to ${info.Config}`;
     case eventTypes.REMOVE_ZONE_CONFIG:
       return `Zone Config Removed: User ${info.User} removed the zone config for ${info.Target}`;
+    case eventTypes.CREATE_STATISTICS:
+      return `Table statistics refreshed for ${info.TableName}`;
+    case eventTypes.GRANT_PRIVILEGE:
+      return `Privileges granted: User ${info.User} granted ${info.Privileges} to ${info.Grantees} on ${info.Target}`;
+    case eventTypes.REVOKE_PRIVILEGE:
+      return `Privileges revoked: User ${info.User} revoked ${info.Privileges} from ${info.Grantees} on ${info.Target}`;
+    case eventTypes.CREATE_SCHEMA:
+      return `Schema Created: User ${info.User} created schema ${info.SchemaName} with owner ${info.Owner}`;
+    case eventTypes.DROP_SCHEMA:
+      return `Schema Dropped: User ${info.User} dropped schema ${info.SchemaName}`;
+    case eventTypes.RENAME_SCHEMA:
+      return `Schema Renamed: User ${info.User} renamed schema ${info.SchemaName} to ${info.NewSchemaName}`;
+    case eventTypes.ALTER_SCHEMA_OWNER:
+      return `Schema Owner Altered: User ${info.User} altered the owner of schema ${info.SchemaName} to ${info.Owner}`;
+    case eventTypes.CONVERT_TO_SCHEMA:
+      return `Database Converted: User ${info.User} converted database ${info.DatabaseName} to a schema with parent database ${info.NewDatabaseName}`;
+    case eventTypes.CREATE_ROLE:
+      return `Role Created: User ${info.User} created role ${info.RoleName}`;
+    case eventTypes.DROP_ROLE:
+      return `Role Dropped: User ${info.User} dropped role(s) ${info.RoleName}`;
+    case eventTypes.ALTER_ROLE:
+      return `Role Altered: User ${info.User} altered role ${info.RoleName}`;
     default:
       return `Unknown Event Type: ${e.event_type}, content: ${JSON.stringify(info, null, 2)}`;
   }
@@ -89,7 +115,9 @@ export function getEventDescription(e: Event$Properties): string {
 export interface EventInfo {
   User: string;
   DatabaseName?: string;
+  NewDatabaseName?: string;
   TableName?: string;
+  NewTableName?: string;
   IndexName?: string;
   MutationID?: string;
   ViewName?: string;
@@ -98,6 +126,13 @@ export interface EventInfo {
   Value?: string;
   Target?: string;
   Config?: string;
+  Statement?: string;
+  Grantees?: string;
+  Privileges?: string;
+  SchemaName?: string;
+  NewSchemaName?: string;
+  Owner?: string;
+  RoleName?: string;
   // The following are three names for the same key (it was renamed twice).
   // All ar included for backwards compatibility.
   DroppedTables?: string[];

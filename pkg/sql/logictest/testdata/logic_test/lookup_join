@@ -1,5 +1,3 @@
-# LogicTest: fakedist-opt local-opt
-
 statement ok
 CREATE TABLE abc (a INT, b INT, c INT, PRIMARY KEY (a, c));
 INSERT INTO abc VALUES (1, 1, 2), (2, 1, 1), (2, NULL, 2)
@@ -14,15 +12,13 @@ INSERT INTO gh VALUES (NULL, 1)
 
 # Set up the statistics as if the first table is much smaller than the second.
 # This will make lookup join into the second table be the best plan.
-# TODO(radu): we have to use very small row counts because of the poor row
-# count estimation for joins (left-rows * right-rows / 10).
 statement ok
 ALTER TABLE abc INJECT STATISTICS '[
   {
     "columns": ["a"],
     "created_at": "2018-01-01 1:00:00.00000+00:00",
-    "row_count": 1,
-    "distinct_count": 1
+    "row_count": 100,
+    "distinct_count": 100
   }
 ]'
 
@@ -31,8 +27,8 @@ ALTER TABLE def INJECT STATISTICS '[
   {
     "columns": ["f"],
     "created_at": "2018-01-01 1:00:00.00000+00:00",
-    "row_count": 10,
-    "distinct_count": 10
+    "row_count": 10000,
+    "distinct_count": 10000
   }
 ]'
 
@@ -41,8 +37,8 @@ ALTER TABLE gh INJECT STATISTICS '[
   {
     "columns": ["g"],
     "created_at": "2018-01-01 1:00:00.00000+00:00",
-    "row_count": 10,
-    "distinct_count": 10
+    "row_count": 10000,
+    "distinct_count": 10000
   }
 ]'
 
@@ -53,6 +49,12 @@ SELECT * FROM abc JOIN def ON f = b
 2  1  1  2     1  1
 1  1  2  NULL  2  1
 2  1  1  NULL  2  1
+
+query IIIIII rowsort
+SELECT * FROM abc JOIN def ON f = b AND e = c
+----
+1  1  2  NULL  2  1
+2  1  1  2     1  1
 
 query IIIIII rowsort
 SELECT * FROM abc JOIN def ON f = b WHERE a > 1 AND e > 1
@@ -111,9 +113,21 @@ INSERT INTO data SELECT a, b, c, d FROM
    generate_series(1, 10) AS c(c),
    generate_series(1, 10) AS d(d)
 
+statement ok
+ALTER TABLE data INJECT STATISTICS '[
+  {
+    "columns": ["a"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 100000,
+    "distinct_count": 100000
+  }
+]'
+
 # Ensure lookup join performs properly on input that has more than 100 rows.
 query I
-SELECT count(*) FROM (SELECT * FROM data WHERE c = 1) AS l NATURAL JOIN data AS r
+SELECT count(*)
+FROM (SELECT * FROM data WHERE c = 1) AS l
+NATURAL JOIN (SELECT * FROM data WHERE c > 0) AS r
 ----
 1000
 
@@ -155,8 +169,8 @@ ALTER TABLE books INJECT STATISTICS '[
   {
     "columns": ["title"],
     "created_at": "2018-01-01 1:00:00.00000+00:00",
-    "row_count": 1,
-    "distinct_count": 1
+    "row_count": 100,
+    "distinct_count": 100
   }
 ]'
 
@@ -165,8 +179,8 @@ ALTER TABLE books2 INJECT STATISTICS '[
   {
     "columns": ["title"],
     "created_at": "2018-01-01 1:00:00.00000+00:00",
-    "row_count": 10,
-    "distinct_count": 10
+    "row_count": 10000,
+    "distinct_count": 1000
   }
 ]'
 
@@ -186,8 +200,8 @@ ALTER TABLE authors INJECT STATISTICS '[
   {
     "columns": ["name"],
     "created_at": "2018-01-01 1:00:00.00000+00:00",
-    "row_count": 1,
-    "distinct_count": 1
+    "row_count": 100,
+    "distinct_count": 100
   }
 ]'
 
@@ -250,8 +264,8 @@ ALTER TABLE small INJECT STATISTICS '[
   {
     "columns": ["a"],
     "created_at": "2018-01-01 1:00:00.00000+00:00",
-    "row_count": 1,
-    "distinct_count": 1
+    "row_count": 100,
+    "distinct_count": 100
   }
 ]'
 
@@ -260,8 +274,8 @@ ALTER TABLE large INJECT STATISTICS '[
   {
     "columns": ["a"],
     "created_at": "2018-01-01 1:00:00.00000+00:00",
-    "row_count": 10,
-    "distinct_count": 10
+    "row_count": 10000,
+    "distinct_count": 10000
   }
 ]'
 
@@ -507,3 +521,70 @@ d     e  f  a  b     c
 NULL  2  1  1  1     2
 1     1  2  2  NULL  2
 1     1  2  2  1     1
+
+# Test lookup semi and anti join.
+query III rowsort
+SELECT * from abc WHERE EXISTS (SELECT * FROM def WHERE a=f)
+----
+1  1     2
+2  1     1
+2  NULL  2
+
+query III rowsort
+SELECT * from abc WHERE NOT EXISTS (SELECT * FROM def WHERE a=f)
+----
+
+query III rowsort
+SELECT * from abc WHERE EXISTS (SELECT * FROM def WHERE a=f AND c=e)
+----
+1  1  2
+2  1  1
+
+query III rowsort
+SELECT * from abc WHERE NOT EXISTS (SELECT * FROM def WHERE a=f AND c=e)
+----
+2  NULL  2
+
+query III rowsort
+SELECT * from abc WHERE EXISTS (SELECT * FROM def WHERE a=f AND d+b>1)
+----
+1  1  2
+2  1  1
+
+query III rowsort
+SELECT * from abc WHERE NOT EXISTS (SELECT * FROM def WHERE a=f AND d+b>1)
+----
+2  NULL  2
+
+query II
+SELECT a,b from small WHERE EXISTS (SELECT a FROM data WHERE small.a=data.a) ORDER BY a
+----
+1   2
+2   4
+3   6
+4   8
+5   10
+6   12
+7   14
+8   16
+9   18
+10  20
+
+query II
+SELECT a,b from small WHERE a+b<20 AND EXISTS (SELECT a FROM data WHERE small.a=data.a AND small.b+data.c>15) ORDER BY a
+----
+3  6
+4  8
+5  10
+6  12
+
+# Regression test for #50964.
+statement ok
+CREATE TABLE tab4 (
+  pk INT8 PRIMARY KEY, col0 INT8, col1 FLOAT8, col2 STRING, col3 INT8, col4 FLOAT8, col5 STRING,
+  UNIQUE (col3 DESC, col4 DESC)
+)
+
+query I
+SELECT pk FROM tab4 WHERE col0 IN (SELECT col3 FROM tab4 WHERE col4 = 495.6) AND (col3 IS NULL)
+----

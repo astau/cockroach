@@ -1,3 +1,13 @@
+// Copyright 2019 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 // Copyright (C) 2013-2018 by Maxim Bublis <b@codemonkey.ru>
 // Use of this source code is governed by a MIT-style
 // license that can be found in licenses/MIT-gofrs.txt.
@@ -19,7 +29,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // Difference in 100-nanosecond intervals between
@@ -162,8 +172,18 @@ func (g *Gen) NewV3(ns UUID, name string) UUID {
 // NewV4 returns a randomly generated UUID.
 func (g *Gen) NewV4() (UUID, error) {
 	u := UUID{}
-	if _, err := io.ReadFull(g.rand, u[:]); err != nil {
-		return Nil, err
+	if r, ok := g.rand.(defaultRandReader); ok {
+		if n, err := r.Read(u[:]); n != len(u) {
+			panic("math/rand.Read always returns len(p)")
+		} else if err != nil {
+			panic("math/rand.Read always returns a nil error")
+		}
+	} else {
+		willEscape := UUID{}
+		if _, err := io.ReadFull(g.rand, willEscape[:]); err != nil {
+			return Nil, err
+		}
+		u = willEscape
 	}
 	u.SetVersion(V4)
 	u.SetVariant(VariantRFC4122)

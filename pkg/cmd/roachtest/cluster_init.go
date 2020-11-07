@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -25,6 +21,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"golang.org/x/sync/errgroup"
 )
@@ -34,48 +31,21 @@ func runClusterInit(ctx context.Context, t *test, c *cluster) {
 
 	addrs := c.InternalAddr(ctx, c.All())
 
-	// Legacy-style init where we start node 1 without a join flag and then point
-	// the other nodes at it.
-	func() {
-		var g errgroup.Group
-		g.Go(func() error {
-			return c.RunE(ctx, c.Node(1),
-				`mkdir -p {log-dir} && `+
-					`./cockroach start --insecure --background --store={store-dir} `+
-					`--log-dir={log-dir} --cache=10% --max-sql-memory=10% `+
-					`--listen-addr=:{pgport:1} --http-port=$[{pgport:1}+1] `+
-					`> {log-dir}/cockroach.stdout 2> {log-dir}/cockroach.stderr`)
-		})
-		for i := 2; i <= c.nodes; i++ {
-			i := i
-			g.Go(func() error {
-				return c.RunE(ctx, c.Node(i),
-					fmt.Sprintf(
-						`mkdir -p {log-dir} && `+
-							`./cockroach start --insecure --background --store={store-dir} `+
-							`--log-dir={log-dir} --cache=10%% --max-sql-memory=10%% `+
-							`--listen-addr=:{pgport:%[1]d} --http-port=$[{pgport:%[1]d}+1] `+
-							`--join=`+addrs[0]+
-							`> {log-dir}/cockroach.stdout 2> {log-dir}/cockroach.stderr`, i))
-			})
-		}
-		if err := g.Wait(); err != nil {
-			t.Fatal(err)
-		}
+	// TODO(tbg): this should never happen, but I saw it locally. The result
+	// is the test hanging forever, because all nodes will create their own
+	// single node cluster and waitForFullReplication never returns.
+	if addrs[0] == "" {
+		t.Fatal("no address for first node")
+	}
 
-		db := c.Conn(ctx, 1)
-		defer db.Close()
-		waitForFullReplication(t, db)
-	}()
-
-	// New-style init where we start all nodes with the same join flags and then
-	// issue an "init" command to one of the nodes.
+	// We start all nodes with the same join flags and then issue an "init"
+	// command to one of the nodes.
 	for _, initNode := range []int{1, 2} {
 		c.Wipe(ctx)
 
 		func() {
 			var g errgroup.Group
-			for i := 1; i <= c.nodes; i++ {
+			for i := 1; i <= c.spec.NodeCount; i++ {
 				i := i
 				g.Go(func() error {
 					return c.RunE(ctx, c.Node(i),
@@ -96,8 +66,8 @@ func runClusterInit(ctx context.Context, t *test, c *cluster) {
 
 			// Wait for the servers to bind their ports.
 			if err := retry.ForDuration(10*time.Second, func() error {
-				for i := 1; i <= c.nodes; i++ {
-					resp, err := http.Get(urlMap[i] + "/health")
+				for i := 1; i <= c.spec.NodeCount; i++ {
+					resp, err := httputil.Get(ctx, urlMap[i]+"/health")
 					if err != nil {
 						return err
 					}
@@ -109,7 +79,7 @@ func runClusterInit(ctx context.Context, t *test, c *cluster) {
 			}
 
 			var dbs []*gosql.DB
-			for i := 1; i <= c.nodes; i++ {
+			for i := 1; i <= c.spec.NodeCount; i++ {
 				db := c.Conn(ctx, i)
 				defer db.Close()
 				dbs = append(dbs, db)
@@ -158,7 +128,7 @@ func runClusterInit(ctx context.Context, t *test, c *cluster) {
 							// The actual contents of the cookie don't matter; the presence of
 							// a valid encoded cookie is enough to trigger the authentication
 							// code paths.
-						})
+						}, false /* forHTTPSOnly - cluster is insecure */)
 						if err != nil {
 							t.Fatal(err)
 						}

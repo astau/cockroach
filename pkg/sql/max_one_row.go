@@ -1,22 +1,19 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
@@ -32,8 +29,13 @@ import (
 type max1RowNode struct {
 	plan planNode
 
-	nexted bool
-	values tree.Datums
+	nexted    bool
+	values    tree.Datums
+	errorText string
+}
+
+func (m *max1RowNode) startExec(runParams) error {
+	return nil
 }
 
 func (m *max1RowNode) Next(params runParams) (bool, error) {
@@ -55,8 +57,11 @@ func (m *max1RowNode) Next(params runParams) (bool, error) {
 		var secondOk bool
 		secondOk, err = m.plan.Next(params)
 		if secondOk {
-			return false, pgerror.NewErrorf(pgerror.CodeCardinalityViolationError,
-				"more than one row returned by a subquery used as an expression")
+			// TODO(knz): m.errorText could be passed via log.Safe if there
+			// was a guarantee that it does not contain PII. Or better yet,
+			// the caller would construct an `error` object to return here
+			// instead of a string.
+			return false, pgerror.Newf(pgcode.CardinalityViolation, "%s", m.errorText)
 		}
 	}
 	return ok, err

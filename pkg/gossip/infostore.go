@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package gossip
 
@@ -31,7 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 type stringMatcher interface {
@@ -255,8 +251,8 @@ func (is *infoStore) addInfo(key string, i *Info) error {
 		i.OrigStamp = monotonicUnixNano()
 		if highWaterStamp, ok := is.highWaterStamps[i.NodeID]; ok && highWaterStamp >= i.OrigStamp {
 			// Report both timestamps in the crash.
-			log.Fatal(context.Background(),
-				log.Safe(fmt.Sprintf("high water stamp %d >= %d", highWaterStamp, i.OrigStamp)))
+			log.Fatalf(context.Background(),
+				"high water stamp %d >= %d", log.Safe(highWaterStamp), log.Safe(i.OrigStamp))
 		}
 	}
 	// Update info map.
@@ -314,6 +310,7 @@ func (is *infoStore) registerCallback(
 			if targetCB == cb {
 				numCBs := len(is.callbacks)
 				is.callbacks[i] = is.callbacks[numCBs-1]
+				is.callbacks[numCBs-1] = nil // for GC
 				is.callbacks = is.callbacks[:numCBs-1]
 				break
 			}
@@ -403,7 +400,7 @@ func (is *infoStore) combine(
 		// the data in *is is newer than in *delta.
 		if addErr := is.addInfo(key, &infoCopy); addErr == nil {
 			freshCount++
-		} else if addErr != errNotFresh {
+		} else if !errors.Is(addErr, errNotFresh) {
 			err = addErr
 		}
 	}

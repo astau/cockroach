@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 // +build !darwin
 
@@ -18,6 +14,7 @@ package status
 
 import (
 	"context"
+	"time"
 
 	"github.com/shirou/gopsutil/disk"
 )
@@ -34,8 +31,12 @@ func getDiskCounters(ctx context.Context) ([]diskStats, error) {
 		output[i] = diskStats{
 			readBytes:      int64(counters.ReadBytes),
 			readCount:      int64(counters.ReadCount),
+			readTime:       time.Duration(counters.ReadTime) * time.Millisecond,
 			writeBytes:     int64(counters.WriteBytes),
 			writeCount:     int64(counters.WriteCount),
+			writeTime:      time.Duration(counters.WriteTime) * time.Millisecond,
+			ioTime:         time.Duration(counters.IoTime) * time.Millisecond,
+			weightedIOTime: time.Duration(counters.WeightedIO) * time.Millisecond,
 			iopsInProgress: int64(counters.IopsInProgress),
 		}
 		i++

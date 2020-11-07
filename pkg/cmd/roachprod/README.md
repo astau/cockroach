@@ -5,15 +5,11 @@ CockroachDB clusters. Use at your own risk! ⚠️
 
 ## Setup
 
-Make sure you have [gcloud installed] and configured (`gcloud auth list` to
+1. Make sure you have [gcloud installed] and configured (`gcloud auth list` to
 check, `gcloud auth login` to authenticate). You may want to update old
 installations (`gcloud components update`).
-
-To build and install into `$GOPATH/bin`:
-
-```
-$ go get -u github.com/cockroachdb/roachprod
-```
+1. Build a local binary of `roachprod`: `make bin/roachprod`
+1. Add `$PWD/bin` to your `PATH` so you can run `roachprod` from the root directory of `cockroach`.
 
 ## Summary
 
@@ -42,7 +38,7 @@ $ go get -u github.com/cockroachdb/roachprod
 export CLUSTER="${USER}-test"
 roachprod create ${CLUSTER} -n 4 --local-ssd
 
-# Add gcloud SSH key.
+# Add gcloud SSH key. Optional for most commands, but some require it.
 ssh-add ~/.ssh/google_compute_engine
 
 # Stage binaries.
@@ -50,16 +46,21 @@ roachprod stage ${CLUSTER} workload
 roachprod stage ${CLUSTER} release v2.0.5
 
 # ...or using roachprod directly (e.g., for your locally-built binary).
-roachprod put ${CLUSTER} cockroach
+build/builder.sh mkrelease
+roachprod put ${CLUSTER} cockroach-linux-2.6.32-gnu-amd64 cockroach
 
 # Start a cluster.
 roachprod start ${CLUSTER}
 
 # Check the admin UI.
-# http://35.196.94.196:26258
+roachprod admin --open ${CLUSTER}:1
+
+# Run a workload.
+roachprod run ${CLUSTER}:4 -- ./workload init kv
+roachprod run ${CLUSTER}:4 -- ./workload run kv --read-percent=0 --splits=1000 --concurrency=384 --duration=5m
 
 # Open a SQL connection to the first node.
-cockroach sql --insecure --host=35.196.94.196
+roachprod sql ${CLUSTER}:1
 
 # Extend lifetime by another 6 hours.
 roachprod extend ${CLUSTER} --lifetime=6h
@@ -74,6 +75,7 @@ Warning: this reference is incomplete. Be prepared to refer to the CLI help text
 and the source code.
 
 ### Create a cluster
+
 ```
 $ roachprod create foo
 Creating cluster marc-foo with 3 nodes
@@ -85,7 +87,31 @@ marc-foo: 23h59m42s remaining
 Syncing...
 ```
 
+#### Choosing a Provider
+
+Use the `--clouds` flag to set which cloud provider(s) to use. Ex:
+
+```
+$ roachprod create foo --clouds gce,aws
+```
+
+#### Node Distribution Options
+
+There are a couple flags that interact to create nodes in one zone or in
+geographically distributed zones:
+
+- `--geo`
+- the `--[provider]-zones` flags (`--gce-zones`, `--aws-zones`, `--azure-locations`)
+
+Here's what to expect when the options are combined:
+
+- _If neither are set_: nodes are all placed within one of the the provider's default zones
+- _`--geo` only_: nodes are spread across the provider's default zones
+- _`--[provider]-zones` or `--geo --[provider]-zones`_: nodes are spread across
+  all the specified zones
+
 ### Interact using crl-prod tools
+
 `roachprod` populates hosts files in `~/.roachprod/hosts`. These are used by
 `crl-prod` tools to map clusters to node addresses.
 
@@ -118,6 +144,7 @@ marc-foo: status 3/3
 ```
 
 ### SSH into hosts
+
 `roachprod` uses `gcloud` to sync the list of hostnames to `~/.ssh/config` and
 set up keys.
 
@@ -126,6 +153,7 @@ $ ssh marc-foo-0000.us-east1-b.cockroach-ephemeral
 ```
 
 ### List clusters
+
 ```
 $ roachprod list
 marc-foo: 23h58m27s remaining
@@ -136,6 +164,7 @@ Syncing...
 ```
 
 ### Destroy cluster
+
 ```
 $ roachprod destroy marc-foo
 Destroying cluster marc-foo with 3 nodes
@@ -144,6 +173,26 @@ OK
 
 See `roachprod help <command>` for further details.
 
+## Return Codes
+
+`roachprod` uses return codes to provide information about the exit status.
+These are the codes and what they mean:
+
+- 0: everything ran as expected
+- 1: an unclassified roachprod error
+- 10: a problem with an SSH connection to a server in the cluster
+- 20: a problem running a non-cockroach command on a remote cluster server or on a local node
+- 30: a problem running a cockroach command on a remote cluster server or a local node
+
+Each of these codes has a corresponding easy-to-search-for string that is
+emitted to output when an error of that type occurs. The strings are emitted
+near the end of output and for each error that happens during an ssh
+connection to a remote cluster node. The strings for each error code are:
+
+- 1:  `UNCLASSIFIED_PROBLEM`
+- 10: `SSH_PROBLEM`
+- 20: `COMMAND_PROBLEM`
+- 30: `DEAD_ROACH_PROBLEM`
 
 # Future improvements
 

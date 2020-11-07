@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package cli
 
@@ -21,6 +17,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 func Example_debug_decode_key_value() {
@@ -31,12 +28,13 @@ func Example_debug_decode_key_value() {
 	// unable to decode key: invalid encoded mvcc key: 016b12bd8980c0b6c2e211ba5182000172647363, assuming it's a roachpb.Key with fake timestamp;
 	// if the result below looks like garbage, then it likely is:
 	//
-	// 0.987654321,0 /Local/Range/Table/53/1/-4560243296450227838/RangeDescriptor: [/Table/53/1/-4560243296450227838, /Table/53/1/-4559358311118345834)
+	// 0.987654321,0 /Local/Range/Table/53/1/-4560243296450227838/RangeDescriptor (0x016b12bd8980c0b6c2e211ba518200017264736300000000003ade68b109): [/Table/53/1/-4560243296450227838, /Table/53/1/-4559358311118345834)
 	// 	Raw:r1179:/Table/53/1/-45{60243296450227838-59358311118345834} [(n1,s1):1, (n4,s4):2, (n2,s2):4, next=5, gen=4]
 }
 
 func TestDebugKeysHex(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	baseDir, dirCleanupFn := testutils.TempDir(t)
 	defer dirCleanupFn()

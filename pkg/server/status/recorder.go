@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package status
 
@@ -20,39 +16,37 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
 	"os"
 	"runtime"
 	"strconv"
-	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/ts/tspb"
+	"github.com/cockroachdb/cockroach/pkg/util/cgroups"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
-	"github.com/dustin/go-humanize"
+	"github.com/cockroachdb/errors"
+	humanize "github.com/dustin/go-humanize"
 	"github.com/elastic/gosigar"
-	"github.com/pkg/errors"
 )
 
 const (
-	defaultCGroupMemPath = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
 	// storeTimeSeriesPrefix is the common prefix for time series keys which
 	// record store-specific data.
 	storeTimeSeriesPrefix = "cr.store.%s"
@@ -62,6 +56,7 @@ const (
 
 	advertiseAddrLabelKey = "advertise-addr"
 	httpAddrLabelKey      = "http-addr"
+	sqlAddrLabelKey       = "sql-addr"
 )
 
 type quantile struct {
@@ -85,10 +80,13 @@ var recordHistogramQuantiles = []quantile{
 // directly in order to simplify testing.
 type storeMetrics interface {
 	StoreID() roachpb.StoreID
-	Descriptor(bool) (*roachpb.StoreDescriptor, error)
-	MVCCStats() enginepb.MVCCStats
+	Descriptor(context.Context, bool) (*roachpb.StoreDescriptor, error)
 	Registry() *metric.Registry
 }
+
+var childMetricsEnabled = settings.RegisterBoolSetting("server.child_metrics.enabled",
+	"enables the exporting of child metrics, additional prometheus time series with extra labels",
+	false)
 
 // MetricsRecorder is used to periodically record the information in a number of
 // metric registries.
@@ -100,7 +98,7 @@ type storeMetrics interface {
 type MetricsRecorder struct {
 	*HealthChecker
 	gossip       *gossip.Gossip
-	nodeLiveness *storage.NodeLiveness
+	nodeLiveness *liveness.NodeLiveness
 	rpcContext   *rpc.Context
 	settings     *cluster.Settings
 	clock        *hlc.Clock
@@ -149,7 +147,7 @@ type MetricsRecorder struct {
 // given clock.
 func NewMetricsRecorder(
 	clock *hlc.Clock,
-	nodeLiveness *storage.NodeLiveness,
+	nodeLiveness *liveness.NodeLiveness,
 	rpcContext *rpc.Context,
 	gossip *gossip.Gossip,
 	settings *cluster.Settings,
@@ -174,7 +172,7 @@ func (mr *MetricsRecorder) AddNode(
 	reg *metric.Registry,
 	desc roachpb.NodeDescriptor,
 	startedAt int64,
-	advertiseAddr, httpAddr string,
+	advertiseAddr, httpAddr, sqlAddr string,
 ) {
 	mr.mu.Lock()
 	defer mr.mu.Unlock()
@@ -192,6 +190,7 @@ func (mr *MetricsRecorder) AddNode(
 
 	metadata.AddLabel(advertiseAddrLabelKey, advertiseAddr)
 	metadata.AddLabel(httpAddrLabelKey, httpAddr)
+	metadata.AddLabel(sqlAddrLabelKey, sqlAddr)
 	nodeIDGauge := metric.NewGauge(metadata)
 	nodeIDGauge.Update(int64(desc.NodeID))
 	reg.AddMetric(nodeIDGauge)
@@ -253,10 +252,10 @@ func (mr *MetricsRecorder) scrapeIntoPrometheus(pm *metric.PrometheusExporter) {
 			log.Warning(context.TODO(), "MetricsRecorder asked to scrape metrics before NodeID allocation")
 		}
 	}
-
-	pm.ScrapeRegistry(mr.mu.nodeRegistry)
+	includeChildMetrics := childMetricsEnabled.Get(&mr.settings.SV)
+	pm.ScrapeRegistry(mr.mu.nodeRegistry, includeChildMetrics)
 	for _, reg := range mr.mu.storeRegistries {
-		pm.ScrapeRegistry(reg)
+		pm.ScrapeRegistry(reg, includeChildMetrics)
 	}
 }
 
@@ -386,7 +385,7 @@ func (mr *MetricsRecorder) getNetworkActivity(
 			address, err := mr.gossip.GetNodeIDAddress(nodeID)
 			if err != nil {
 				if entry.IsLive {
-					log.Warning(ctx, err.Error())
+					log.Warningf(ctx, "%v", err)
 				}
 				continue
 			}
@@ -433,7 +432,7 @@ func (mr *MetricsRecorder) GenerateNodeStatus(ctx context.Context) *statuspb.Nod
 
 	systemMemory, _, err := GetTotalMemoryWithoutLogging()
 	if err != nil {
-		log.Error(ctx, "could not get total system memory:", err)
+		log.Errorf(ctx, "could not get total system memory: %v", err)
 	}
 
 	// Generate a node status with no store data.
@@ -451,15 +450,6 @@ func (mr *MetricsRecorder) GenerateNodeStatus(ctx context.Context) *statuspb.Nod
 		TotalSystemMemory: systemMemory,
 	}
 
-	// If the cluster hasn't yet been definitively moved past the network stats
-	// phase, ensure that we provide latencies separately for backwards compatibility.
-	if !mr.settings.Version.IsMinSupported(cluster.VersionRPCNetworkStats) {
-		nodeStat.Latencies = make(map[roachpb.NodeID]int64)
-		for nodeID, na := range nodeStat.Activity {
-			nodeStat.Latencies[nodeID] = na.Latency
-		}
-	}
-
 	eachRecordableValue(mr.mu.nodeRegistry, func(name string, val float64) {
 		nodeStat.Metrics[name] = val
 	})
@@ -472,9 +462,9 @@ func (mr *MetricsRecorder) GenerateNodeStatus(ctx context.Context) *statuspb.Nod
 		})
 
 		// Gather descriptor from store.
-		descriptor, err := mr.mu.stores[storeID].Descriptor(false /* useCached */)
+		descriptor, err := mr.mu.stores[storeID].Descriptor(ctx, false /* useCached */)
 		if err != nil {
-			log.Errorf(ctx, "Could not record status summaries: Store %d could not return descriptor, error: %s", storeID, err)
+			log.Errorf(ctx, "could not record status summaries: Store %d could not return descriptor, error: %s", storeID, err)
 			continue
 		}
 
@@ -498,7 +488,7 @@ func (mr *MetricsRecorder) GenerateNodeStatus(ctx context.Context) *statuspb.Nod
 
 // WriteNodeStatus writes the supplied summary to the given client.
 func (mr *MetricsRecorder) WriteNodeStatus(
-	ctx context.Context, db *client.DB, nodeStatus statuspb.NodeStatus,
+	ctx context.Context, db *kv.DB, nodeStatus statuspb.NodeStatus,
 ) error {
 	mr.writeSummaryMu.Lock()
 	defer mr.writeSummaryMu.Unlock()
@@ -532,17 +522,22 @@ type registryRecorder struct {
 }
 
 func extractValue(mtr interface{}) (float64, error) {
-	// TODO(tschottdorf|mrtracy): consider moving this switch to an interface
-	// implemented by the individual metric types.
+	// TODO(tschottdorf,ajwerner): consider moving this switch to a single
+	// interface implemented by the individual metric types.
+	type (
+		float64Valuer interface{ Value() float64 }
+		int64Valuer   interface{ Value() int64 }
+		int64Counter  interface{ Count() int64 }
+	)
 	switch mtr := mtr.(type) {
 	case float64:
 		return mtr, nil
-	case *metric.Counter:
-		return float64(mtr.Count()), nil
-	case *metric.Gauge:
-		return float64(mtr.Value()), nil
-	case *metric.GaugeFloat64:
+	case float64Valuer:
 		return mtr.Value(), nil
+	case int64Valuer:
+		return float64(mtr.Value()), nil
+	case int64Counter:
+		return float64(mtr.Count()), nil
 	default:
 		return 0, errors.Errorf("cannot extract value for type %T", mtr)
 	}
@@ -576,7 +571,7 @@ func eachRecordableValue(reg *metric.Registry, fn func(string, float64)) {
 		} else {
 			val, err := extractValue(mtr)
 			if err != nil {
-				log.Warning(context.TODO(), err)
+				log.Warningf(context.TODO(), "%v", err)
 				return
 			}
 			fn(name, val)
@@ -599,15 +594,15 @@ func (rr registryRecorder) record(dest *[]tspb.TimeSeriesData) {
 	})
 }
 
-// GetTotalMemory returns either the total system memory or if possible the
-// cgroups available memory.
+// GetTotalMemory returns either the total system memory (in bytes) or if
+// possible the cgroups available memory.
 func GetTotalMemory(ctx context.Context) (int64, error) {
 	memory, warning, err := GetTotalMemoryWithoutLogging()
 	if err != nil {
 		return 0, err
 	}
 	if warning != "" {
-		log.Infof(ctx, warning)
+		log.Infof(ctx, "%s", warning)
 	}
 	return memory, nil
 }
@@ -639,32 +634,16 @@ func GetTotalMemoryWithoutLogging() (int64, string, error) {
 	if runtime.GOOS != "linux" {
 		return checkTotal(totalMem, "")
 	}
-
-	var buf []byte
-	if buf, err = ioutil.ReadFile(defaultCGroupMemPath); err != nil {
-		warning := fmt.Sprintf("can't read available memory from cgroups (%s), using system memory %s instead",
-			err, humanizeutil.IBytes(totalMem))
-		return checkTotal(totalMem, warning)
-	}
-
-	cgAvlMem, err := strconv.ParseUint(strings.TrimSpace(string(buf)), 10, 64)
+	cgAvlMem, warning, err := cgroups.GetMemoryLimit()
 	if err != nil {
-		warning := fmt.Sprintf("can't parse available memory from cgroups (%s), using system memory %s instead",
-			err, humanizeutil.IBytes(totalMem))
-		return checkTotal(totalMem, warning)
+		return checkTotal(totalMem,
+			fmt.Sprintf("available memory from cgroups is unsupported, using system memory %s instead: %v",
+				humanizeutil.IBytes(totalMem), err))
 	}
-
-	if cgAvlMem == 0 || cgAvlMem > math.MaxInt64 {
-		warning := fmt.Sprintf("available memory from cgroups (%s) is unsupported, using system memory %s instead",
-			humanize.IBytes(cgAvlMem), humanizeutil.IBytes(totalMem))
-		return checkTotal(totalMem, warning)
+	if cgAvlMem == 0 || (totalMem > 0 && cgAvlMem > totalMem) {
+		return checkTotal(totalMem,
+			fmt.Sprintf("available memory from cgroups (%s) is unsupported, using system memory %s instead: %s",
+				humanize.IBytes(uint64(cgAvlMem)), humanizeutil.IBytes(totalMem), warning))
 	}
-
-	if totalMem > 0 && int64(cgAvlMem) > totalMem {
-		warning := fmt.Sprintf("available memory from cgroups (%s) exceeds system memory %s, using system memory",
-			humanize.IBytes(cgAvlMem), humanizeutil.IBytes(totalMem))
-		return checkTotal(totalMem, warning)
-	}
-
-	return checkTotal(int64(cgAvlMem), "")
+	return checkTotal(cgAvlMem, "")
 }

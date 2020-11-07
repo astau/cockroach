@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tree_test
 
@@ -19,17 +15,22 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	_ "github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/stop"
 )
 
 // Test that EvalContext.GetClusterTimestamp() gets its timestamp from the
 // transaction, and also that the conversion to decimal works properly.
 func TestClusterTimestampConversion(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	testData := []struct {
 		walltime int64
 		logical  int32
@@ -42,32 +43,36 @@ func TestClusterTimestampConversion(t *testing.T) {
 		{9223372036854775807, 2147483647, "9223372036854775807.2147483647"},
 	}
 
+	ctx := context.Background()
+	stopper := stop.NewStopper()
+	defer stopper.Stop(ctx)
+
 	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
-	senderFactory := client.MakeMockTxnSenderFactory(
+	senderFactory := kv.MakeMockTxnSenderFactory(
 		func(context.Context, *roachpb.Transaction, roachpb.BatchRequest,
 		) (*roachpb.BatchResponse, *roachpb.Error) {
 			panic("unused")
 		})
-	db := client.NewDB(
-		testutils.MakeAmbientCtx(),
-		senderFactory,
-		clock)
+	db := kv.NewDB(testutils.MakeAmbientCtx(), senderFactory, clock, stopper)
 
 	for _, d := range testData {
 		ts := hlc.Timestamp{WallTime: d.walltime, Logical: d.logical}
+		txnProto := roachpb.MakeTransaction(
+			"test",
+			nil, // baseKey
+			roachpb.NormalUserPriority,
+			ts,
+			0, /* maxOffsetNs */
+		)
+
 		ctx := tree.EvalContext{
-			Txn: client.NewTxnWithProto(
+			Txn: kv.NewTxnFromProto(
 				context.Background(),
 				db,
 				1, /* gatewayNodeID */
-				client.RootTxn,
-				roachpb.MakeTransaction(
-					"test",
-					nil, // baseKey
-					roachpb.NormalUserPriority,
-					ts,
-					0, /* maxOffsetNs */
-				),
+				ts,
+				kv.RootTxn,
+				&txnProto,
 			),
 		}
 

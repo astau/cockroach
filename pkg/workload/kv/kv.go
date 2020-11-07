@@ -1,23 +1,19 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package kv
 
 import (
 	"context"
 	"crypto/sha1"
+	gosql "database/sql"
 	"encoding/binary"
 	"fmt"
 	"hash"
@@ -29,7 +25,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
+	"github.com/cockroachdb/errors"
 	"github.com/spf13/pflag"
 )
 
@@ -41,6 +38,21 @@ const (
 	kvSchemaWithIndex = `(
 		k BIGINT NOT NULL PRIMARY KEY,
 		v BYTES NOT NULL,
+		INDEX (v)
+	)`
+	// TODO(ajwerner): Change this to use the "easier" hash sharded index syntax once that
+	// is in.
+	shardedKvSchema = `(
+		k BIGINT NOT NULL,
+		v BYTES NOT NULL,
+		shard INT4 AS (mod(k, %d)) STORED CHECK (%s),
+		PRIMARY KEY (shard, k)
+	)`
+	shardedKvSchemaWithIndex = `(
+		k BIGINT NOT NULL,
+		v BYTES NOT NULL,
+		shard INT4 AS (mod(k, %d)) STORED CHECK (%s),
+		PRIMARY KEY (shard, k),
 		INDEX (v)
 	)`
 )
@@ -60,7 +72,9 @@ type kv struct {
 	zipfian                              bool
 	splits                               int
 	secondaryIndex                       bool
-	useOpt                               bool
+	shards                               int
+	targetCompressionRatio               float64
+	enum                                 bool
 }
 
 func init() {
@@ -68,10 +82,10 @@ func init() {
 }
 
 var kvMeta = workload.Meta{
-	Name: `kv`,
-	Description: `
-	KV reads and writes to keys spread (by default, uniformly	at random) across
-	the cluster.
+	Name:        `kv`,
+	Description: `KV reads and writes to keys spread randomly across the cluster.`,
+	Details: `
+	By default, keys are picked uniformly at random across the cluster.
 	--concurrency workers alternate between doing selects and upserts (according
 	to a --read-percent ratio). Each select/upsert reads/writes a batch of --batch
 	rows. The write keys are randomly generated in a deterministic fashion (or
@@ -80,7 +94,8 @@ var kvMeta = workload.Meta{
 	--write-seq can be used to incorporate data produced by a previous run into
 	the current run.
 	`,
-	Version: `1.0.0`,
+	Version:      `1.0.0`,
+	PublicFacing: true,
 	New: func() workload.Generator {
 		g := &kv{}
 		g.flags.FlagSet = pflag.NewFlagSet(`kv`, pflag.ContinueOnError)
@@ -91,7 +106,7 @@ var kvMeta = workload.Meta{
 			`Number of blocks to read/insert in a single SQL statement.`)
 		g.flags.IntVar(&g.minBlockSizeBytes, `min-block-bytes`, 1,
 			`Minimum amount of raw data written with each insertion.`)
-		g.flags.IntVar(&g.maxBlockSizeBytes, `max-block-bytes`, 2,
+		g.flags.IntVar(&g.maxBlockSizeBytes, `max-block-bytes`, 1,
 			`Maximum amount of raw data written with each insertion`)
 		g.flags.Int64Var(&g.cycleLength, `cycle-length`, math.MaxInt64,
 			`Number of keys repeatedly accessed by each writer through upserts.`)
@@ -112,7 +127,12 @@ var kvMeta = workload.Meta{
 			`Number of splits to perform before starting normal operations.`)
 		g.flags.BoolVar(&g.secondaryIndex, `secondary-index`, false,
 			`Add a secondary index to the schema`)
-		g.flags.BoolVar(&g.useOpt, `use-opt`, true, `Use cost-based optimizer`)
+		g.flags.IntVar(&g.shards, `num-shards`, 0,
+			`Number of shards to create on the primary key.`)
+		g.flags.Float64Var(&g.targetCompressionRatio, `target-compression-ratio`, 1.0,
+			`Target compression ratio for data blocks. Must be >= 1.0`)
+		g.flags.BoolVar(&g.enum, `enum`, false,
+			`Inject an enum column and use it`)
 		g.connFlags = workload.NewConnFlags(&g.flags)
 		return g
 	},
@@ -127,6 +147,15 @@ func (w *kv) Flags() workload.Flags { return w.flags }
 // Hooks implements the Hookser interface.
 func (w *kv) Hooks() workload.Hooks {
 	return workload.Hooks{
+		PostLoad: func(db *gosql.DB) error {
+			if !w.enum {
+				return nil
+			}
+			_, err := db.Exec(`
+CREATE TYPE enum_type AS ENUM ('v');
+ALTER TABLE kv ADD COLUMN e enum_type NOT NULL AS ('v') STORED;`)
+			return err
+		},
 		Validate: func() error {
 			if w.maxBlockSizeBytes < w.minBlockSizeBytes {
 				return errors.Errorf("Value of 'max-block-bytes' (%d) must be greater than or equal to value of 'min-block-bytes' (%d)",
@@ -141,6 +170,9 @@ func (w *kv) Hooks() workload.Hooks {
 			if w.readPercent+w.spanPercent > 100 {
 				return errors.New("'read-percent' and 'span-percent' higher than 100")
 			}
+			if w.targetCompressionRatio < 1.0 || math.IsNaN(w.targetCompressionRatio) {
+				return errors.New("'target-compression-ratio' must be a number >= 1.0")
+			}
 			return nil
 		},
 	}
@@ -154,22 +186,41 @@ func (w *kv) Tables() []workload.Table {
 		Splits: workload.Tuples(
 			w.splits,
 			func(splitIdx int) []interface{} {
-				stride := (float64(math.MaxInt64) - float64(math.MinInt64)) / float64(w.splits+1)
+				stride := (float64(w.cycleLength) - float64(math.MinInt64)) / float64(w.splits+1)
 				splitPoint := int(math.MinInt64 + float64(splitIdx+1)*stride)
 				return []interface{}{splitPoint}
 			},
 		),
 	}
-	if w.secondaryIndex {
-		table.Schema = kvSchemaWithIndex
+	if w.shards > 0 {
+		schema := shardedKvSchema
+		if w.secondaryIndex {
+			schema = shardedKvSchemaWithIndex
+		}
+		checkConstraint := strings.Builder{}
+		checkConstraint.WriteString(`shard IN (`)
+		for i := 0; i < w.shards; i++ {
+			if i != 0 {
+				checkConstraint.WriteString(",")
+			}
+			fmt.Fprintf(&checkConstraint, "%d", i)
+		}
+		checkConstraint.WriteString(")")
+		table.Schema = fmt.Sprintf(schema, w.shards, checkConstraint.String())
 	} else {
-		table.Schema = kvSchema
+		if w.secondaryIndex {
+			table.Schema = kvSchemaWithIndex
+		} else {
+			table.Schema = kvSchema
+		}
 	}
 	return []workload.Table{table}
 }
 
 // Ops implements the Opser interface.
-func (w *kv) Ops(urls []string, reg *workload.HistogramRegistry) (workload.QueryLoad, error) {
+func (w *kv) Ops(
+	ctx context.Context, urls []string, reg *histogram.Registry,
+) (workload.QueryLoad, error) {
 	writeSeq := 0
 	if w.writeSeq != "" {
 		first := w.writeSeq[0]
@@ -191,31 +242,49 @@ func (w *kv) Ops(urls []string, reg *workload.HistogramRegistry) (workload.Query
 		}
 	}
 
-	ctx := context.Background()
 	sqlDatabase, err := workload.SanitizeUrls(w, w.connFlags.DBOverride, urls)
 	if err != nil {
 		return workload.QueryLoad{}, err
 	}
-	mcp, err := workload.NewMultiConnPool(w.connFlags.Concurrency+1, urls...)
+	cfg := workload.MultiConnPoolCfg{
+		MaxTotalConnections: w.connFlags.Concurrency + 1,
+	}
+	mcp, err := workload.NewMultiConnPool(cfg, urls...)
 	if err != nil {
 		return workload.QueryLoad{}, err
 	}
 
-	if !w.useOpt {
-		_, err := mcp.Get().Exec("SET optimizer=off")
-		if err != nil {
-			return workload.QueryLoad{}, err
-		}
-	}
-
 	// Read statement
 	var buf strings.Builder
-	buf.WriteString(`SELECT k, v FROM kv WHERE k IN (`)
-	for i := 0; i < w.batchSize; i++ {
-		if i > 0 {
-			buf.WriteString(", ")
+	if w.shards == 0 {
+		buf.WriteString(`SELECT k, v FROM kv WHERE k IN (`)
+		for i := 0; i < w.batchSize; i++ {
+			if i > 0 {
+				buf.WriteString(", ")
+			}
+			fmt.Fprintf(&buf, `$%d`, i+1)
 		}
-		fmt.Fprintf(&buf, `$%d`, i+1)
+	} else if w.enum {
+		buf.WriteString(`SELECT k, v, e FROM kv WHERE k IN (`)
+		for i := 0; i < w.batchSize; i++ {
+			if i > 0 {
+				buf.WriteString(", ")
+			}
+			fmt.Fprintf(&buf, `$%d`, i+1)
+		}
+	} else {
+		// TODO(ajwerner): We're currently manually plumbing down the computed shard column
+		// since the optimizer doesn't yet support deriving values of computed columns
+		// when all the columns they reference are available. See
+		// https://github.com/cockroachdb/cockroach/issues/39340#issuecomment-535338071
+		// for details. Remove this once that functionality is added.
+		buf.WriteString(`SELECT k, v FROM kv WHERE (shard, k) in (`)
+		for i := 0; i < w.batchSize; i++ {
+			if i > 0 {
+				buf.WriteString(", ")
+			}
+			fmt.Fprintf(&buf, `(mod($%d, %d), $%d)`, i+1, w.shards, i+1)
+		}
 	}
 	buf.WriteString(`)`)
 	readStmtStr := buf.String()
@@ -265,7 +334,7 @@ func (w *kv) Ops(urls []string, reg *workload.HistogramRegistry) (workload.Query
 
 type kvOp struct {
 	config          *kv
-	hists           *workload.Histograms
+	hists           *histogram.Histograms
 	sr              workload.SQLRunner
 	readStmt        workload.StmtHandle
 	writeStmt       workload.StmtHandle
@@ -483,10 +552,18 @@ func (g *zipfGenerator) sequence() int64 {
 }
 
 func randomBlock(config *kv, r *rand.Rand) []byte {
-	blockSize := r.Intn(config.maxBlockSizeBytes-config.minBlockSizeBytes) + config.minBlockSizeBytes
+	blockSize := r.Intn(config.maxBlockSizeBytes-config.minBlockSizeBytes+1) + config.minBlockSizeBytes
 	blockData := make([]byte, blockSize)
+	uniqueSize := int(float64(blockSize) / config.targetCompressionRatio)
+	if uniqueSize < 1 {
+		uniqueSize = 1
+	}
 	for i := range blockData {
-		blockData[i] = byte(r.Int() & 0xff)
+		if i >= uniqueSize {
+			blockData[i] = blockData[i-uniqueSize]
+		} else {
+			blockData[i] = byte(r.Int() & 0xff)
+		}
 	}
 	return blockData
 }

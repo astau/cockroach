@@ -1,4 +1,6 @@
-# LogicTest: local local-opt local-parallel-stmts fakedist fakedist-opt fakedist-metadata
+# Disable automatic stats to avoid flakiness.
+statement ok
+SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false
 
 # Test default table-level permissions.
 # Default user is root.
@@ -70,7 +72,7 @@ statement error pq: user testuser does not have SELECT privilege on relation t
 SELECT r FROM t
 
 statement error pq: user testuser does not have SELECT privilege on relation t
-SELECT * from [56 as num_ref]
+SELECT * from [55 as num_ref]
 
 statement error user testuser does not have GRANT privilege on relation t
 GRANT ALL ON t TO bar
@@ -167,10 +169,16 @@ REVOKE SELECT ON t FROM testuser
 user testuser
 
 statement ok
-GRANT ALL ON t TO bar
+GRANT INSERT ON t TO bar
 
 statement ok
-REVOKE ALL ON t FROM bar
+REVOKE INSERT ON t FROM bar
+
+statement error user testuser does not have ALL privilege on relation t
+GRANT ALL ON t TO bar
+
+statement error user testuser does not have SELECT privilege on relation t
+GRANT SELECT ON t TO bar
 
 statement ok
 INSERT INTO t VALUES (1, 1), (2, 2)

@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 import _ from "lodash";
 import React from "react";
@@ -28,16 +24,20 @@ interface LogTableProps {
 }
 
 function printLogEventType(
-  eventType: protos.cockroach.storage.RangeLogEventType,
+  eventType: protos.cockroach.kv.kvserver.storagepb.RangeLogEventType,
 ) {
   switch (eventType) {
-    case protos.cockroach.storage.RangeLogEventType.add:
-      return "Add";
-    case protos.cockroach.storage.RangeLogEventType.remove:
-      return "Remove";
-    case protos.cockroach.storage.RangeLogEventType.split:
+    case protos.cockroach.kv.kvserver.storagepb.RangeLogEventType.add_voter:
+      return "Add Voter";
+    case protos.cockroach.kv.kvserver.storagepb.RangeLogEventType.remove_voter:
+      return "Remove Voter";
+    case protos.cockroach.kv.kvserver.storagepb.RangeLogEventType.add_non_voter:
+      return "Add Non-Voter";
+    case protos.cockroach.kv.kvserver.storagepb.RangeLogEventType.remove_non_voter:
+      return "Remove Non-Voter";
+    case protos.cockroach.kv.kvserver.storagepb.RangeLogEventType.split:
       return "Split";
-    case protos.cockroach.storage.RangeLogEventType.merge:
+    case protos.cockroach.kv.kvserver.storagepb.RangeLogEventType.merge:
       return "Merge";
     default:
       return "Unknown";
@@ -133,7 +133,7 @@ export default class LogTable extends React.Component<LogTableProps, {}> {
 
     return (
       <div>
-        <h2>Range Log</h2>
+        <h2 className="base-heading">Range Log</h2>
         <Loading
           loading={!log || log.inFlight}
           error={log && log.lastError}

@@ -9,7 +9,8 @@ source [file join [file dirnam $argv0] common.tcl]
 system "$argv start --insecure --pid-file=server_pid -s=path=logs/db --listen-addr=localhost --background --join=localhost:26258 >>logs/expect-cmd.log 2>&1"
 
 start_test "Check that the server has informed us and the log file that it was ready before forking off in the background"
-system "grep -q 'initial startup completed, will now wait' logs/db/logs/cockroach.log"
+system "grep -q 'initial startup completed' logs/db/logs/cockroach.log"
+system "grep -q 'will now attempt to join a running cluster, or wait' logs/db/logs/cockroach.log"
 end_test
 
 start_test "Check that the SQL shell successfully times out upon connecting to an uninitialized node"
@@ -19,7 +20,7 @@ spawn /bin/bash
 send "PS1=':''/# '\r"
 eexpect ":/# "
 send "$argv sql\r"
-eexpect "Error: cannot dial server"
+eexpect "ERROR: cannot dial server"
 send "exit\r"
 eexpect eof
 end_test
@@ -27,6 +28,7 @@ end_test
 # The following tests expect the client to wait forever.
 set ::env(COCKROACH_CONNECT_TIMEOUT) "0"
 
+start_test "Check that init allows a suspended SQL client to resume"
 
 # Start a shell and send a command. The shell should block at startup,
 # so we don't "expect" anything yet. The point of this test is to
@@ -46,7 +48,7 @@ system "$argv init --insecure --host=localhost"
 expect {
     "pg_class" {}
     # Hopefully this broad regex will match any errors we log
-    # (Currently, everything I've seen begins with "Error:")
+    # (Currently, everything I've seen begins with "ERROR:")
     -re "(?i)err" {
         set prefix $expect_out(buffer)
         # Read next line to finish the error message.
@@ -57,5 +59,33 @@ expect {
     }
     timeout { handle_timeout "pg_class" }
 }
+
+interrupt
+interrupt
+eexpect eof
+
+end_test
+
+spawn /bin/bash
+send "PS1=':''/# '\r"
+eexpect ":/# "
+
+start_test "Check that init on an already started server immediately complains the server is already initialized"
+send "$argv init --insecure --host=localhost\r"
+eexpect "ERROR: cluster has already been initialized"
+eexpect ":/# "
+end_test
+
+stop_server $argv
+start_server $argv
+
+start_test "Check that init after server restart still properly complains the server has been initialized"
+send "$argv init --insecure --host=localhost\r"
+eexpect "ERROR: cluster has already been initialized"
+eexpect ":/# "
+end_test
+
+send "exit 0\r"
+eexpect eof
 
 stop_server $argv

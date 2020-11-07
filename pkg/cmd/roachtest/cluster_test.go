@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -20,16 +15,18 @@ import (
 	"fmt"
 	"os"
 	"regexp"
-	"runtime"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/testutils"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestClusterNodes(t *testing.T) {
-	c := &cluster{nodes: 10}
+	c := &cluster{spec: makeClusterSpec(10)}
 	opts := func(opts ...option) []option {
 		return opts
 	}
@@ -69,12 +66,62 @@ func (t testWrapper) logger() *logger {
 	return nil
 }
 
+func TestExecCmd(t *testing.T) {
+	cfg := &loggerConfig{stdout: os.Stdout, stderr: os.Stderr}
+	logger, err := cfg.newLogger("" /* path */)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run(`success`, func(t *testing.T) {
+		res := execCmdEx(context.Background(), logger, "/bin/bash", "-c", "echo guacamole")
+		require.NoError(t, res.err)
+		require.Contains(t, res.stdout, "guacamole")
+	})
+
+	t.Run(`error`, func(t *testing.T) {
+		res := execCmdEx(context.Background(), logger, "/bin/bash", "-c", "echo burrito; false")
+		require.Error(t, res.err)
+		require.Contains(t, res.stdout, "burrito")
+	})
+
+	t.Run(`returns-on-cancel`, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			cancel()
+		}()
+		tBegin := timeutil.Now()
+		require.Error(t, execCmd(ctx, logger, "/bin/bash", "-c", "sleep 100"))
+		if max, act := 99*time.Second, timeutil.Since(tBegin); max < act {
+			t.Fatalf("took %s despite cancellation", act)
+		}
+	})
+
+	t.Run(`returns-on-cancel-subprocess`, func(t *testing.T) {
+		// The tricky version of the preceding test. The difference is that the process
+		// spawns a stalling subprocess and then waits for it. See execCmdEx for a
+		// detailed discussion of how this is made work.
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			cancel()
+		}()
+		tBegin := timeutil.Now()
+		require.Error(t, execCmd(ctx, logger, "/bin/bash", "-c", "sleep 100& wait"))
+		if max, act := 99*time.Second, timeutil.Since(tBegin); max < act {
+			t.Fatalf("took %s despite cancellation", act)
+		}
+	})
+}
+
 func TestClusterMonitor(t *testing.T) {
 	cfg := &loggerConfig{stdout: os.Stdout, stderr: os.Stderr}
 	logger, err := cfg.newLogger("" /* path */)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	t.Run(`success`, func(t *testing.T) {
 		c := &cluster{t: testWrapper{t}, l: logger}
 		m := newMonitor(context.Background(), c)
@@ -152,7 +199,7 @@ func TestClusterMonitor(t *testing.T) {
 
 		// If wait terminates, context gets canceled.
 		err := m.wait(`true`)
-		if err != context.Canceled {
+		if !errors.Is(err, context.Canceled) {
 			t.Errorf(`expected context canceled, got: %+v`, err)
 		}
 	})
@@ -176,14 +223,9 @@ func TestClusterMonitor(t *testing.T) {
 			time.Sleep(30 * time.Millisecond)
 			return execCmd(ctx, logger, "/bin/bash", "-c", "echo hi && notthere")
 		})
-		expectedErr := regexp.QuoteMeta(`/bin/bash -c echo hi && notthere returned:
-stderr:
-/bin/bash: notthere: command not found
-
-stdout:
-hi
-: exit status 127`)
+		expectedErr := regexp.QuoteMeta(`exit status 127`)
 		if err := m.wait("sleep", "100"); !testutils.IsError(err, expectedErr) {
+			t.Logf("error details: %+v", err)
 			t.Error(err)
 		}
 	})
@@ -200,11 +242,11 @@ hi
 			// In reality t.Fatal adds text that is returned when the test fails,
 			// so the failing goroutine will be referenced (not like in the expected
 			// error below, where all you see is the other one being canceled).
-			runtime.Goexit()
-			return errors.New("unreachable")
+			panic(errTestFatal)
 		})
-		expectedErr := regexp.QuoteMeta(`Goexit() was called`)
+		expectedErr := regexp.QuoteMeta(`t.Fatal() was called`)
 		if err := m.wait("sleep", "100"); !testutils.IsError(err, expectedErr) {
+			t.Logf("error details: %+v", err)
 			t.Error(err)
 		}
 	})
@@ -252,4 +294,91 @@ func TestClusterMachineType(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestLoadGroups(t *testing.T) {
+	cfg := &loggerConfig{stdout: os.Stdout, stderr: os.Stderr}
+	logger, err := cfg.newLogger("" /* path */)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		numZones, numRoachNodes, numLoadNodes int
+		loadGroups                            loadGroupList
+	}{
+		{
+			3, 9, 3,
+			loadGroupList{
+				{
+					nodeListOption{1, 2, 3},
+					nodeListOption{4},
+				},
+				{
+					nodeListOption{5, 6, 7},
+					nodeListOption{8},
+				},
+				{
+					nodeListOption{9, 10, 11},
+					nodeListOption{12},
+				},
+			},
+		},
+		{
+			3, 9, 1,
+			loadGroupList{
+				{
+					nodeListOption{1, 2, 3, 4, 5, 6, 7, 8, 9},
+					nodeListOption{10},
+				},
+			},
+		},
+		{
+			4, 8, 2,
+			loadGroupList{
+				{
+					nodeListOption{1, 2, 3, 4},
+					nodeListOption{9},
+				},
+				{
+					nodeListOption{5, 6, 7, 8},
+					nodeListOption{10},
+				},
+			},
+		},
+	} {
+		t.Run(fmt.Sprintf("%d/%d/%d", tc.numZones, tc.numRoachNodes, tc.numLoadNodes),
+			func(t *testing.T) {
+				c := &cluster{t: testWrapper{t}, l: logger, spec: makeClusterSpec(tc.numRoachNodes + tc.numLoadNodes)}
+				lg := makeLoadGroups(c, tc.numZones, tc.numRoachNodes, tc.numLoadNodes)
+				require.EqualValues(t, lg, tc.loadGroups)
+			})
+	}
+	t.Run("panics with too many load nodes", func(t *testing.T) {
+		require.Panics(t, func() {
+
+			numZones, numRoachNodes, numLoadNodes := 2, 4, 3
+			makeLoadGroups(nil, numZones, numRoachNodes, numLoadNodes)
+		}, "Failed to panic when number of load nodes exceeded number of zones")
+	})
+	t.Run("panics with unequal zones per load node", func(t *testing.T) {
+		require.Panics(t, func() {
+			numZones, numRoachNodes, numLoadNodes := 4, 4, 3
+			makeLoadGroups(nil, numZones, numRoachNodes, numLoadNodes)
+		}, "Failed to panic when number of zones is not divisible by number of load nodes")
+	})
+}
+
+func TestCmdLogFileName(t *testing.T) {
+	ts := time.Date(2000, 1, 1, 15, 4, 12, 0, time.Local)
+
+	const exp = `run_150412.000_n1,3-4,9_cockroach_bla`
+	nodes := nodeListOption{1, 3, 4, 9}
+	assert.Equal(t,
+		exp,
+		cmdLogFileName(ts, nodes, "./cockroach", "bla", "--foo", "bar"),
+	)
+	assert.Equal(t,
+		exp,
+		cmdLogFileName(ts, nodes, "./cockroach bla --foo bar"),
+	)
 }

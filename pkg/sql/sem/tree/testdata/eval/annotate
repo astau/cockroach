@@ -43,7 +43,7 @@ ANNOTATE_TYPE('1-2 02:12', interval)
 eval
 ANNOTATE_TYPE('2010-09-28', timestamp)
 ----
-'2010-09-28 00:00:00+00:00'
+'2010-09-28 00:00:00'
 
 eval
 ANNOTATE_TYPE('2010-09-28', timestamptz)
@@ -111,3 +111,8 @@ eval
 (123 + 1):::float
 ----
 124.0
+
+eval
+ANNOTATE_TYPE('12:00:00-01', timetz)
+----
+'12:00:00-01:00:00'

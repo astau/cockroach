@@ -227,14 +227,15 @@
                         MergeJoinPrivate |
                         InnerJoinApply |
                         LeftJoinApply |
-                        RightJoinApply |
-                        FullJoinApply |
                         SemiJoinApply |
                         AntiJoinApply |
                         GroupBy |
                         GroupingPrivate |
                         ScalarGroupBy |
                         DistinctOn |
+                        EnsureDistinctOn |
+                        UpsertDistinctOn |
+                        EnsureUpsertDistinctOn |
                         Union |
                         SetPrivate |
                         Intersect |

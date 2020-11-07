@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -24,7 +19,7 @@ import (
 
 func runCLINodeStatus(ctx context.Context, t *test, c *cluster) {
 	c.Put(ctx, cockroach, "./cockroach")
-	c.Start(ctx, t, c.Range(1, 3), startArgs("--sequential"))
+	c.Start(ctx, t, c.Range(1, 3))
 
 	db := c.Conn(ctx, 1)
 	defer db.Close()
@@ -33,7 +28,9 @@ func runCLINodeStatus(ctx context.Context, t *test, c *cluster) {
 
 	lastWords := func(s string) []string {
 		var result []string
-		for _, line := range strings.Split(s, "\n") {
+		s = elideInsecureDeprecationNotice(s)
+		lines := strings.Split(s, "\n")
+		for _, line := range lines {
 			words := strings.Fields(line)
 			if n := len(words); n > 0 {
 				result = append(result, words[n-2]+" "+words[n-1])
@@ -42,13 +39,14 @@ func runCLINodeStatus(ctx context.Context, t *test, c *cluster) {
 		return result
 	}
 
-	nodeStatus := func() []string {
+	nodeStatus := func() (raw string, _ []string) {
 		out, err := c.RunWithBuffer(ctx, t.l, c.Node(1),
 			"./cockroach node status --insecure -p {pgport:1}")
 		if err != nil {
 			t.Fatalf("%v\n%s", err, out)
 		}
-		return lastWords(string(out))
+		raw = string(out)
+		return raw, lastWords(string(out))
 	}
 
 	{
@@ -58,17 +56,18 @@ func runCLINodeStatus(ctx context.Context, t *test, c *cluster) {
 			"true true",
 			"true true",
 		}
-		actual := nodeStatus()
+		raw, actual := nodeStatus()
 		if !reflect.DeepEqual(expected, actual) {
-			t.Fatalf("expected %s, but found %s:\n", expected, actual)
+			t.Fatalf("expected %s, but found %s:\nfrom:\n%s", expected, actual, raw)
 		}
 	}
 
 	waitUntil := func(expected []string) {
+		var raw string
 		var actual []string
 		// Node liveness takes ~9s to time out. Give the test double that time.
 		for i := 0; i < 20; i++ {
-			actual = nodeStatus()
+			raw, actual = nodeStatus()
 			if reflect.DeepEqual(expected, actual) {
 				break
 			}
@@ -76,7 +75,7 @@ func runCLINodeStatus(ctx context.Context, t *test, c *cluster) {
 			time.Sleep(time.Second)
 		}
 		if !reflect.DeepEqual(expected, actual) {
-			t.Fatalf("expected %s, but found %s:\n", expected, actual)
+			t.Fatalf("expected %s, but found %s from:\n%s", expected, actual, raw)
 		}
 	}
 
@@ -101,4 +100,22 @@ func runCLINodeStatus(ctx context.Context, t *test, c *cluster) {
 		"false false",
 		"false false",
 	})
+
+	// Stop the cluster and restart only 2 of the nodes. Verify that three nodes
+	// show up in the node status output.
+	c.Stop(ctx, c.Range(1, 3))
+	c.Start(ctx, t, c.Range(1, 2))
+
+	// Wait for the cluster to come back up.
+	waitForFullReplication(t, db)
+
+	waitUntil([]string{
+		"is_available is_live",
+		"true true",
+		"true true",
+		"false false",
+	})
+
+	// Start node again to satisfy roachtest.
+	c.Start(ctx, t, c.Node(3))
 }

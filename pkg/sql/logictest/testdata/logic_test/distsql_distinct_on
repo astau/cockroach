@@ -1,4 +1,4 @@
-# LogicTest: 5node-dist 5node-dist-metadata 5node-dist-opt 5node-dist-disk
+# LogicTest: 5node-default-configs
 
 statement ok
 CREATE TABLE xyz (
@@ -34,10 +34,6 @@ INSERT INTO abc VALUES
   ('2', '3', '4'),
   ('3', '4', '5')
 
-# Prevent the merge queue from immediately discarding our splits.
-statement ok
-SET CLUSTER SETTING kv.range_merge.queue_enabled = false;
-
 statement ok
 ALTER TABLE xyz SPLIT AT VALUES (2), (4), (6), (7)
 
@@ -65,8 +61,8 @@ ALTER TABLE abc EXPERIMENTAL_RELOCATE VALUES
   (ARRAY[4], '2', '3', '4'),
   (ARRAY[5], '3', '4', '5')
 
-query TTTI colnames
-SELECT start_key, end_key, replicas, lease_holder from [SHOW EXPERIMENTAL_RANGES FROM TABLE xyz]
+query TTTI colnames,rowsort
+SELECT start_key, end_key, replicas, lease_holder from [SHOW RANGES FROM TABLE xyz]
 ----
 start_key  end_key  replicas  lease_holder
 NULL       /2       {1}       1
@@ -75,8 +71,8 @@ NULL       /2       {1}       1
 /6         /7       {4}       4
 /7         NULL     {5}       5
 
-query TTTI colnames
-SELECT start_key, end_key, replicas, lease_holder from [SHOW EXPERIMENTAL_RANGES FROM TABLE abc]
+query TTTI colnames,rowsort
+SELECT start_key, end_key, replicas, lease_holder from [SHOW RANGES FROM TABLE abc]
 ----
 start_key        end_key          replicas  lease_holder
 NULL             /NULL/NULL/NULL  {5}       5

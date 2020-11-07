@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql_test
 
@@ -21,28 +17,39 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/proto"
-	"github.com/pkg/errors"
 )
 
 func TestShowTraceReplica(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	skip.WithIssue(t, 34213)
+
 	const numNodes = 4
 
-	cfg := config.DefaultZoneConfig()
-	cfg.NumReplicas = proto.Int32(1)
-	defer config.TestingSetDefaultZoneConfig(cfg)()
-	defer config.TestingSetDefaultSystemZoneConfig(cfg)()
+	zoneConfig := zonepb.DefaultZoneConfig()
+	zoneConfig.NumReplicas = proto.Int32(1)
 
 	ctx := context.Background()
 	tsArgs := func(node string) base.TestServerArgs {
 		return base.TestServerArgs{
+			Knobs: base.TestingKnobs{
+				Server: &server.TestingKnobs{
+					DefaultZoneConfigOverride:       &zoneConfig,
+					DefaultSystemZoneConfigOverride: &zoneConfig,
+				},
+			},
 			StoreSpecs: []base.StoreSpec{{InMemory: true, Attributes: roachpb.Attributes{Attrs: []string{node}}}},
 		}
 	}
@@ -82,9 +89,9 @@ func TestShowTraceReplica(t *testing.T) {
 			expected: [][]string{{`2`, `2`}},
 		},
 		{
-			// First a read to compute the deletions then a write to delete them.
+			// A write to delete the row.
 			query:    `DELETE FROM d.t2`,
-			expected: [][]string{{`2`, `2`}, {`2`, `2`}},
+			expected: [][]string{{`2`, `2`}},
 		},
 		{
 			// Admin command. We use distinct because the ALTER statement is

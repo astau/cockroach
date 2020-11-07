@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 // This connects to a postgres server and crafts postgres-protocol message
 // to encode its arguments into postgres' text and binary encodings. The
@@ -21,7 +17,7 @@
 // The target postgres server must accept plaintext (non-ssl) connections from
 // the postgres:postgres account. A suitable server can be started with:
 //
-// `docker run -p 127.0.0.1:5432:5432 postgres`
+// `docker run -p 127.0.0.1:5432:5432 postgres:11`
 //
 // The output of this file generates pkg/sql/pgwire/testdata/encodings.json.
 package main
@@ -91,8 +87,14 @@ func main() {
 		if err != nil {
 			log.Fatalf("binary: %s: %v", sql, err)
 		}
+		sql = fmt.Sprintf("SELECT pg_typeof(%s)::int", expr)
+		id, err := pgconnect.Connect(ctx, sql, *postgresAddr, *postgresUser, pgwirebase.FormatText)
+		if err != nil {
+			log.Fatalf("oid: %s: %v", sql, err)
+		}
 		data = append(data, entry{
 			SQL:    expr,
+			Oid:    string(id),
 			Text:   text,
 			Binary: binary,
 		})
@@ -109,6 +111,7 @@ func main() {
 
 type entry struct {
 	SQL    string
+	Oid    string
 	Text   []byte
 	Binary []byte
 }
@@ -131,6 +134,7 @@ const outputJSON = `[
 	{{- if gt $idx 0 }},{{end}}
 	{
 		"SQL": {{.SQL | json}},
+		"Oid": {{.Oid}},
 		"Text": {{printf "%q" .Text}},
 		"TextAsBinary": {{.Text | binary}},
 		"Binary": {{.Binary | binary}}
@@ -193,6 +197,9 @@ var inputs = map[string][]string{
 		"2.2289971159100284",
 		"3409589268520956934250.234098732045120934701239846",
 		"42",
+		"42.0",
+		"420000",
+		"420000.0",
 	},
 
 	"'%s'::float8": {
@@ -214,6 +221,60 @@ var inputs = map[string][]string{
 		fmt.Sprint(math.SmallestNonzeroFloat32),
 		fmt.Sprint(math.MaxFloat64),
 		fmt.Sprint(math.SmallestNonzeroFloat64),
+	},
+
+	"'%s'::float4": {
+		// The Go binary encoding of NaN differs from Postgres by a 1 at the
+		// end. Go also uses Inf instead of Infinity (used by Postgres) for text
+		// float encodings. These deviations are still correct, and it's not worth
+		// special casing them into the code, so they are commented out here.
+		//"NaN",
+		//"Inf",
+		//"-Inf",
+		"-000.000",
+		"-0000021234.2",
+		"-1.2",
+		".0",
+		".1",
+		".1234",
+		".12345",
+		"3.40282e+38",
+		"1.4013e-45",
+	},
+
+	"'%s'::int2": {
+		"0",
+		"1",
+		"-1",
+		"-32768",
+		"32767",
+	},
+
+	"'%s'::int4": {
+		"0",
+		"1",
+		"-1",
+		"-32768",
+		"32767",
+		"-2147483648",
+		"2147483647",
+	},
+
+	"'%s'::int8": {
+		"0",
+		"1",
+		"-1",
+		"-32768",
+		"32767",
+		"-2147483648",
+		"2147483647",
+		"-9223372036854775808",
+		"9223372036854775807",
+	},
+
+	"'%s'::char(8)": {
+		"hello",
+		"hello123",
 	},
 
 	"'%s'::timestamp": {
@@ -255,8 +316,18 @@ var inputs = map[string][]string{
 		"1999-12-30",
 		"1996-02-29",
 		"0001-01-01",
+		"0001-12-31 BC",
 		"0001-01-01 BC",
 		"3592-12-31 BC",
+		"4713-01-01 BC",
+		"4714-11-24 BC",
+		"5874897-12-31",
+		"2000-01-01",
+		"2000-01-02",
+		"1999-12-31",
+		"infinity",
+		"-infinity",
+		"epoch",
 	},
 
 	"'%s'::time": {
@@ -386,6 +457,20 @@ var inputs = map[string][]string{
 		"00000000",
 		"000000001",
 		"0010101000011010101111100100011001110101100001010101",
+		"00101010000110101011111001000110011101011000000101010000110101011111001000110011101011000010101011010101",
+		"0010101000011010101111100100011001110101001010100001101010111110010001100111010110000100101010000110101011111001000110011101011000010101010101010000101010000110101011111001000110011101010010101000011010101111100100011001110101100001001010100001101010111110010001100111010110000101010101010100101010000110101011111001000110011101011000010010101000011010101111100100011011111111111111111111111111111111111111111111111111111111111111110111010111111111111111111111111111111111111111111111111111111111111111111000010101010000000000000000000000000000000000000000000000000000000000000000101011000010010101000011010101111100100011001110101100001010101010101101010000110101011111001000110011101011000010010101000011010101111100100011011111111111111111111111111111111111111111111111111111111111111110111010111111111111111111111111111111111111111111111111111111111111111111000010101010000000000000000000000000000000000000000000000000000000000000000101011000010010101000011010101111100100011001110101100001010101010101",
+		"000000000000000000000000000000000000000000000000000000000000000",
+		"0000000000000000000000000000000000000000000000000000000000000000",
+		"00000000000000000000000000000000000000000000000000000000000000000",
+		"000000000000000000000000000000000000000000000000000000000000001",
+		"0000000000000000000000000000000000000000000000000000000000000001",
+		"00000000000000000000000000000000000000000000000000000000000000001",
+		"100000000000000000000000000000000000000000000000000000000000000",
+		"1000000000000000000000000000000000000000000000000000000000000000",
+		"10000000000000000000000000000000000000000000000000000000000000000",
+		"111111111111111111111111111111111111111111111111111111111111111",
+		"1111111111111111111111111111111111111111111111111111111111111111",
+		"11111111111111111111111111111111111111111111111111111111111111111",
 	},
 
 	"array[%s]::text[]": {
@@ -407,6 +492,15 @@ var inputs = map[string][]string{
 		`'\x0d53e338548082'::BYTEA`,
 		`'test with spaces'::BYTEA`,
 		`'name'::NAME`,
+	},
+
+	"%s": {
+		`array[1,NULL]::int8[]`,
+		`array[0.1,NULL]::float8[]`,
+		`array[1,NULL]::numeric[]`,
+		`array['test',NULL]::text[]`,
+		`array['test',NULL]::name[]`,
+		`array[]::int4[]`,
 	},
 
 	"(%s,null)": {

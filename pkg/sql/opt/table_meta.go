@@ -1,22 +1,20 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package opt
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/errors"
 )
 
 // TableID uniquely identifies the usage of a table within the scope of a
@@ -34,9 +32,7 @@ const (
 )
 
 // ColumnID returns the metadata id of the column at the given ordinal position
-// in the table. This is equivalent to calling:
-//
-//   md.TableMeta(t).ColumnMeta(ord).MetaID
+// in the table.
 //
 // NOTE: This method cannot do bounds checking, so it's up to the caller to
 //       ensure that a column really does exist at this ordinal position.
@@ -44,17 +40,21 @@ func (t TableID) ColumnID(ord int) ColumnID {
 	return t.firstColID() + ColumnID(ord)
 }
 
+// IndexColumnID returns the metadata id of the idxOrd-th index column in the
+// given index.
+func (t TableID) IndexColumnID(idx cat.Index, idxOrd int) ColumnID {
+	return t.ColumnID(idx.Column(idxOrd).Ordinal())
+}
+
 // ColumnOrdinal returns the ordinal position of the given column in its base
-// table. This is equivalent to calling:
-//
-//   md.ColumnMeta(id).Ordinal()
+// table.
 //
 // NOTE: This method cannot do complete bounds checking, so it's up to the
 //       caller to ensure that this column is really in the given base table.
 func (t TableID) ColumnOrdinal(id ColumnID) int {
 	if util.RaceEnabled {
 		if id < t.firstColID() {
-			panic("ordinal cannot be negative")
+			panic(errors.AssertionFailedf("ordinal cannot be negative"))
 		}
 	}
 	return int(id - t.firstColID())
@@ -81,6 +81,11 @@ func (t TableID) index() int {
 // metadata. A table annotation allows arbitrary values to be cached with table
 // metadata, which can be used to avoid recalculating base table properties or
 // other information each time it's needed.
+//
+// WARNING! When copying memo metadata (which happens when we use a cached
+// memo), the annotations are cleared. Any code using a annotation must treat
+// this as a best-effort cache and be prepared to repopulate the annotation as
+// necessary.
 //
 // To create a TableAnnID, call NewTableAnnID during Go's program initialization
 // phase. The returned TableAnnID never clashes with other annotations on the
@@ -109,6 +114,9 @@ var tableAnnIDCount TableAnnID
 const maxTableAnnIDCount = 2
 
 // TableMeta stores information about one of the tables stored in the metadata.
+//
+// NOTE: Metadata.DuplicateTable must be kept in sync with changes to this
+// struct.
 type TableMeta struct {
 	// MetaID is the identifier for this table that is unique within the query
 	// metadata.
@@ -117,21 +125,53 @@ type TableMeta struct {
 	// Table is a reference to the table in the catalog.
 	Table cat.Table
 
-	// Alias is an alternate name for the base table to be used for formatting,
-	// debugging, EXPLAIN output, etc. It is set to "" if no alias was specified.
-	Alias string
+	// Alias stores the identifier used in the query to identify the table. This
+	// might be explicitly qualified (e.g. <catalog>.<schema>.<table>), or not
+	// (e.g. <table>). Or, it may be an alias used in the query, in which case it
+	// is always an unqualified name.
+	Alias tree.TableName
+
+	// IgnoreForeignKeys is true if we should disable any rules that depend on the
+	// consistency of outgoing foreign key references. Set by the
+	// IGNORE_FOREIGN_KEYS table hint; useful for scrub queries meant to verify
+	// the consistency of foreign keys.
+	IgnoreForeignKeys bool
+
+	// Constraints stores a *FiltersExpr containing filters that are known to
+	// evaluate to true on the table data. This list is extracted from validated
+	// check constraints; specifically, those check constraints that we can prove
+	// never evaluate to NULL (as NULL is treated differently in check constraints
+	// and filters).
+	//
+	// If nil, there are no check constraints.
+	//
+	// See comment above GenerateConstrainedScans for more detail.
+	Constraints ScalarExpr
+
+	// ComputedCols stores ScalarExprs for computed columns on the table, indexed
+	// by ColumnID. These will be used as "known truths" about data when
+	// constraining indexes. See comment above GenerateConstrainedScans for more
+	// detail.
+	//
+	// Computed columns with non-immutable operators are omitted.
+	ComputedCols map[ColumnID]ScalarExpr
+
+	// PartialIndexPredicates is a map from index ordinals on the table to
+	// *FiltersExprs representing the predicate on the corresponding partial
+	// index. If an index is not a partial index, it will not have an entry in
+	// the map.
+	PartialIndexPredicates map[cat.IndexOrdinal]ScalarExpr
 
 	// anns annotates the table metadata with arbitrary data.
 	anns [maxTableAnnIDCount]interface{}
 }
 
-// Name returns the table alias, if it was specified, or else the table's name
-// as a string.
-func (tm *TableMeta) Name() string {
-	if tm.Alias != "" {
-		return tm.Alias
+// clearAnnotations resets all the table annotations; used when copying a
+// Metadata.
+func (tm *TableMeta) clearAnnotations() {
+	for i := range tm.anns {
+		tm.anns[i] = nil
 	}
-	return string(tm.Table.Name().TableName)
 }
 
 // IndexColumns returns the metadata IDs for the set of columns in the given
@@ -141,11 +181,66 @@ func (tm *TableMeta) IndexColumns(indexOrd int) ColSet {
 	index := tm.Table.Index(indexOrd)
 
 	var indexCols ColSet
-	for i, cnt := 0, index.ColumnCount(); i < cnt; i++ {
-		ord := index.Column(i).Ordinal
-		indexCols.Add(int(tm.MetaID.ColumnID(ord)))
+	for i, n := 0, index.ColumnCount(); i < n; i++ {
+		ord := index.Column(i).Ordinal()
+		indexCols.Add(tm.MetaID.ColumnID(ord))
 	}
 	return indexCols
+}
+
+// IndexKeyColumns returns the metadata IDs for the set of strict key columns in
+// the given index.
+func (tm *TableMeta) IndexKeyColumns(indexOrd int) ColSet {
+	index := tm.Table.Index(indexOrd)
+
+	var indexCols ColSet
+	for i, n := 0, index.KeyColumnCount(); i < n; i++ {
+		ord := index.Column(i).Ordinal()
+		indexCols.Add(tm.MetaID.ColumnID(ord))
+	}
+	return indexCols
+}
+
+// IndexKeyColumnsMapVirtual returns the metadata IDs for the set of strict key
+// columns in the given index. Inverted index columns are mapped to their source
+// column.
+func (tm *TableMeta) IndexKeyColumnsMapVirtual(indexOrd int) ColSet {
+	index := tm.Table.Index(indexOrd)
+
+	var indexCols ColSet
+	for i, n := 0, index.KeyColumnCount(); i < n; i++ {
+		ord := 0
+		if i == 0 && index.IsInverted() {
+			ord = index.Column(i).InvertedSourceColumnOrdinal()
+		} else {
+			ord = index.Column(i).Ordinal()
+		}
+		indexCols.Add(tm.MetaID.ColumnID(ord))
+	}
+	return indexCols
+}
+
+// SetConstraints sets the filters derived from check constraints; see
+// TableMeta.Constraint. The argument must be a *FiltersExpr.
+func (tm *TableMeta) SetConstraints(constraints ScalarExpr) {
+	tm.Constraints = constraints
+}
+
+// AddComputedCol adds a computed column expression to the table's metadata.
+func (tm *TableMeta) AddComputedCol(colID ColumnID, computedCol ScalarExpr) {
+	if tm.ComputedCols == nil {
+		tm.ComputedCols = make(map[ColumnID]ScalarExpr)
+	}
+	tm.ComputedCols[colID] = computedCol
+}
+
+// AddPartialIndexPredicate adds a partial index predicate to the table's
+// metadata.
+func (tm *TableMeta) AddPartialIndexPredicate(ord cat.IndexOrdinal, pred ScalarExpr) {
+	if tm.PartialIndexPredicates == nil {
+		tm.PartialIndexPredicates = make(map[cat.IndexOrdinal]ScalarExpr)
+	}
+	tm.PartialIndexPredicates[ord] = pred
 }
 
 // TableAnnotation returns the given annotation that is associated with the
@@ -177,7 +272,8 @@ func (md *Metadata) SetTableAnnotation(tabID TableID, tabAnnID TableAnnID, ann i
 // See the TableAnnID comment for more details and a usage example.
 func NewTableAnnID() TableAnnID {
 	if tableAnnIDCount == maxTableAnnIDCount {
-		panic("can't allocate table annotation id; increase maxTableAnnIDCount to allow")
+		panic(errors.AssertionFailedf(
+			"can't allocate table annotation id; increase maxTableAnnIDCount to allow"))
 	}
 	cnt := tableAnnIDCount
 	tableAnnIDCount++

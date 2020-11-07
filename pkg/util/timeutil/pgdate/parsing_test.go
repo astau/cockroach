@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package pgdate_test
 
@@ -41,7 +37,6 @@ func init() {
 		`a postgresql connect string suitable for sql.Open(), `+
 			`to enable cross-checking during development; for example: `+
 			`-pgdate.db="database=bob sslmode=disable"`)
-	flag.Parse()
 }
 
 type timeData struct {
@@ -126,68 +121,91 @@ func (td timeData) expected(mode pgdate.ParseMode) (time.Time, bool) {
 	return td.exp, td.err
 }
 
-func (td timeData) testParseDate(t *testing.T, mode pgdate.ParseMode) {
-	t.Run("ParseDate", func(t *testing.T) {
-		exp, expErr := td.expected(mode)
-		res, err := pgdate.ParseDate(time.Time{}, mode, td.s)
+func (td timeData) testParseDate(t *testing.T, info string, mode pgdate.ParseMode) {
+	info = fmt.Sprintf("%s ParseDate", info)
+	exp, expErr := td.expected(mode)
+	dt, _, err := pgdate.ParseDate(time.Time{}, mode, td.s)
+	res, _ := dt.ToTime()
 
-		// HACK: This is a format that parses as a date and timestamp,
-		// but is not a time.
-		if td.s == "2018 123" {
-			exp = time.Date(2018, 5, 3, 0, 0, 0, 0, time.UTC)
-			expErr = false
-		}
+	// HACK: This is a format that parses as a date and timestamp,
+	// but is not a time.
+	if td.s == "2018 123" {
+		exp = time.Date(2018, 5, 3, 0, 0, 0, 0, time.UTC)
+		expErr = false
+	}
 
-		// Keeps the date components, but lose everything else.
-		y, m, d := exp.Date()
-		exp = time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
+	// Keeps the date components, but lose everything else.
+	y, m, d := exp.Date()
+	exp = time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
 
-		check(t, exp, expErr, res, err)
+	check(t, info, exp, expErr, res, err)
 
-		td.crossCheck(t, "date", td.s, mode, exp, expErr)
-	})
+	td.crossCheck(t, info, "date", td.s, mode, exp, expErr)
 }
 
-func (td timeData) testParseTime(t *testing.T, mode pgdate.ParseMode) {
-	t.Run("ParseTime", func(t *testing.T) {
-		exp, expErr := td.expected(mode)
-		res, err := pgdate.ParseTime(time.Time{}, mode, td.s)
+func (td timeData) testParseTime(t *testing.T, info string, mode pgdate.ParseMode) {
+	info = fmt.Sprintf("%s ParseTime", info)
+	exp, expErr := td.expected(mode)
+	res, _, err := pgdate.ParseTime(time.Time{}, mode, td.s)
 
-		// Weird times like 24:00:00 or 23:59:60 aren't allowed,
-		// unless there's also a date.
-		if td.isRolloverTime {
-			_, err := pgdate.ParseDate(time.Time{}, mode, td.s)
-			expErr = err != nil
-		}
+	// Weird times like 24:00:00 or 23:59:60 aren't allowed,
+	// unless there's also a date.
+	if td.isRolloverTime {
+		_, _, err := pgdate.ParseDate(time.Time{}, mode, td.s)
+		expErr = err != nil
+	}
 
-		// Keep only the time and zone components.
-		h, m, sec := exp.Clock()
-		exp = time.Date(0, 1, 1, h, m, sec, td.exp.Nanosecond(), td.exp.Location())
+	// Keep only the time and zone components.
+	h, m, sec := exp.Clock()
+	exp = time.Date(0, 1, 1, h, m, sec, td.exp.Nanosecond(), td.exp.Location())
 
-		check(t, exp, expErr, res, err)
-		td.crossCheck(t, "timetz", td.s, mode, exp, expErr)
-	})
+	check(t, info, exp, expErr, res, err)
+	td.crossCheck(t, info, "timetz", td.s, mode, exp, expErr)
 }
 
-func (td timeData) testParseTimestamp(t *testing.T, mode pgdate.ParseMode) {
-	t.Run("ParseTimestamp", func(t *testing.T) {
-		exp, expErr := td.expected(mode)
-		res, err := pgdate.ParseTimestamp(time.Time{}, mode, td.s)
+func (td timeData) testParseTimestamp(t *testing.T, info string, mode pgdate.ParseMode) {
+	info = fmt.Sprintf("%s ParseTimestamp", info)
+	exp, expErr := td.expected(mode)
+	res, _, err := pgdate.ParseTimestamp(time.Time{}, mode, td.s)
 
-		// HACK: This is a format that parses as a date and timestamp,
-		// but is not a time.
-		if td.s == "2018 123" {
-			exp = time.Date(2018, 5, 3, 0, 0, 0, 0, time.UTC)
-			expErr = false
-		}
+	// HACK: This is a format that parses as a date and timestamp,
+	// but is not a time.
+	if td.s == "2018 123" {
+		exp = time.Date(2018, 5, 3, 0, 0, 0, 0, time.UTC)
+		expErr = false
+	}
 
-		if td.isRolloverTime {
-			exp = exp.AddDate(0, 0, 1)
-		}
+	if td.isRolloverTime {
+		exp = exp.AddDate(0, 0, 1)
+	}
 
-		check(t, exp, expErr, res, err)
-		td.crossCheck(t, "timestamptz", td.s, mode, exp, expErr)
-	})
+	check(t, info, exp, expErr, res, err)
+	td.crossCheck(t, info, "timestamptz", td.s, mode, exp, expErr)
+}
+
+func (td timeData) testParseTimestampWithoutTimezone(
+	t *testing.T, info string, mode pgdate.ParseMode,
+) {
+	info = fmt.Sprintf("%s ParseTimestampWithoutTimezone", info)
+	exp, expErr := td.expected(mode)
+	res, _, err := pgdate.ParseTimestampWithoutTimezone(time.Time{}, mode, td.s)
+
+	// HACK: This is a format that parses as a date and timestamp,
+	// but is not a time.
+	if td.s == "2018 123" {
+		exp = time.Date(2018, 5, 3, 0, 0, 0, 0, time.UTC)
+		expErr = false
+	}
+
+	if td.isRolloverTime {
+		exp = exp.AddDate(0, 0, 1)
+	}
+	// Convert the expected time to the same timestamp but in UTC.
+	_, offset := exp.Zone()
+	exp = exp.Add(time.Duration(offset) * time.Second).UTC()
+
+	check(t, info, exp, expErr, res, err)
+	td.crossCheck(t, info, "timestamp", td.s, mode, exp, expErr)
 }
 
 var dateTestData = []timeData{
@@ -366,6 +384,18 @@ var dateTestData = []timeData{
 		s:           "2018-10-23 +01",
 		exp:         time.Date(2018, 10, 23, 0, 0, 0, 0, time.FixedZone("", 60*60)),
 		hasTimezone: true,
+	},
+	{
+		s:   "5874897-01-22",
+		exp: time.Date(5874897, 1, 22, 0, 0, 0, 0, time.UTC),
+	},
+	{
+		s:   "121212-01-01",
+		exp: time.Date(121212, 1, 1, 0, 0, 0, 0, time.UTC),
+	},
+	{
+		s:   "121212",
+		exp: time.Date(2012, 12, 12, 0, 0, 0, 0, time.UTC),
 	},
 }
 
@@ -610,6 +640,33 @@ var timeTestData = []timeData{
 		s:   "23:59:59.1",
 		exp: time.Date(0, 1, 1, 23, 59, 59, 100000000, time.UTC),
 	},
+	{
+		s:   "23.59.59.1",
+		exp: time.Date(0, 1, 1, 23, 59, 59, 100000000, time.UTC),
+	},
+	{
+		s:           "23.59.59.1-00:29",
+		exp:         time.Date(0, 1, 1, 23, 59, 59, 100000000, time.FixedZone("UGH", -29*60)),
+		hasTimezone: true,
+	},
+	{
+		s:           "23.59.59.1-05",
+		exp:         time.Date(0, 1, 1, 23, 59, 59, 100000000, time.FixedZone("-500", -5*60*60)),
+		hasTimezone: true,
+	},
+	{
+		s:           "23.59.59.1+05",
+		exp:         time.Date(0, 1, 1, 23, 59, 59, 100000000, time.FixedZone("500", 5*60*60)),
+		hasTimezone: true,
+	},
+	{
+		s:   "23:59.59.",
+		err: true,
+	},
+	{
+		s:   "23.59:59.123",
+		err: true,
+	},
 }
 
 // Additional timestamp tests not generated by combining dates and times.
@@ -627,6 +684,42 @@ var timestampTestData = []timeData{
 		exp:         time.Date(2000, 1, 1, 2, 2, 2, 567000000, time.FixedZone("", 9*60*60+30*60+15)),
 		hasTimezone: true,
 	},
+	{
+		s:   "2014-03-15-04.38.53.399853+07:35",
+		exp: time.Date(2014, 3, 15, 4, 38, 53, 399853000, time.FixedZone("", 7*60*60+35*60)),
+	},
+	{
+		s:   "2014-03-15-04.38.53.399853",
+		exp: time.Date(2014, 3, 15, 4, 38, 53, 399853000, time.UTC),
+	},
+	{
+		s:   "2014-03-15 04.38.53.399853",
+		exp: time.Date(2014, 3, 15, 4, 38, 53, 399853000, time.UTC),
+	},
+	{
+		s:   "2014-03-15 04.38.53.399853-07:35",
+		exp: time.Date(2014, 3, 15, 4, 38, 53, 399853000, time.FixedZone("-0735", -7*60*60-35*60)),
+	},
+	{
+		s:   "2014-03-15 04.38.53.",
+		exp: time.Date(2014, 3, 15, 4, 38, 53, 0, time.UTC),
+	},
+	{
+		s:   "2014-03-15-04.38:53.399853-07:35",
+		err: true,
+	},
+	{
+		s:   "2014-03-15-04:38.53.399853-07:35",
+		err: true,
+	},
+	{
+		s:   "2014-03-15-04:38:53.399853-07:35",
+		err: true,
+	},
+	{
+		s:   "2007-09-24-15.0",
+		err: true,
+	},
 }
 
 // TestMain will enable cross-checking of test results against a
@@ -634,6 +727,7 @@ var timestampTestData = []timeData{
 // useful for developing the tests themselves and doesn't need
 // to be part of a regular build.
 func TestMain(m *testing.M) {
+	flag.Parse()
 	if dbString != "" {
 		if d, err := gosql.Open("postgres", dbString); err == nil {
 			if err := d.Ping(); err == nil {
@@ -666,36 +760,30 @@ func TestParse(t *testing.T) {
 	for _, mode := range modes {
 		t.Run(mode.String(), func(t *testing.T) {
 			for _, dtc := range dateTestData {
-				t.Run(dtc.s, func(t *testing.T) {
-					dtc.testParseDate(t, mode)
+				dtc.testParseDate(t, dtc.s, mode)
 
-					// Combine times with dates to create timestamps.
-					for _, ttc := range timeTestData {
-						t.Run(ttc.s, func(t *testing.T) {
-							tstc := dtc.concatTime(ttc)
-							tstc.testParseDate(t, mode)
-							tstc.testParseTime(t, mode)
-							tstc.testParseTimestamp(t, mode)
-						})
-					}
-				})
+				// Combine times with dates to create timestamps.
+				for _, ttc := range timeTestData {
+					info := fmt.Sprintf("%s %s", dtc.s, ttc.s)
+					tstc := dtc.concatTime(ttc)
+					tstc.testParseDate(t, info, mode)
+					tstc.testParseTime(t, info, mode)
+					tstc.testParseTimestamp(t, info, mode)
+					tstc.testParseTimestampWithoutTimezone(t, info, mode)
+				}
 			}
 
 			// Test some other timestamps formats we can't create
 			// by just concatenating a date + time string.
 			for _, ttc := range timestampTestData {
-				t.Run(ttc.s, func(t *testing.T) {
-					ttc.testParseTime(t, mode)
-				})
+				ttc.testParseTime(t, ttc.s, mode)
 			}
 		})
 	}
 
 	t.Run("ParseTime", func(t *testing.T) {
 		for _, ttc := range timeTestData {
-			t.Run(ttc.s, func(t *testing.T) {
-				ttc.testParseTime(t, 0 /* mode */)
-			})
+			ttc.testParseTime(t, ttc.s, 0 /* mode */)
 		}
 	})
 }
@@ -739,7 +827,7 @@ func bench(b *testing.B, layout string, s string, locationName string) {
 
 			b.RunParallel(func(pb *testing.PB) {
 				for pb.Next() {
-					if _, err := pgdate.ParseTimestamp(time.Time{}, 0, benchS); err != nil {
+					if _, _, err := pgdate.ParseTimestamp(time.Time{}, 0, benchS); err != nil {
 						b.Fatal(err)
 					}
 					b.SetBytes(bytes)
@@ -771,28 +859,23 @@ func bench(b *testing.B, layout string, s string, locationName string) {
 
 // check is a helper function to compare expected and actual
 // outputs and error conditions.
-func check(t testing.TB, expTime time.Time, expErr bool, res time.Time, err error) {
+func check(t testing.TB, info string, expTime time.Time, expErr bool, res time.Time, err error) {
 	t.Helper()
 
 	if err == nil {
 		if expErr {
-			t.Fatalf("expected error, but succeeded %s", res)
+			t.Errorf("%s: expected error, but succeeded %s", info, res)
+		} else if !res.Equal(expTime) {
+			t.Errorf("%s: expected %s, got %s", info, expTime, res)
 		}
-		if !res.Equal(expTime) {
-			t.Fatalf("expected %s, got %s", expTime, res)
-		}
-		t.Logf("got expected value: %s", res)
-	} else {
-		if !expErr {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		t.Logf("got expected err: %v", err)
+	} else if !expErr {
+		t.Errorf("%s: unexpected error: %v", info, err)
 	}
 }
 
 // crossCheck executes the parsing on a remote sql connection.
 func (td timeData) crossCheck(
-	t *testing.T, kind, s string, mode pgdate.ParseMode, expTime time.Time, expErr bool,
+	t *testing.T, info string, kind, s string, mode pgdate.ParseMode, expTime time.Time, expErr bool,
 ) {
 	if db == nil {
 		return
@@ -807,63 +890,176 @@ func (td timeData) crossCheck(
 		expErr = true
 	}
 
-	t.Run("cross-check", func(t *testing.T) {
-		tx, err := db.Begin()
-		if err != nil {
-			t.Fatal(err)
-		}
+	info = fmt.Sprintf("%s cross-check", info)
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("%s: %v", info, err)
+	}
 
-		defer func() {
-			if err := tx.Rollback(); err != nil {
-				t.Fatal(err)
+	defer func() {
+		if err := tx.Rollback(); err != nil {
+			t.Fatalf("%s: %v", info, err)
+		}
+	}()
+
+	if _, err := db.Exec("set time zone 'UTC'"); err != nil {
+		t.Fatalf("%s: %v", info, err)
+	}
+
+	var style string
+	switch mode {
+	case pgdate.ParseModeMDY:
+		style = "MDY"
+	case pgdate.ParseModeDMY:
+		style = "DMY"
+	case pgdate.ParseModeYMD:
+		style = "YMD"
+	}
+	if _, err := db.Exec(fmt.Sprintf("set datestyle='%s'", style)); err != nil {
+		t.Fatalf("%s: %v", info, err)
+	}
+
+	row := db.QueryRow(fmt.Sprintf("select '%s'::%s", s, kind))
+	var ret time.Time
+	if err := row.Scan(&ret); err == nil {
+		switch {
+		case expErr:
+			t.Errorf("%s: expected error, got %s", info, ret)
+		case ret.Round(td.allowCrossDelta).Equal(expTime.Round(td.allowCrossDelta)):
+			// Got expected value.
+		default:
+			t.Errorf("%s: expected %s, got %s", info, expTime, ret)
+		}
+	} else {
+		switch {
+		case expErr:
+			// Got expected error.
+		case kind == "time", kind == "timetz":
+			// Our parser is quite a bit more lenient than the
+			// PostgreSQL 10.5 implementation. For instance:
+			// '1999.123 12:54 PM +11'::timetz --> fail
+			// '1999.123 12:54 PM America/New_York'::timetz --> OK
+			// Trying to run this down is too much of a time-sink,
+			// and as long as we're not producing erroneous values,
+			// it's reasonable to treat cases where we can parse,
+			// but pg doesn't as a soft failure.
+		default:
+			t.Errorf(`%s: unexpected error from "%s": %s`, info, s, err)
+		}
+	}
+}
+
+func TestDependsOnContext(t *testing.T) {
+	// Each test case contains the expected output for each of ParseDate,
+	// ParseTime, ParseTimeWithoutTimezone, ParseTimestamp,
+	// ParseTimestampWithoutTimezone.
+	//
+	// The output contains the result with "yes/no" appended to indicate context
+	// dependence. If an error is expected, "error" is used.
+	testCases := []struct {
+		s             string
+		date          string
+		time          string
+		timeNoTZ      string
+		timestamp     string
+		timestampNoTZ string
+	}{
+		{
+			s:             "04:05:06",
+			date:          "error",
+			time:          "0000-01-01 04:05:06 +0500 +0500 yes",
+			timeNoTZ:      "0000-01-01 04:05:06 +0000 UTC no",
+			timestamp:     "error",
+			timestampNoTZ: "error",
+		},
+		{
+			s:             "04:05:06.000001+00",
+			date:          "error",
+			time:          "0000-01-01 04:05:06.000001 +0000 +0000 no",
+			timeNoTZ:      "0000-01-01 04:05:06.000001 +0000 UTC no",
+			timestamp:     "error",
+			timestampNoTZ: "error",
+		},
+		{
+			s:             "04:05:06.000001-04",
+			date:          "error",
+			time:          "0000-01-01 04:05:06.000001 -0400 -0400 no",
+			timeNoTZ:      "0000-01-01 04:05:06.000001 +0000 UTC no",
+			timestamp:     "error",
+			timestampNoTZ: "error",
+		},
+		{
+			s:             "2017-03-03 01:00:00.00000",
+			date:          "2017-03-03 no",
+			time:          "0000-01-01 01:00:00 +0500 +0500 yes",
+			timeNoTZ:      "0000-01-01 01:00:00 +0000 UTC no",
+			timestamp:     "2017-03-03 01:00:00 +0500 foo yes",
+			timestampNoTZ: "2017-03-03 01:00:00 +0000 UTC no",
+		},
+		{
+			s:             "2017-03-03 01:00:00.00000-04",
+			date:          "2017-03-03 no",
+			time:          "0000-01-01 01:00:00 -0400 -0400 no",
+			timeNoTZ:      "0000-01-01 01:00:00 +0000 UTC no",
+			timestamp:     "2017-03-03 01:00:00 -0400 -040000 no",
+			timestampNoTZ: "2017-03-03 01:00:00 +0000 UTC no",
+		},
+		{
+			s:             "2017-03-03 01:00:00.00000 Europe/Berlin",
+			date:          "2017-03-03 no",
+			time:          "0000-01-01 01:00:00 +0100 +0100 no",
+			timeNoTZ:      "0000-01-01 01:00:00 +0000 UTC no",
+			timestamp:     "2017-03-03 01:00:00 +0100 CET no",
+			timestampNoTZ: "2017-03-03 01:00:00 +0000 UTC no",
+		},
+		{
+			s:             "now",
+			date:          "2001-02-03 yes",
+			time:          "2001-02-03 04:05:06.000001 +0500 foo yes",
+			timeNoTZ:      "2001-02-03 04:05:06.000001 +0000 UTC yes",
+			timestamp:     "2001-02-03 04:05:06.000001 +0500 foo yes",
+			timestampNoTZ: "2001-02-03 04:05:06.000001 +0000 UTC yes",
+		},
+		{
+			s:             "tomorrow",
+			date:          "2001-02-04 yes",
+			time:          "error",
+			timeNoTZ:      "error",
+			timestamp:     "2001-02-04 00:00:00 +0500 foo yes",
+			timestampNoTZ: "2001-02-04 00:00:00 +0000 UTC yes",
+		},
+	}
+
+	now := time.Date(2001, time.February, 3, 4, 5, 6, 1000, time.FixedZone("foo", 18000))
+	mode := pgdate.ParseModeYMD
+	for _, tc := range testCases {
+		t.Run(tc.s, func(t *testing.T) {
+			toStr := func(result interface{}, depOnCtx bool, err error) string {
+				if err != nil {
+					return "error"
+				}
+				if s := fmt.Sprint(result); depOnCtx {
+					return s + " yes"
+				} else {
+					return s + " no"
+				}
 			}
-		}()
-
-		if _, err := db.Exec("set time zone 'UTC'"); err != nil {
-			t.Fatal(err)
-		}
-
-		var style string
-		switch mode {
-		case pgdate.ParseModeMDY:
-			style = "MDY"
-		case pgdate.ParseModeDMY:
-			style = "DMY"
-		case pgdate.ParseModeYMD:
-			style = "YMD"
-		}
-		if _, err := db.Exec(fmt.Sprintf("set datestyle='%s'", style)); err != nil {
-			t.Fatal(err)
-		}
-
-		row := db.QueryRow(fmt.Sprintf("select '%s'::%s", s, kind))
-		var ret time.Time
-		if err := row.Scan(&ret); err == nil {
-			switch {
-			case expErr:
-				t.Fatalf("expected error, got %s", ret)
-			case ret.Round(td.allowCrossDelta).Equal(expTime.Round(td.allowCrossDelta)):
-				t.Logf("got expected value: %s", ret)
-			default:
-				t.Fatalf("expected %s, got %s", expTime, ret)
+			check := func(what string, expected string, actual string) {
+				t.Helper()
+				if expected != actual {
+					t.Errorf("%s: expected '%s', got '%s'", what, expected, actual)
+				}
 			}
-		} else {
-			switch {
-			case expErr:
-				t.Logf("got expected error: %s", err)
-			case kind == "time", kind == "timetz":
-				// Our parser is quite a bit more lenient than the
-				// PostgreSQL 10.5 implementation. For instance:
-				// '1999.123 12:54 PM +11'::timetz --> fail
-				// '1999.123 12:54 PM America/New_York'::timetz --> OK
-				// Trying to run this down is too much of a time-sink,
-				// and as long as we're not producing erroneous values,
-				// it's reasonable to treat cases where we can parse,
-				// but pg doesn't as a soft failure.
-				t.Skipf(`unexpected error from "%s": %s`, s, err)
-			default:
-				t.Fatalf(`unexpected error from "%s": %s`, s, err)
-			}
-		}
-	})
+			check("ParseDate", tc.date, toStr(pgdate.ParseDate(now, mode, tc.s)))
+			check("ParseTime", tc.time, toStr(pgdate.ParseTime(now, mode, tc.s)))
+			check(
+				"ParseTimeWithoutTimezone", tc.timeNoTZ,
+				toStr(pgdate.ParseTimeWithoutTimezone(now, mode, tc.s)),
+			)
+			check("ParseTimestamp", tc.timestamp, toStr(pgdate.ParseTimestamp(now, mode, tc.s)))
+			check("ParseTimestampWithoutTimezone",
+				tc.timestampNoTZ, toStr(pgdate.ParseTimestampWithoutTimezone(now, mode, tc.s)),
+			)
+		})
+	}
 }

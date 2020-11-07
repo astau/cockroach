@@ -1,20 +1,16 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 export const kibi = 1024;
-const byteUnits: string[] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB", "ZiB", "YiB"];
-const durationUnits: string[] = ["ns", "µs", "ms", "s"];
+export const byteUnits: string[] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB", "ZiB", "YiB"];
+export const durationUnits: string[] = ["ns", "µs", "ms", "s"];
 
 interface UnitValue {
   value: number;
@@ -85,6 +81,18 @@ export function BytesWithPrecision(bytes: number, precision: number): string {
 }
 
 /**
+ * Cast bytes to provided scale units
+ */
+// tslint:disable-next-line: variable-name
+export const BytesFitScale = (scale: string) => ( bytes: number) => {
+  if (!bytes) {
+    return `0.00 ${scale}`;
+  }
+  const n = byteUnits.indexOf(scale);
+  return `${(bytes / Math.pow(kibi, n)).toFixed(2)} ${scale}`;
+};
+
+/**
  * Percentage creates a string representation of a fraction as a percentage.
  */
 export function Percentage(numerator: number, denominator: number): string {
@@ -116,3 +124,17 @@ export function Duration(nanoseconds: number): string {
   const unitVal = nanoseconds / scale.value;
   return unitVal.toFixed(1) + " " + scale.units;
 }
+
+/**
+ * Cast nanonseconds to provided scale units
+ */
+// tslint:disable-next-line: variable-name
+export const DurationFitScale = (scale: string) => (nanoseconds: number) => {
+  if (!nanoseconds) {
+    return `0.00 ${scale}`;
+  }
+  const n = durationUnits.indexOf(scale) ;
+  return `${(nanoseconds / Math.pow(1000, n)).toFixed(2)} ${scale}`;
+};
+
+export const DATE_FORMAT = "MMM DD, YYYY [at] h:mm A";

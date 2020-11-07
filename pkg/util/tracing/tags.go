@@ -1,72 +1,64 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tracing
 
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/util/log/logtags"
-	opentracing "github.com/opentracing/opentracing-go"
+	"github.com/cockroachdb/logtags"
 )
 
-// LogTagsOption is a StartSpanOption that uses log tags to populate the span tags.
+// LogTagsOption is a StartSpanOption that uses log tags to populate the Span tags.
 type logTagsOption logtags.Buffer
 
-var _ opentracing.StartSpanOption = &logTagsOption{}
+var _ SpanOption = &logTagsOption{}
 
-// Apply is part of the opentracing.StartSpanOption interface.
-func (lt *logTagsOption) Apply(o *opentracing.StartSpanOptions) {
-	if lt == nil {
-		return
-	}
-	tags := (*logtags.Buffer)(lt).Get()
-	if len(tags) == 0 {
-		return
-	}
-	if o.Tags == nil {
-		o.Tags = make(map[string]interface{}, len(tags))
-	}
-	for i := range tags {
-		o.Tags[tagName(tags[i].Key())] = tags[i].ValueStr()
-	}
+func (lt *logTagsOption) apply(opts spanOptions) spanOptions {
+	opts.LogTags = (*logtags.Buffer)(lt)
+	return opts
 }
 
-// LogTags returns a StartSpanOption that sets the span tags to the given log
-// tags.
-func LogTags(tags *logtags.Buffer) opentracing.StartSpanOption {
+// WithLogTags returns a SpanOption that sets the Span tags to the given log
+// tags. When applied, the returned option will apply any logtag name->Span tag
+// name remapping that has been registered via RegisterTagRemapping.
+func WithLogTags(tags *logtags.Buffer) SpanOption {
 	return (*logTagsOption)(tags)
 }
 
-// LogTagsFromCtx returns a StartSpanOption that sets the span tags to the log
-// tags in the context.
-func LogTagsFromCtx(ctx context.Context) opentracing.StartSpanOption {
-	return (*logTagsOption)(logtags.FromContext(ctx))
+// WithCtxLogTags returns WithLogTags(logtags.FromContext(ctx)).
+func WithCtxLogTags(ctx context.Context) SpanOption {
+	return WithLogTags(logtags.FromContext(ctx))
 }
 
 // tagRemap is a map that records desired conversions
 var tagRemap = make(map[string]string)
 
-// RegisterTagRemapping sets the span tag name that corresponds to the given log
+// RegisterTagRemapping sets the Span tag name that corresponds to the given log
 // tag name. Should be called as part of an init() function.
 func RegisterTagRemapping(logTag, spanTag string) {
 	tagRemap[logTag] = spanTag
 }
 
-func tagName(logTag string) string {
-	if v, ok := tagRemap[logTag]; ok {
-		return v
+// setLogTags calls the provided function for each tag pair from the provided log tags.
+// It takes into account any prior calls to RegisterTagRemapping.
+func setLogTags(logTags []logtags.Tag, setTag func(remappedKey string, value *logtags.Tag)) {
+	tagName := func(logTag string) string {
+		if v, ok := tagRemap[logTag]; ok {
+			return v
+		}
+		return logTag
 	}
-	return logTag
+
+	for i := range logTags {
+		tag := &logTags[i]
+		setTag(tagName(tag.Key()), tag)
+	}
 }

@@ -15,6 +15,18 @@
 # case.
 # =============================================================================
 
+# InlineConstVar inlines variables which are restricted to be constant, as in
+#   SELECT * FROM foo WHERE a = 4 AND a IN (1, 2, 3, 4).
+# =>
+#   SELECT * FROM foo WHERE a = 4 AND 4 IN (1, 2, 3, 4).
+# Note that a single iteration of this rule might not be sufficient to inline
+# all variables, in which case it will trigger itself again.
+#
+# This rule is high priority so that it runs before filter pushdown.
+[InlineConstVar, Normalize, HighPriority]
+(Select $input:* $filters:* & (CanInlineConstVar $filters))
+=>
+(Select $input (InlineConstVar $filters))
 
 # InlineProjectConstants finds variable references in Projections expressions
 # that refer to constant input values, and then inlines those constant values
@@ -22,8 +34,15 @@
 # further simplifications such as constant folding or Project merging.
 [InlineProjectConstants, Normalize]
 (Project
-    $input:* & ^(ColsAreEmpty $constCols:(FindInlinableConstants $input))
-    $projections:[ ... $item:* & (ColsIntersect (OuterCols $item) $constCols) ... ]
+    $input:* &
+        ^(ColsAreEmpty
+            $constCols:(FindInlinableConstants $input)
+        )
+    $projections:[
+        ...
+        $item:* & (ColsIntersect (OuterCols $item) $constCols)
+        ...
+    ]
     $passthrough:*
 )
 =>
@@ -39,8 +58,15 @@
 # simplifications such as constant folding or generation of constrained scans.
 [InlineSelectConstants, Normalize]
 (Select
-    $input:* & ^(ColsAreEmpty $constCols:(FindInlinableConstants $input))
-    $filters:[ ... $item:* & (ColsIntersect (OuterCols $item) $constCols) ... ]
+    $input:* &
+        ^(ColsAreEmpty
+            $constCols:(FindInlinableConstants $input)
+        )
+    $filters:[
+        ...
+        $item:* & (ColsIntersect (OuterCols $item) $constCols)
+        ...
+    ]
 )
 =>
 (Select
@@ -55,15 +81,22 @@
 # pushdown.
 [InlineJoinConstantsLeft, Normalize]
 (Join
-    $left:* & ^(ColsAreEmpty $constCols:(FindInlinableConstants $left))
+    $left:* &
+        ^(ColsAreEmpty $constCols:(FindInlinableConstants $left))
     $right:*
-    $on:[ ... $item:* & (ColsIntersect (OuterCols $item) $constCols) ... ]
+    $on:[
+        ...
+        $item:* & (ColsIntersect (OuterCols $item) $constCols)
+        ...
+    ]
+    $private:* & (NoJoinHints $private)
 )
 =>
 ((OpName)
     $left
     $right
     (InlineFilterConstants $on $left $constCols)
+    $private
 )
 
 # InlineJoinConstantsRight finds variable references in a join condition that
@@ -74,14 +107,23 @@
 [InlineJoinConstantsRight, Normalize]
 (Join
     $left:*
-    $right:* & ^(ColsAreEmpty $constCols:(FindInlinableConstants $right))
-    $on:[ ... $item:* & (ColsIntersect (OuterCols $item) $constCols) ... ]
+    $right:* &
+        ^(ColsAreEmpty
+            $constCols:(FindInlinableConstants $right)
+        )
+    $on:[
+        ...
+        $item:* & (ColsIntersect (OuterCols $item) $constCols)
+        ...
+    ]
+    $private:* & (NoJoinHints $private)
 )
 =>
 ((OpName)
     $left
     $right
     (InlineFilterConstants $on $right $constCols)
+    $private
 )
 
 # PushSelectIntoInlinableProject pushes the Select operator into a Project, even
@@ -110,10 +152,7 @@
 )
 =>
 (Project
-    (Select
-        $input
-        (InlineSelectProject $filters $projections)
-    )
+    (Select $input (InlineSelectProject $filters $projections))
     $projections
     $passthrough
 )
@@ -137,7 +176,11 @@
     $input:(Project * $innerProjections:*)
     $projections:*
     $passthrough:* &
-        ^(HasDuplicateRefs $projections $passthrough (ProjectionCols $innerProjections))
+        ^(HasDuplicateRefs
+            $projections
+            $passthrough
+            (ProjectionCols $innerProjections)
+        )
 )
 =>
 (InlineProjectProject $input $projections $passthrough)

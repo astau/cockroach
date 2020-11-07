@@ -1,33 +1,38 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 import { assert } from "chai";
-import fetchMock from "src/util/fetch-mock";
 import { Store } from "redux";
 import moment from "moment";
+import sinon from "sinon";
+import { createHashHistory } from "history";
 
 import * as protos from "src/js/protos";
+import { cockroach } from "src/js/protos";
 import { API_PREFIX } from "src/util/api";
+import fetchMock from "src/util/fetch-mock";
+
 import { AdminUIState, createAdminUIStore } from "./state";
 import {
   AlertLevel,
   alertDataSync,
-  versionsSelector,
-  staggeredVersionWarningSelector, staggeredVersionDismissedSetting,
-  newVersionNotificationSelector, newVersionDismissedLocalSetting,
-  disconnectedAlertSelector, disconnectedDismissedLocalSetting,
+  staggeredVersionWarningSelector,
+  staggeredVersionDismissedSetting,
+  newVersionNotificationSelector,
+  newVersionDismissedLocalSetting,
+  disconnectedAlertSelector,
+  disconnectedDismissedLocalSetting,
+  emailSubscriptionAlertLocalSetting,
+  emailSubscriptionAlertSelector,
 } from "./alerts";
+import { versionsSelector } from "src/redux/nodes";
 import {
   VERSION_DISMISSED_KEY, INSTRUCTIONS_BOX_COLLAPSED_KEY,
   setUIDataKey, isInFlight,
@@ -35,6 +40,9 @@ import {
 import {
   livenessReducerObj, versionReducerObj, nodesReducerObj, clusterReducerObj, healthReducerObj,
 } from "./apiReducers";
+import MembershipStatus = cockroach.kv.kvserver.liveness.livenesspb.MembershipStatus;
+
+const sandbox = sinon.createSandbox();
 
 describe("alerts", function() {
   let store: Store<AdminUIState>;
@@ -42,12 +50,16 @@ describe("alerts", function() {
   let state: typeof store.getState;
 
   beforeEach(function () {
-    store = createAdminUIStore();
+    store = createAdminUIStore(createHashHistory());
     dispatch = store.dispatch;
     state = store.getState;
+    // localSettings persist values in sessionStorage and
+    // this stub disables caching values between tests.
+    sandbox.stub(sessionStorage, "getItem").returns(null);
   });
 
   afterEach(function() {
+    sandbox.restore();
     fetchMock.restore();
   });
 
@@ -70,9 +82,12 @@ describe("alerts", function() {
         assert.deepEqual(versions, ["0.1", "0.2"]);
       });
 
-      it("ignores decommissioned nodes", function () {
+      it("ignores decommissioning/decommissioned nodes", function () {
         dispatch(nodesReducerObj.receiveData([
           {
+            desc: {
+              node_id: 1,
+            },
             build_info: {
               tag: "0.1",
             },
@@ -85,14 +100,32 @@ describe("alerts", function() {
               tag: "0.2",
             },
           },
+          {
+            desc: {
+              node_id: 3,
+            },
+            build_info: {
+              tag: "0.3",
+            },
+          },
         ]));
 
         dispatch(livenessReducerObj.receiveData(
           new protos.cockroach.server.serverpb.LivenessResponse({
-            livenesses: [{
-              node_id: 2,
-              decommissioning: true,
-            }],
+            livenesses: [
+              {
+                node_id: 1,
+                membership: MembershipStatus.ACTIVE,
+              },
+              {
+                node_id: 2,
+                membership: MembershipStatus.DECOMMISSIONING,
+              },
+              {
+                node_id: 3,
+                membership: MembershipStatus.DECOMMISSIONED,
+              },
+            ],
           }),
         ));
 
@@ -343,6 +376,26 @@ describe("alerts", function() {
           );
           done();
         });
+      });
+    });
+
+    describe("email signup for release notes alert", () => {
+      it("initialized with default 'false' (hidden) state", () => {
+        const settingState = emailSubscriptionAlertLocalSetting.selector(state());
+        assert.isFalse(settingState);
+      });
+
+      it("dismissed by alert#dismiss", async () => {
+        // set alert to open state
+        dispatch(emailSubscriptionAlertLocalSetting.set(true));
+        let openState = emailSubscriptionAlertLocalSetting.selector(state());
+        assert.isTrue(openState);
+
+        // dismiss alert
+        const alert = emailSubscriptionAlertSelector(state());
+        await alert.dismiss(dispatch, state);
+        openState = emailSubscriptionAlertLocalSetting.selector(state());
+        assert.isFalse(openState);
       });
     });
   });

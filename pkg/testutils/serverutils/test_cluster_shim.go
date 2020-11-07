@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 //
 // This file provides generic interfaces that allow tests to set up test
 // clusters without importing the testcluster (and indirectly server) package
@@ -32,6 +28,12 @@ import (
 
 // TestClusterInterface defines TestCluster functionality used by tests.
 type TestClusterInterface interface {
+	// Start is used to start up the servers that were instantiated when
+	// creating this cluster.
+	Start(t testing.TB)
+
+	// NumServers returns the number of servers this test cluster is configured
+	// with.
 	NumServers() int
 
 	// Server returns the TestServerInterface corresponding to a specific node.
@@ -47,17 +49,46 @@ type TestClusterInterface interface {
 	// defer the Stop() method on this stopper after starting a test cluster.
 	Stopper() *stop.Stopper
 
-	// AddReplicas adds replicas for a range on a set of stores.
+	// AddVoters adds voter replicas for a range on a set of stores.
 	// It's illegal to have multiple replicas of the same range on stores of a single
 	// node.
 	// The method blocks until a snapshot of the range has been copied to all the
 	// new replicas and the new replicas become part of the Raft group.
-	AddReplicas(
+	AddVoters(
 		startKey roachpb.Key, targets ...roachpb.ReplicationTarget,
 	) (roachpb.RangeDescriptor, error)
 
-	// RemoveReplicas removes one or more replicas from a range.
-	RemoveReplicas(
+	// AddVotersMulti is the same as AddVoters but will execute multiple jobs.
+	AddVotersMulti(
+		kts ...KeyAndTargets,
+	) ([]roachpb.RangeDescriptor, []error)
+
+	// AddVotersOrFatal is the same as AddVoters but will Fatal the test on
+	// error.
+	AddVotersOrFatal(
+		t testing.TB, startKey roachpb.Key, targets ...roachpb.ReplicationTarget,
+	) roachpb.RangeDescriptor
+
+	// RemoveVoters removes one or more voter replicas from a range.
+	RemoveVoters(
+		startKey roachpb.Key, targets ...roachpb.ReplicationTarget,
+	) (roachpb.RangeDescriptor, error)
+
+	// RemoveVotersOrFatal is the same as RemoveVoters but will Fatal the test on
+	// error.
+	RemoveVotersOrFatal(
+		t testing.TB, startKey roachpb.Key, targets ...roachpb.ReplicationTarget,
+	) roachpb.RangeDescriptor
+
+	// AddNonVoters adds non-voting replicas for a range on a set of stores.
+	//
+	//This method blocks until the new replicas become a part of the Raft group.
+	AddNonVoters(
+		startKey roachpb.Key, targets ...roachpb.ReplicationTarget,
+	) (roachpb.RangeDescriptor, error)
+
+	// RemoveNonVoters removes one or more learners from a range.
+	RemoveNonVoters(
 		startKey roachpb.Key, targets ...roachpb.ReplicationTarget,
 	) (roachpb.RangeDescriptor, error)
 
@@ -90,19 +121,28 @@ type TestClusterInterface interface {
 	// LookupRange returns the descriptor of the range containing key.
 	LookupRange(key roachpb.Key) (roachpb.RangeDescriptor, error)
 
+	// LookupRangeOrFatal is the same as LookupRange but will Fatal the test on
+	// error.
+	LookupRangeOrFatal(t testing.TB, key roachpb.Key) roachpb.RangeDescriptor
+
 	// Target returns a roachpb.ReplicationTarget for the specified server.
 	Target(serverIdx int) roachpb.ReplicationTarget
 
 	// ReplicationMode returns the ReplicationMode that the test cluster was
 	// configured with.
 	ReplicationMode() base.TestClusterReplicationMode
+
+	// ScratchRange returns the start key of a span of keyspace suitable for use
+	// as kv scratch space (it doesn't overlap system spans or SQL tables). The
+	// range is lazily split off on the first call to ScratchRange.
+	ScratchRange(t testing.TB) roachpb.Key
 }
 
 // TestClusterFactory encompasses the actual implementation of the shim
 // service.
 type TestClusterFactory interface {
-	// New instantiates a test server.
-	StartTestCluster(t testing.TB, numNodes int, args base.TestClusterArgs) TestClusterInterface
+	// NewTestCluster creates a test cluster without starting it.
+	NewTestCluster(t testing.TB, numNodes int, args base.TestClusterArgs) TestClusterInterface
 }
 
 var clusterFactoryImpl TestClusterFactory
@@ -114,12 +154,29 @@ func InitTestClusterFactory(impl TestClusterFactory) {
 	clusterFactoryImpl = impl
 }
 
-// StartTestCluster starts up a TestCluster made up of numNodes in-memory
-// testing servers. The cluster should be stopped using Stopper().Stop().
-func StartTestCluster(t testing.TB, numNodes int, args base.TestClusterArgs) TestClusterInterface {
+// StartNewTestCluster creates and starts up a TestCluster made up of numNodes
+// in-memory testing servers. The cluster should be stopped using
+// Stopper().Stop().
+func StartNewTestCluster(
+	t testing.TB, numNodes int, args base.TestClusterArgs,
+) TestClusterInterface {
+	cluster := NewTestCluster(t, numNodes, args)
+	cluster.Start(t)
+	return cluster
+}
+
+// NewTestCluster creates TestCluster made up of numNodes in-memory testing
+// servers. It can be started using the return type.
+func NewTestCluster(t testing.TB, numNodes int, args base.TestClusterArgs) TestClusterInterface {
 	if clusterFactoryImpl == nil {
 		panic("TestClusterFactory not initialized. One needs to be injected " +
 			"from the package's TestMain()")
 	}
-	return clusterFactoryImpl.StartTestCluster(t, numNodes, args)
+	return clusterFactoryImpl.NewTestCluster(t, numNodes, args)
+}
+
+// KeyAndTargets contains replica startKey and targets.
+type KeyAndTargets struct {
+	StartKey roachpb.Key
+	Targets  []roachpb.ReplicationTarget
 }

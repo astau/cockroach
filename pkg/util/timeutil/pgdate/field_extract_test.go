@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package pgdate
 
@@ -44,8 +40,14 @@ func TestExtractRelative(t *testing.T) {
 	now := time.Date(2018, 10, 17, 0, 0, 0, 0, time.UTC)
 	for _, tc := range tests {
 		t.Run(tc.s, func(t *testing.T) {
-
-			ts, err := ParseDate(now, ParseModeYMD, tc.s)
+			d, depOnCtx, err := ParseDate(now, ParseModeYMD, tc.s)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !depOnCtx {
+				t.Fatalf("relative dates should depend on context")
+			}
+			ts, err := d.ToTime()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -87,7 +89,7 @@ func TestExtractSentinels(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.s, func(t *testing.T) {
-			fe := fieldExtract{now: now}
+			fe := fieldExtract{currentTime: now}
 			err := fe.Extract(tc.s)
 			if tc.err {
 				if err == nil {

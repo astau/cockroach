@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -26,7 +21,7 @@ import (
 	_ "github.com/lib/pq"
 )
 
-func registerDrop(r *registry) {
+func registerDrop(r *testRegistry) {
 	// TODO(tschottdorf): rearrange all tests so that their synopses are available
 	// via godoc and (some variation on) `roachtest run <testname> --help`.
 
@@ -42,8 +37,7 @@ func registerDrop(r *registry) {
 		m := newMonitor(ctx, c, c.Range(1, nodes))
 		m.Go(func(ctx context.Context) error {
 			t.WorkerStatus("importing TPCC fixture")
-			c.Run(ctx, c.Node(1), fmt.Sprintf(
-				"./workload fixtures load tpcc --warehouses=%d --db tpcc {pgurl:1}", warehouses))
+			c.Run(ctx, c.Node(1), tpccImportCmd(warehouses))
 
 			// Don't open the DB connection until after the data has been imported.
 			// Otherwise the ALTER TABLE query below might fail to find the
@@ -93,7 +87,7 @@ func registerDrop(r *registry) {
 
 				t.l.Printf("Node %d space used: %s\n", j, humanizeutil.IBytes(int64(size)))
 
-				// Return if the size of the directory is less than 100mb
+				// Return if the size of the directory is less than expected.
 				if size < initDiskSpace {
 					t.Fatalf("Node %d space used: %s less than %s", j, humanizeutil.IBytes(int64(size)),
 						humanizeutil.IBytes(int64(initDiskSpace)))
@@ -165,23 +159,20 @@ func registerDrop(r *registry) {
 
 	warehouses := 100
 	numNodes := 9
-
-	// 1GB
-	initDiskSpace := int(1E9)
+	initDiskSpace := 256 << 20 // 256 MB
 
 	r.Add(testSpec{
 		Name:       fmt.Sprintf("drop/tpcc/w=%d,nodes=%d", warehouses, numNodes),
+		Owner:      OwnerKV,
 		MinVersion: `v2.1.0`,
-		Nodes:      nodes(numNodes),
+		Cluster:    makeClusterSpec(numNodes),
 		Run: func(ctx context.Context, t *test, c *cluster) {
 			// NB: this is likely not going to work out in `-local` mode. Edit the
 			// numbers during iteration.
 			if local {
 				numNodes = 4
 				warehouses = 1
-
-				// 100 MB
-				initDiskSpace = 1E8
+				initDiskSpace = 5 << 20 // 5 MB
 				fmt.Printf("running with w=%d,nodes=%d in local mode\n", warehouses, numNodes)
 			}
 			runDrop(ctx, t, c, warehouses, numNodes, initDiskSpace)

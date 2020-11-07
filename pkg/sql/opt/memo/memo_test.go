@@ -1,42 +1,42 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package memo_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/optbuilder"
 	opttestutils "github.com/cockroachdb/cockroach/pkg/sql/opt/testutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/opttester"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/testcat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/xform"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	testutils "github.com/cockroachdb/cockroach/pkg/testutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/datadriven"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/datadriven"
 )
 
 func TestMemo(t *testing.T) {
 	flags := memo.ExprFmtHideCost | memo.ExprFmtHideRuleProps | memo.ExprFmtHideQualifications |
 		memo.ExprFmtHideStats
 	runDataDrivenTest(t, "testdata/memo", flags)
+}
+
+func TestFormat(t *testing.T) {
+	runDataDrivenTest(t, "testdata/format", memo.ExprFmtShowAll)
 }
 
 func TestLogicalProps(t *testing.T) {
@@ -50,6 +50,53 @@ func TestStats(t *testing.T) {
 	runDataDrivenTest(t, "testdata/stats/", flags)
 }
 
+func TestStatsQuality(t *testing.T) {
+	flags := memo.ExprFmtHideCost | memo.ExprFmtHideRuleProps | memo.ExprFmtHideQualifications |
+		memo.ExprFmtHideScalars
+	runDataDrivenTest(t, "testdata/stats_quality/", flags)
+}
+
+func TestCompositeSensitive(t *testing.T) {
+	datadriven.RunTest(t, "testdata/composite_sensitive", func(t *testing.T, d *datadriven.TestData) string {
+		semaCtx := tree.MakeSemaContext()
+		evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+
+		var f norm.Factory
+		f.Init(&evalCtx, nil /* catalog */)
+		md := f.Metadata()
+
+		if d.Cmd != "composite-sensitive" {
+			d.Fatalf(t, "unsupported command: %s\n", d.Cmd)
+		}
+		var sv opttestutils.ScalarVars
+
+		for _, arg := range d.CmdArgs {
+			key, vals := arg.Key, arg.Vals
+			switch key {
+			case "vars":
+				err := sv.Init(md, vals)
+				if err != nil {
+					d.Fatalf(t, "%v", err)
+				}
+
+			default:
+				d.Fatalf(t, "unknown argument: %s\n", key)
+			}
+		}
+
+		expr, err := parser.ParseExpr(d.Input)
+		if err != nil {
+			d.Fatalf(t, "error parsing: %v", err)
+		}
+
+		b := optbuilder.NewScalar(context.Background(), &semaCtx, &evalCtx, &f)
+		if err := b.Build(expr); err != nil {
+			d.Fatalf(t, "error building: %v", err)
+		}
+		return fmt.Sprintf("%v", memo.CanBeCompositeSensitive(md, f.Memo().RootExpr()))
+	})
+}
+
 func TestMemoInit(t *testing.T) {
 	catalog := testcat.New()
 	_, err := catalog.ExecuteDDL("CREATE TABLE abc (a INT PRIMARY KEY, b INT, c STRING, INDEX (c))")
@@ -57,23 +104,12 @@ func TestMemoInit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stmt, err := parser.ParseOne("SELECT * FROM abc WHERE $1=10")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	ctx := context.Background()
-	semaCtx := tree.MakeSemaContext(false /* privileged */)
 	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 
 	var o xform.Optimizer
-	o.Init(&evalCtx)
-	err = optbuilder.New(ctx, &semaCtx, &evalCtx, catalog, o.Factory(), stmt.AST).Build()
-	if err != nil {
-		t.Fatal(err)
-	}
+	opttestutils.BuildQuery(t, &o, catalog, &evalCtx, "SELECT * FROM abc WHERE $1=10")
 
-	o.Init(&evalCtx)
+	o.Init(&evalCtx, catalog)
 	if !o.Memo().IsEmpty() {
 		t.Fatal("memo should be empty")
 	}
@@ -103,67 +139,82 @@ func TestMemoIsStale(t *testing.T) {
 	// access via the view.
 	catalog.Table(tree.NewTableName("t", "abc")).Revoked = true
 
-	ctx := context.Background()
-	semaCtx := tree.MakeSemaContext(false /* privileged */)
-	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
-
 	// Initialize context with starting values.
-	searchPath := []string{"path1", "path2"}
+	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 	evalCtx.SessionData.Database = "t"
-	evalCtx.SessionData.SearchPath = sessiondata.MakeSearchPath(searchPath)
-
-	stmt, err := parser.ParseOne("SELECT a, b+1 FROM abcview WHERE c='foo'")
-	if err != nil {
-		t.Fatal(err)
-	}
 
 	var o xform.Optimizer
-	o.Init(&evalCtx)
-	err = optbuilder.New(ctx, &semaCtx, &evalCtx, catalog, o.Factory(), stmt.AST).Build()
-	if err != nil {
-		t.Fatal(err)
-	}
-	o.Memo().Metadata().AddDependency(catalog.Schema(), privilege.CREATE)
+	opttestutils.BuildQuery(t, &o, catalog, &evalCtx, "SELECT a, b+1 FROM abcview WHERE c='foo'")
 	o.Memo().Metadata().AddSchema(catalog.Schema())
 
-	if isStale, err := o.Memo().IsStale(ctx, &evalCtx, catalog); err != nil {
-		t.Fatal(err)
-	} else if isStale {
-		t.Errorf("memo should not be stale")
+	ctx := context.Background()
+	stale := func() {
+		t.Helper()
+		if isStale, err := o.Memo().IsStale(ctx, &evalCtx, catalog); err != nil {
+			t.Fatal(err)
+		} else if !isStale {
+			t.Errorf("memo should be stale")
+		}
+
+		// If we did not initialize the Memo's copy of a SessionData setting, the
+		// tests as written still pass if the default value is 0. To detect this, we
+		// create a new memo with the changed setting and verify it's not stale.
+		var o2 xform.Optimizer
+		opttestutils.BuildQuery(t, &o2, catalog, &evalCtx, "SELECT a, b+1 FROM abcview WHERE c='foo'")
+
+		if isStale, err := o2.Memo().IsStale(ctx, &evalCtx, catalog); err != nil {
+			t.Fatal(err)
+		} else if isStale {
+			t.Errorf("memo should not be stale")
+		}
 	}
 
-	// Stale current database.
-	evalCtx.SessionData.Database = "newdb"
-	if isStale, err := o.Memo().IsStale(ctx, &evalCtx, catalog); err != nil {
-		t.Fatal(err)
-	} else if !isStale {
-		t.Errorf("expected stale current database")
+	notStale := func() {
+		t.Helper()
+		if isStale, err := o.Memo().IsStale(ctx, &evalCtx, catalog); err != nil {
+			t.Fatal(err)
+		} else if isStale {
+			t.Errorf("memo should not be stale")
+		}
 	}
-	evalCtx.SessionData.Database = "t"
 
-	// Stale search path.
-	evalCtx.SessionData.SearchPath = sessiondata.SearchPath{}
-	if isStale, err := o.Memo().IsStale(ctx, &evalCtx, catalog); err != nil {
-		t.Fatal(err)
-	} else if !isStale {
-		t.Errorf("expected stale search path")
-	}
-	evalCtx.SessionData.SearchPath = sessiondata.MakeSearchPath([]string{"path1", "path2"})
-	if isStale, err := o.Memo().IsStale(ctx, &evalCtx, catalog); err != nil {
-		t.Fatal(err)
-	} else if isStale {
-		t.Errorf("memo should not be stale")
-	}
-	evalCtx.SessionData.SearchPath = sessiondata.MakeSearchPath(searchPath)
+	notStale()
 
-	// Stale location.
-	evalCtx.SessionData.DataConversion.Location = time.FixedZone("PST", -8*60*60)
-	if isStale, err := o.Memo().IsStale(ctx, &evalCtx, catalog); err != nil {
-		t.Fatal(err)
-	} else if !isStale {
-		t.Errorf("expected stale location")
-	}
-	evalCtx.SessionData.DataConversion.Location = time.UTC
+	// Stale reorder joins limit.
+	evalCtx.SessionData.ReorderJoinsLimit = 4
+	stale()
+	evalCtx.SessionData.ReorderJoinsLimit = 0
+	notStale()
+
+	// Stale zig zag join enable.
+	evalCtx.SessionData.ZigzagJoinEnabled = true
+	stale()
+	evalCtx.SessionData.ZigzagJoinEnabled = false
+	notStale()
+
+	// Stale optimizer histogram usage enable.
+	evalCtx.SessionData.OptimizerUseHistograms = true
+	stale()
+	evalCtx.SessionData.OptimizerUseHistograms = false
+	notStale()
+
+	// Stale optimizer multi-col stats usage enable.
+	evalCtx.SessionData.OptimizerUseMultiColStats = true
+	stale()
+	evalCtx.SessionData.OptimizerUseMultiColStats = false
+	notStale()
+
+	// Stale safe updates.
+	evalCtx.SessionData.SafeUpdates = true
+	stale()
+	evalCtx.SessionData.SafeUpdates = false
+	notStale()
+
+	// Stale prefer lookup joins for FKs.
+	evalCtx.SessionData.PreferLookupJoinsForFKs = true
+	stale()
+	evalCtx.SessionData.PreferLookupJoinsForFKs = false
+	notStale()
 
 	// Stale data sources and schema. Create new catalog so that data sources are
 	// recreated and can be modified independently.
@@ -184,53 +235,105 @@ func TestMemoIsStale(t *testing.T) {
 		t.Fatalf("expected %q error, but got %+v", exp, err)
 	}
 	catalog.View(tree.NewTableName("t", "abcview")).Revoked = false
-
-	// Ensure that memo is not stale after restoring to original state.
-	if isStale, err := o.Memo().IsStale(ctx, &evalCtx, catalog); err != nil {
-		t.Fatal(err)
-	} else if isStale {
-		t.Errorf("memo should not be stale")
-	}
+	notStale()
 
 	// Table ID changes.
 	catalog.Table(tree.NewTableName("t", "abc")).TabID = 1
-	if isStale, err := o.Memo().IsStale(ctx, &evalCtx, catalog); err != nil {
-		t.Fatal(err)
-	} else if !isStale {
-		t.Errorf("expected table ID to be stale")
-	}
+	stale()
 	catalog.Table(tree.NewTableName("t", "abc")).TabID = 53
+	notStale()
 
 	// Table Version changes.
 	catalog.Table(tree.NewTableName("t", "abc")).TabVersion = 1
-	if isStale, err := o.Memo().IsStale(ctx, &evalCtx, catalog); err != nil {
-		t.Fatal(err)
-	} else if !isStale {
-		t.Errorf("expected table version to be stale")
-	}
+	stale()
 	catalog.Table(tree.NewTableName("t", "abc")).TabVersion = 0
+	notStale()
+}
 
-	// Schema ID changes.
-	catalog.Schema().SchemaID = 2
-	if isStale, err := o.Memo().IsStale(ctx, &evalCtx, catalog); err != nil {
+// TestStatsAvailable tests that the statisticsBuilder correctly identifies
+// for each expression whether statistics were available on the base table.
+// This test is here (instead of statistics_builder_test.go) to avoid import
+// cycles.
+func TestStatsAvailable(t *testing.T) {
+	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+
+	catalog := testcat.New()
+	if _, err := catalog.ExecuteDDL(
+		"CREATE TABLE t (a INT, b INT)",
+	); err != nil {
 		t.Fatal(err)
-	} else if !isStale {
-		t.Errorf("expected schema ID to be stale")
 	}
-	catalog.Schema().SchemaID = 1
 
-	// User no longer has access to schema.
-	catalog.Schema().Revoked = true
-	if isStale, err := o.Memo().IsStale(ctx, &evalCtx, catalog); err == nil || !isStale {
-		t.Errorf("expected user not to have CREATE privilege on schema")
+	var o xform.Optimizer
+
+	testNotAvailable := func(expr memo.RelExpr) {
+		traverseExpr(expr, func(e memo.RelExpr) {
+			if e.Relational().Stats.Available {
+				t.Fatal("stats should not be available")
+			}
+		})
 	}
-	catalog.Schema().Revoked = false
 
-	// Ensure that memo is not stale after restoring to original state.
-	if isStale, err := o.Memo().IsStale(ctx, &evalCtx, catalog); err != nil {
+	// Stats should not be available for any expression.
+	opttestutils.BuildQuery(t, &o, catalog, &evalCtx, "SELECT * FROM t WHERE a=1")
+	testNotAvailable(o.Memo().RootExpr().(memo.RelExpr))
+
+	opttestutils.BuildQuery(t, &o, catalog, &evalCtx, "SELECT sum(a), b FROM t GROUP BY b")
+	testNotAvailable(o.Memo().RootExpr().(memo.RelExpr))
+
+	opttestutils.BuildQuery(t, &o, catalog, &evalCtx,
+		"SELECT * FROM t AS t1, t AS t2 WHERE t1.a = t2.a AND t1.b = 5",
+	)
+	testNotAvailable(o.Memo().RootExpr().(memo.RelExpr))
+
+	if _, err := catalog.ExecuteDDL(
+		`ALTER TABLE t INJECT STATISTICS '[
+		{
+			"columns": ["a"],
+			"created_at": "2018-01-01 1:00:00.00000+00:00",
+			"row_count": 1000,
+			"distinct_count": 500
+		},
+		{
+			"columns": ["b"],
+			"created_at": "2018-01-01 1:30:00.00000+00:00",
+			"row_count": 1000,
+			"distinct_count": 500
+		}
+	]'`); err != nil {
 		t.Fatal(err)
-	} else if isStale {
-		t.Errorf("memo should not be stale")
+	}
+
+	testAvailable := func(expr memo.RelExpr) {
+		traverseExpr(expr, func(e memo.RelExpr) {
+			if !e.Relational().Stats.Available {
+				t.Fatal("stats should be available")
+			}
+		})
+	}
+
+	// Stats should be available for all expressions.
+	opttestutils.BuildQuery(t, &o, catalog, &evalCtx, "SELECT * FROM t WHERE a=1")
+	testAvailable(o.Memo().RootExpr().(memo.RelExpr))
+
+	opttestutils.BuildQuery(t, &o, catalog, &evalCtx, "SELECT sum(a), b FROM t GROUP BY b")
+	testAvailable(o.Memo().RootExpr().(memo.RelExpr))
+
+	opttestutils.BuildQuery(t, &o, catalog, &evalCtx,
+		"SELECT * FROM t AS t1, t AS t2 WHERE t1.a = t2.a AND t1.b = 5",
+	)
+	testAvailable(o.Memo().RootExpr().(memo.RelExpr))
+}
+
+// traverseExpr is a helper function to recursively traverse a relational
+// expression and apply a function to the root as well as each relational
+// child.
+func traverseExpr(expr memo.RelExpr, f func(memo.RelExpr)) {
+	f(expr)
+	for i, n := 0, expr.ChildCount(); i < n; i++ {
+		if child, ok := expr.Child(i).(memo.RelExpr); ok {
+			traverseExpr(child, f)
+		}
 	}
 }
 
@@ -244,8 +347,8 @@ func TestMemoIsStale(t *testing.T) {
 func runDataDrivenTest(t *testing.T, path string, fmtFlags memo.ExprFmtFlags) {
 	datadriven.Walk(t, path, func(t *testing.T, path string) {
 		catalog := testcat.New()
-		datadriven.RunTest(t, path, func(d *datadriven.TestData) string {
-			tester := opttestutils.NewOptTester(catalog, d.Input)
+		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
+			tester := opttester.New(catalog, d.Input)
 			tester.Flags.ExprFormat = fmtFlags
 			return tester.RunCommand(t, d)
 		})

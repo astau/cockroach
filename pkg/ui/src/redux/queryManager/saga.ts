@@ -1,8 +1,18 @@
+// Copyright 2019 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import moment from "moment";
 import { Action } from "redux";
-import { channel, delay, Task, Channel } from "redux-saga";
+import { channel, Task, Channel } from "redux-saga";
 import {
-    call, cancel, fork, join, put, race, take,
+    call, cancel, fork, join, put, race, take, delay,
 } from "redux-saga/effects";
 
 import { queryBegin, queryComplete, queryError } from "./reducer";
@@ -316,7 +326,7 @@ export function getMoment() {
 // but redux-saga-test-plan does not.
 // https://github.com/jfairbank/redux-saga-test-plan/issues/139
 function *delayGenerator(delayTime: number) {
-    yield call(delay, delayTime);
+  yield delay(delayTime);
 }
 
 /**

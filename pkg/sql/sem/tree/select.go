@@ -7,25 +7,25 @@
 //
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 // This code was derived from https://github.com/youtube/vitess.
 
 package tree
 
 import (
-	"errors"
 	"fmt"
+
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 // SelectStatement represents any SELECT statement.
@@ -45,6 +45,7 @@ type Select struct {
 	Select  SelectStatement
 	OrderBy OrderBy
 	Limit   *Limit
+	Locking LockingClause
 }
 
 // Format implements the NodeFormatter interface.
@@ -59,6 +60,7 @@ func (node *Select) Format(ctx *FmtCtx) {
 		ctx.WriteByte(' ')
 		ctx.FormatNode(node.Limit)
 	}
+	ctx.FormatNode(&node.Locking)
 }
 
 // ParenSelect represents a parenthesized SELECT/UNION/VALUES statement.
@@ -78,7 +80,7 @@ type SelectClause struct {
 	Distinct    bool
 	DistinctOn  DistinctOn
 	Exprs       SelectExprs
-	From        *From
+	From        From
 	Where       *Where
 	GroupBy     GroupBy
 	Having      *Where
@@ -104,7 +106,7 @@ func (node *SelectClause) Format(ctx *FmtCtx) {
 		ctx.FormatNode(&node.Exprs)
 		if len(node.From.Tables) > 0 {
 			ctx.WriteByte(' ')
-			ctx.FormatNode(node.From)
+			ctx.FormatNode(&node.From)
 		}
 		if node.Where != nil {
 			ctx.WriteByte(' ')
@@ -263,13 +265,22 @@ type IndexID uint32
 // IndexFlags represents "@<index_name|index_id>" or "@{param[,param]}" where
 // param is one of:
 //  - FORCE_INDEX=<index_name|index_id>
+//  - ASC / DESC
 //  - NO_INDEX_JOIN
+//  - IGNORE_FOREIGN_KEYS
 // It is used optionally after a table name in SELECT statements.
 type IndexFlags struct {
 	Index   UnrestrictedName
 	IndexID IndexID
+	// Direction of the scan, if provided. Can only be set if
+	// one of Index or IndexID is set.
+	Direction Direction
 	// NoIndexJoin cannot be specified together with an index.
 	NoIndexJoin bool
+	// IgnoreForeignKeys disables optimizations based on outbound foreign key
+	// references from this table. This is useful in particular for scrub queries
+	// used to verify the consistency of foreign key relations.
+	IgnoreForeignKeys bool
 }
 
 // ForceIndex returns true if a forced index was specified, either using a name
@@ -284,45 +295,85 @@ func (ih *IndexFlags) CombineWith(other *IndexFlags) error {
 	if ih.NoIndexJoin && other.NoIndexJoin {
 		return errors.New("NO_INDEX_JOIN specified multiple times")
 	}
-	noIndexJoin := ih.NoIndexJoin || other.NoIndexJoin
+	if ih.IgnoreForeignKeys && other.IgnoreForeignKeys {
+		return errors.New("IGNORE_FOREIGN_KEYS specified multiple times")
+	}
+	result := *ih
+	result.NoIndexJoin = ih.NoIndexJoin || other.NoIndexJoin
+	result.IgnoreForeignKeys = ih.IgnoreForeignKeys || other.IgnoreForeignKeys
 
-	if noIndexJoin && (ih.ForceIndex() || other.ForceIndex()) {
-		return errors.New("FORCE_INDEX cannot be specified in conjunction with NO_INDEX_JOIN")
+	if other.Direction != 0 {
+		if ih.Direction != 0 {
+			return errors.New("ASC/DESC specified multiple times")
+		}
+		result.Direction = other.Direction
 	}
 
 	if other.ForceIndex() {
 		if ih.ForceIndex() {
 			return errors.New("FORCE_INDEX specified multiple times")
 		}
-		ih.Index = other.Index
-		ih.IndexID = other.IndexID
+		result.Index = other.Index
+		result.IndexID = other.IndexID
 	}
 
-	ih.NoIndexJoin = noIndexJoin
+	// We only set at the end to avoid a partially changed structure in one of the
+	// error cases above.
+	*ih = result
+	return nil
+}
+
+// Check verifies if the flags are valid:
+//  - ascending/descending is not specified without an index;
+//  - no_index_join isn't specified with an index.
+func (ih *IndexFlags) Check() error {
+	if ih.NoIndexJoin && ih.ForceIndex() {
+		return errors.New("FORCE_INDEX cannot be specified in conjunction with NO_INDEX_JOIN")
+	}
+	if ih.Direction != 0 && !ih.ForceIndex() {
+		return errors.New("ASC/DESC must be specified in conjunction with an index")
+	}
 	return nil
 }
 
 // Format implements the NodeFormatter interface.
 func (ih *IndexFlags) Format(ctx *FmtCtx) {
-	if !ih.NoIndexJoin {
-		ctx.WriteByte('@')
+	ctx.WriteByte('@')
+	if !ih.NoIndexJoin && !ih.IgnoreForeignKeys && ih.Direction == 0 {
 		if ih.Index != "" {
 			ctx.FormatNode(&ih.Index)
 		} else {
 			ctx.Printf("[%d]", ih.IndexID)
 		}
 	} else {
-		if ih.Index == "" && ih.IndexID == 0 {
-			ctx.WriteString("@{NO_INDEX_JOIN}")
-		} else {
-			ctx.WriteString("@{FORCE_INDEX=")
+		ctx.WriteByte('{')
+		var sep func()
+		sep = func() {
+			sep = func() { ctx.WriteByte(',') }
+		}
+		if ih.Index != "" || ih.IndexID != 0 {
+			sep()
+			ctx.WriteString("FORCE_INDEX=")
 			if ih.Index != "" {
 				ctx.FormatNode(&ih.Index)
 			} else {
 				ctx.Printf("[%d]", ih.IndexID)
 			}
-			ctx.WriteString(",NO_INDEX_JOIN}")
+
+			if ih.Direction != 0 {
+				ctx.Printf(",%s", ih.Direction)
+			}
 		}
+		if ih.NoIndexJoin {
+			sep()
+			ctx.WriteString("NO_INDEX_JOIN")
+		}
+
+		if ih.IgnoreForeignKeys {
+			sep()
+			ctx.WriteString("IGNORE_FOREIGN_KEYS")
+		}
+		ctx.WriteString("}")
 	}
 }
 
@@ -332,11 +383,15 @@ type AliasedTableExpr struct {
 	Expr       TableExpr
 	IndexFlags *IndexFlags
 	Ordinality bool
+	Lateral    bool
 	As         AliasClause
 }
 
 // Format implements the NodeFormatter interface.
 func (node *AliasedTableExpr) Format(ctx *FmtCtx) {
+	if node.Lateral {
+		ctx.WriteString("LATERAL ")
+	}
 	ctx.FormatNode(node.Expr)
 	if node.IndexFlags != nil {
 		ctx.FormatNode(node.IndexFlags)
@@ -372,20 +427,27 @@ func StripTableParens(expr TableExpr) TableExpr {
 
 // JoinTableExpr represents a TableExpr that's a JOIN operation.
 type JoinTableExpr struct {
-	Join  string
-	Left  TableExpr
-	Right TableExpr
-	Cond  JoinCond
+	JoinType string
+	Left     TableExpr
+	Right    TableExpr
+	Cond     JoinCond
+	Hint     string
 }
 
 // JoinTableExpr.Join
 const (
-	AstJoin      = "JOIN"
-	AstFullJoin  = "FULL JOIN"
-	AstLeftJoin  = "LEFT JOIN"
-	AstRightJoin = "RIGHT JOIN"
-	AstCrossJoin = "CROSS JOIN"
-	AstInnerJoin = "INNER JOIN"
+	AstFull  = "FULL"
+	AstLeft  = "LEFT"
+	AstRight = "RIGHT"
+	AstCross = "CROSS"
+	AstInner = "INNER"
+)
+
+// JoinTableExpr.Hint
+const (
+	AstHash   = "HASH"
+	AstLookup = "LOOKUP"
+	AstMerge  = "MERGE"
 )
 
 // Format implements the NodeFormatter interface.
@@ -396,13 +458,27 @@ func (node *JoinTableExpr) Format(ctx *FmtCtx) {
 		// Natural joins have a different syntax: "<a> NATURAL <join_type> <b>"
 		ctx.FormatNode(node.Cond)
 		ctx.WriteByte(' ')
-		ctx.WriteString(node.Join)
-		ctx.WriteByte(' ')
+		if node.JoinType != "" {
+			ctx.WriteString(node.JoinType)
+			ctx.WriteByte(' ')
+			if node.Hint != "" {
+				ctx.WriteString(node.Hint)
+				ctx.WriteByte(' ')
+			}
+		}
+		ctx.WriteString("JOIN ")
 		ctx.FormatNode(node.Right)
 	} else {
-		// General syntax: "<a> <join_type> <b> <condition>"
-		ctx.WriteString(node.Join)
-		ctx.WriteByte(' ')
+		// General syntax: "<a> <join_type> [<join_hint>] JOIN <b> <condition>"
+		if node.JoinType != "" {
+			ctx.WriteString(node.JoinType)
+			ctx.WriteByte(' ')
+			if node.Hint != "" {
+				ctx.WriteString(node.Hint)
+				ctx.WriteByte(' ')
+			}
+		}
+		ctx.WriteString("JOIN ")
 		ctx.FormatNode(node.Right)
 		if node.Cond != nil {
 			ctx.WriteByte(' ')
@@ -503,7 +579,7 @@ func (node *DistinctOn) Format(ctx *FmtCtx) {
 	ctx.WriteByte(')')
 }
 
-// OrderBy represents an ORDER By clause.
+// OrderBy represents an ORDER BY clause.
 type OrderBy []*Order
 
 // Format implements the NodeFormatter interface.
@@ -517,7 +593,7 @@ func (node *OrderBy) Format(ctx *FmtCtx) {
 }
 
 // Direction for ordering results.
-type Direction int
+type Direction int8
 
 // Direction values.
 const (
@@ -539,6 +615,29 @@ func (d Direction) String() string {
 	return directionName[d]
 }
 
+// NullsOrder for specifying ordering of NULLs.
+type NullsOrder int8
+
+// Null order values.
+const (
+	DefaultNullsOrder NullsOrder = iota
+	NullsFirst
+	NullsLast
+)
+
+var nullsOrderName = [...]string{
+	DefaultNullsOrder: "",
+	NullsFirst:        "NULLS FIRST",
+	NullsLast:         "NULLS LAST",
+}
+
+func (n NullsOrder) String() string {
+	if n < 0 || n > NullsOrder(len(nullsOrderName)-1) {
+		return fmt.Sprintf("NullsOrder(%d)", n)
+	}
+	return nullsOrderName[n]
+}
+
 // OrderType indicates which type of expression is used in ORDER BY.
 type OrderType int
 
@@ -551,9 +650,10 @@ const (
 
 // Order represents an ordering expression.
 type Order struct {
-	OrderType OrderType
-	Expr      Expr
-	Direction Direction
+	OrderType  OrderType
+	Expr       Expr
+	Direction  Direction
+	NullsOrder NullsOrder
 	// Table/Index replaces Expr when OrderType = OrderByIndex.
 	Table TableName
 	// If Index is empty, then the order should use the primary key.
@@ -579,11 +679,23 @@ func (node *Order) Format(ctx *FmtCtx) {
 		ctx.WriteByte(' ')
 		ctx.WriteString(node.Direction.String())
 	}
+	if node.NullsOrder != DefaultNullsOrder {
+		ctx.WriteByte(' ')
+		ctx.WriteString(node.NullsOrder.String())
+	}
+}
+
+// Equal checks if the node ordering is equivalent to other.
+func (node *Order) Equal(other *Order) bool {
+	return node.Expr.String() == other.Expr.String() && node.Direction == other.Direction &&
+		node.Table == other.Table && node.OrderType == other.OrderType &&
+		node.NullsOrder == other.NullsOrder
 }
 
 // Limit represents a LIMIT clause.
 type Limit struct {
 	Offset, Count Expr
+	LimitAll      bool
 }
 
 // Format implements the NodeFormatter interface.
@@ -592,6 +704,9 @@ func (node *Limit) Format(ctx *FmtCtx) {
 	if node.Count != nil {
 		ctx.WriteString("LIMIT ")
 		ctx.FormatNode(node.Count)
+		needSpace = true
+	} else if node.LimitAll {
+		ctx.WriteString("LIMIT ALL")
 		needSpace = true
 	}
 	if node.Offset != nil {
@@ -683,6 +798,30 @@ const (
 	GROUPS
 )
 
+// OverrideWindowDef implements the logic to have a base window definition which
+// then gets augmented by a different window definition.
+func OverrideWindowDef(base *WindowDef, override WindowDef) (WindowDef, error) {
+	// base.Partitions is always used.
+	if len(override.Partitions) > 0 {
+		return WindowDef{}, pgerror.Newf(pgcode.Windowing, "cannot override PARTITION BY clause of window %q", base.Name)
+	}
+	override.Partitions = base.Partitions
+
+	// base.OrderBy is used if set.
+	if len(base.OrderBy) > 0 {
+		if len(override.OrderBy) > 0 {
+			return WindowDef{}, pgerror.Newf(pgcode.Windowing, "cannot override ORDER BY clause of window %q", base.Name)
+		}
+		override.OrderBy = base.OrderBy
+	}
+
+	if base.Frame != nil {
+		return WindowDef{}, pgerror.Newf(pgcode.Windowing, "cannot copy window %q because it has a frame clause", base.Name)
+	}
+
+	return override, nil
+}
+
 // WindowFrameBoundType indicates which type of boundary is used.
 type WindowFrameBoundType int
 
@@ -699,6 +838,11 @@ const (
 	UnboundedFollowing
 )
 
+// IsOffset returns true if the WindowFrameBoundType is an offset.
+func (ft WindowFrameBoundType) IsOffset() bool {
+	return ft == OffsetPreceding || ft == OffsetFollowing
+}
+
 // WindowFrameBound specifies the offset and the type of boundary.
 type WindowFrameBound struct {
 	BoundType  WindowFrameBoundType
@@ -707,7 +851,7 @@ type WindowFrameBound struct {
 
 // HasOffset returns whether node contains an offset.
 func (node *WindowFrameBound) HasOffset() bool {
-	return node.BoundType == OffsetPreceding || node.BoundType == OffsetFollowing
+	return node.BoundType.IsOffset()
 }
 
 // WindowFrameBounds specifies boundaries of the window frame.
@@ -722,10 +866,25 @@ func (node *WindowFrameBounds) HasOffset() bool {
 	return node.StartBound.HasOffset() || (node.EndBound != nil && node.EndBound.HasOffset())
 }
 
+// WindowFrameExclusion indicates which mode of exclusion is used.
+type WindowFrameExclusion int
+
+const (
+	// NoExclusion represents an omitted frame exclusion clause.
+	NoExclusion WindowFrameExclusion = iota
+	// ExcludeCurrentRow represents EXCLUDE CURRENT ROW mode of frame exclusion.
+	ExcludeCurrentRow
+	// ExcludeGroup represents EXCLUDE GROUP mode of frame exclusion.
+	ExcludeGroup
+	// ExcludeTies represents EXCLUDE TIES mode of frame exclusion.
+	ExcludeTies
+)
+
 // WindowFrame represents static state of window frame over which calculations are made.
 type WindowFrame struct {
-	Mode   WindowFrameMode   // the mode of framing being used
-	Bounds WindowFrameBounds // the bounds of the frame
+	Mode      WindowFrameMode      // the mode of framing being used
+	Bounds    WindowFrameBounds    // the bounds of the frame
+	Exclusion WindowFrameExclusion // optional frame exclusion
 }
 
 // Format implements the NodeFormatter interface.
@@ -744,22 +903,46 @@ func (node *WindowFrameBound) Format(ctx *FmtCtx) {
 	case UnboundedFollowing:
 		ctx.WriteString("UNBOUNDED FOLLOWING")
 	default:
-		panic(fmt.Sprintf("unhandled case: %d", node.BoundType))
+		panic(errors.AssertionFailedf("unhandled case: %d", log.Safe(node.BoundType)))
+	}
+}
+
+// Format implements the NodeFormatter interface.
+func (node WindowFrameExclusion) Format(ctx *FmtCtx) {
+	if node == NoExclusion {
+		return
+	}
+	ctx.WriteString("EXCLUDE ")
+	switch node {
+	case ExcludeCurrentRow:
+		ctx.WriteString("CURRENT ROW")
+	case ExcludeGroup:
+		ctx.WriteString("GROUP")
+	case ExcludeTies:
+		ctx.WriteString("TIES")
+	default:
+		panic(errors.AssertionFailedf("unhandled case: %d", log.Safe(node)))
+	}
+}
+
+// WindowModeName returns the name of the window frame mode.
+func WindowModeName(mode WindowFrameMode) string {
+	switch mode {
+	case RANGE:
+		return "RANGE"
+	case ROWS:
+		return "ROWS"
+	case GROUPS:
+		return "GROUPS"
+	default:
+		panic(errors.AssertionFailedf("unhandled case: %d", log.Safe(mode)))
 	}
 }
 
 // Format implements the NodeFormatter interface.
 func (node *WindowFrame) Format(ctx *FmtCtx) {
-	switch node.Mode {
-	case RANGE:
-		ctx.WriteString("RANGE ")
-	case ROWS:
-		ctx.WriteString("ROWS ")
-	case GROUPS:
-		ctx.WriteString("GROUPS ")
-	default:
-		panic(fmt.Sprintf("unhandled case: %d", node.Mode))
-	}
+	ctx.WriteString(WindowModeName(node.Mode))
+	ctx.WriteByte(' ')
 	if node.Bounds.EndBound != nil {
 		ctx.WriteString("BETWEEN ")
 		ctx.FormatNode(node.Bounds.StartBound)
@@ -768,4 +951,132 @@ func (node *WindowFrame) Format(ctx *FmtCtx) {
 	} else {
 		ctx.FormatNode(node.Bounds.StartBound)
 	}
+	if node.Exclusion != NoExclusion {
+		ctx.WriteByte(' ')
+		ctx.FormatNode(node.Exclusion)
+	}
+}
+
+// LockingClause represents a locking clause, like FOR UPDATE.
+type LockingClause []*LockingItem
+
+// Format implements the NodeFormatter interface.
+func (node *LockingClause) Format(ctx *FmtCtx) {
+	for _, n := range *node {
+		ctx.FormatNode(n)
+	}
+}
+
+// LockingItem represents a single locking item in a locking clause.
+//
+// NOTE: if this struct changes, HashLockingItem and IsLockingItemEqual
+// in opt/memo/interner.go will need to be updated accordingly.
+type LockingItem struct {
+	Strength   LockingStrength
+	Targets    TableNames
+	WaitPolicy LockingWaitPolicy
+}
+
+// Format implements the NodeFormatter interface.
+func (f *LockingItem) Format(ctx *FmtCtx) {
+	f.Strength.Format(ctx)
+	if len(f.Targets) > 0 {
+		ctx.WriteString(" OF ")
+		f.Targets.Format(ctx)
+	}
+	f.WaitPolicy.Format(ctx)
+}
+
+// LockingStrength represents the possible row-level lock modes for a SELECT
+// statement.
+type LockingStrength byte
+
+// The ordering of the variants is important, because the highest numerical
+// value takes precedence when row-level locking is specified multiple ways.
+const (
+	// ForNone represents the default - no for statement at all.
+	// LockingItem AST nodes are never created with this strength.
+	ForNone LockingStrength = iota
+	// ForKeyShare represents FOR KEY SHARE.
+	ForKeyShare
+	// ForShare represents FOR SHARE.
+	ForShare
+	// ForNoKeyUpdate represents FOR NO KEY UPDATE.
+	ForNoKeyUpdate
+	// ForUpdate represents FOR UPDATE.
+	ForUpdate
+)
+
+var lockingStrengthName = [...]string{
+	ForNone:        "",
+	ForKeyShare:    "FOR KEY SHARE",
+	ForShare:       "FOR SHARE",
+	ForNoKeyUpdate: "FOR NO KEY UPDATE",
+	ForUpdate:      "FOR UPDATE",
+}
+
+func (s LockingStrength) String() string {
+	return lockingStrengthName[s]
+}
+
+// Format implements the NodeFormatter interface.
+func (s LockingStrength) Format(ctx *FmtCtx) {
+	if s != ForNone {
+		ctx.WriteString(" ")
+		ctx.WriteString(s.String())
+	}
+}
+
+// Max returns the maximum of the two locking strengths.
+func (s LockingStrength) Max(s2 LockingStrength) LockingStrength {
+	return LockingStrength(max(byte(s), byte(s2)))
+}
+
+// LockingWaitPolicy represents the possible policies for handling conflicting
+// locks held by other active transactions when attempting to lock rows due to
+// FOR UPDATE/SHARE clauses (i.e. it represents the NOWAIT and SKIP LOCKED
+// options).
+type LockingWaitPolicy byte
+
+// The ordering of the variants is important, because the highest numerical
+// value takes precedence when row-level locking is specified multiple ways.
+const (
+	// LockWaitBlock represents the default - wait for the lock to become
+	// available.
+	LockWaitBlock LockingWaitPolicy = iota
+	// LockWaitSkip represents SKIP LOCKED - skip rows that can't be locked.
+	LockWaitSkip
+	// LockWaitError represents NOWAIT - raise an error if a row cannot be
+	// locked.
+	LockWaitError
+)
+
+var lockingWaitPolicyName = [...]string{
+	LockWaitBlock: "",
+	LockWaitSkip:  "SKIP LOCKED",
+	LockWaitError: "NOWAIT",
+}
+
+func (p LockingWaitPolicy) String() string {
+	return lockingWaitPolicyName[p]
+}
+
+// Format implements the NodeFormatter interface.
+func (p LockingWaitPolicy) Format(ctx *FmtCtx) {
+	if p != LockWaitBlock {
+		ctx.WriteString(" ")
+		ctx.WriteString(p.String())
+	}
+}
+
+// Max returns the maximum of the two locking wait policies.
+func (p LockingWaitPolicy) Max(p2 LockingWaitPolicy) LockingWaitPolicy {
+	return LockingWaitPolicy(max(byte(p), byte(p2)))
+}
+
+func max(a, b byte) byte {
+	if a > b {
+		return a
+	}
+	return b
 }

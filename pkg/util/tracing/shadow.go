@@ -1,21 +1,17 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 //
 // A "shadow" tracer can be any opentracing.Tracer implementation that is used
 // in addition to the normal functionality of our tracer. It works by attaching
-// a shadow span to every span, and attaching a shadow context to every span
-// context. When injecting a span context, we encapsulate the shadow context
+// a shadow Span to every Span, and attaching a shadow context to every Span
+// context. When injecting a Span context, we encapsulate the shadow context
 // inside ours.
 
 package tracing
@@ -65,43 +61,47 @@ type shadowTracer struct {
 	manager shadowTracerManager
 }
 
-func (st *shadowTracer) Typ() string {
-	return st.manager.Name()
+// Type returns the underlying type of the shadow tracer manager.
+// It is valid to call this on a nil shadowTracer; it will
+// return zero values in this case.
+func (st *shadowTracer) Type() (string, bool) {
+	if st == nil || st.manager == nil {
+		return "", false
+	}
+	return st.manager.Name(), true
 }
 
 func (st *shadowTracer) Close() {
 	st.manager.Close(st)
 }
 
-// linkShadowSpan creates and links a Shadow span to the passed-in span (i.e.
-// fills in s.shadowTr and s.shadowSpan). This should only be called when
-// shadow tracing is enabled.
+// makeShadowSpan creates an otSpan for construction of a Span.
+// This must be called with a non-nil shadowTr, which must have
+// been confirmed to be compatible with parentShadowCtx.
 //
-// The Shadow span will have a parent if parentShadowCtx is not nil.
-// parentType is ignored if parentShadowCtx is nil.
-//
-// The tags from s are copied to the Shadow span.
-func linkShadowSpan(
-	s *span,
+// The span contained in `otSpan` will have a parent if parentShadowCtx
+// is not nil. parentType is ignored if parentShadowCtx is nil.
+func makeShadowSpan(
 	shadowTr *shadowTracer,
 	parentShadowCtx opentracing.SpanContext,
 	parentType opentracing.SpanReferenceType,
-) {
-	// Create the shadow lightstep span.
-	var opts []opentracing.StartSpanOption
+	opName string,
+	startTime time.Time,
+) otSpan {
+	// Create the shadow lightstep Span.
+	opts := make([]opentracing.StartSpanOption, 0, 2)
 	// Replicate the options, using the lightstep context in the reference.
-	opts = append(opts, opentracing.StartTime(s.startTime))
-	if s.mu.tags != nil {
-		opts = append(opts, s.mu.tags)
-	}
+	opts = append(opts, opentracing.StartTime(startTime))
 	if parentShadowCtx != nil {
 		opts = append(opts, opentracing.SpanReference{
 			Type:              parentType,
 			ReferencedContext: parentShadowCtx,
 		})
 	}
-	s.shadowTr = shadowTr
-	s.shadowSpan = shadowTr.StartSpan(s.operation, opts...)
+	return otSpan{
+		shadowTr:   shadowTr,
+		shadowSpan: shadowTr.StartSpan(opName, opts...),
+	}
 }
 
 func createLightStepTracer(token string) (shadowTracerManager, opentracing.Tracer) {

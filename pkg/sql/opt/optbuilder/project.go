@@ -1,25 +1,22 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package optbuilder
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 // constructProjectForScope constructs a projection if it will result in a
@@ -45,27 +42,38 @@ func (b *Builder) constructProject(input memo.RelExpr, cols []scopeColumn) memo.
 	colSet := opt.ColSet{}
 	for i := range cols {
 		id, scalar := cols[i].id, cols[i].scalar
-		if !colSet.Contains(int(id)) {
+		if !colSet.Contains(id) {
 			if scalar == nil {
-				passthrough.Add(int(id))
+				passthrough.Add(id)
 			} else {
-				projections = append(projections, memo.ProjectionsItem{
-					Element:    scalar,
-					ColPrivate: memo.ColPrivate{Col: id},
-				})
+				projections = append(projections, b.factory.ConstructProjectionsItem(scalar, id))
 			}
-			colSet.Add(int(id))
+			colSet.Add(id)
 		}
 	}
 
 	return b.factory.ConstructProject(input, projections, passthrough)
 }
 
+// dropOrderingAndExtraCols removes the ordering in the scope and projects away
+// any extra columns.
+func (b *Builder) dropOrderingAndExtraCols(s *scope) {
+	s.ordering = nil
+	if len(s.extraCols) > 0 {
+		var passthrough opt.ColSet
+		for i := range s.cols {
+			passthrough.Add(s.cols[i].id)
+		}
+		s.expr = b.factory.ConstructProject(s.expr, nil /* projections */, passthrough)
+		s.extraCols = nil
+	}
+}
+
 // analyzeProjectionList analyzes the given list of SELECT clause expressions,
 // and adds the resulting aliases and typed expressions to outScope. See the
 // header comment for analyzeSelectList.
 func (b *Builder) analyzeProjectionList(
-	selects tree.SelectExprs, desiredTypes []types.T, inScope, outScope *scope,
+	selects tree.SelectExprs, desiredTypes []*types.T, inScope, outScope *scope,
 ) {
 	// We need to save and restore the previous values of the replaceSRFs field
 	// and the field in semaCtx in case we are recursively called within a
@@ -73,8 +81,8 @@ func (b *Builder) analyzeProjectionList(
 	defer b.semaCtx.Properties.Restore(b.semaCtx.Properties)
 	defer func(replaceSRFs bool) { inScope.replaceSRFs = replaceSRFs }(inScope.replaceSRFs)
 
-	b.semaCtx.Properties.Require("SELECT", tree.RejectNestedGenerators)
-	inScope.context = "SELECT"
+	b.semaCtx.Properties.Require(exprKindSelect.String(), tree.RejectNestedGenerators)
+	inScope.context = exprKindSelect
 	inScope.replaceSRFs = true
 
 	b.analyzeSelectList(selects, desiredTypes, inScope, outScope)
@@ -84,7 +92,7 @@ func (b *Builder) analyzeProjectionList(
 // and adds the resulting aliases and typed expressions to outScope. See the
 // header comment for analyzeSelectList.
 func (b *Builder) analyzeReturningList(
-	returning tree.ReturningExprs, desiredTypes []types.T, inScope, outScope *scope,
+	returning tree.ReturningExprs, desiredTypes []*types.T, inScope, outScope *scope,
 ) {
 	// We need to save and restore the previous value of the field in
 	// semaCtx in case we are recursively called within a subquery
@@ -92,8 +100,8 @@ func (b *Builder) analyzeReturningList(
 	defer b.semaCtx.Properties.Restore(b.semaCtx.Properties)
 
 	// Ensure there are no special functions in the RETURNING clause.
-	b.semaCtx.Properties.Require("RETURNING", tree.RejectSpecial)
-	inScope.context = "RETURNING"
+	b.semaCtx.Properties.Require(exprKindReturning.String(), tree.RejectSpecial)
+	inScope.context = exprKindReturning
 
 	b.analyzeSelectList(tree.SelectExprs(returning), desiredTypes, inScope, outScope)
 }
@@ -106,7 +114,7 @@ func (b *Builder) analyzeReturningList(
 // As a side-effect, the appropriate scopes are updated with aggregations
 // (scope.groupby.aggs)
 func (b *Builder) analyzeSelectList(
-	selects tree.SelectExprs, desiredTypes []types.T, inScope, outScope *scope,
+	selects tree.SelectExprs, desiredTypes []*types.T, inScope, outScope *scope,
 ) {
 	for i, e := range selects {
 		// Start with fast path, looking for simple column reference.
@@ -115,7 +123,7 @@ func (b *Builder) analyzeSelectList(
 			// Fall back to slow path. Pre-normalize any VarName so the work is
 			// not done twice below.
 			if err := e.NormalizeTopLevelVarName(); err != nil {
-				panic(builderError{err})
+				panic(err)
 			}
 
 			// Special handling for "*", "<table>.*" and "(Expr).*".
@@ -123,8 +131,8 @@ func (b *Builder) analyzeSelectList(
 				switch v.(type) {
 				case tree.UnqualifiedStar, *tree.AllColumnsSelector, *tree.TupleStar:
 					if e.As != "" {
-						panic(builderError{pgerror.NewErrorf(pgerror.CodeSyntaxError,
-							"%q cannot be aliased", tree.ErrString(v))})
+						panic(pgerror.Newf(pgcode.Syntax,
+							"%q cannot be aliased", tree.ErrString(v)))
 					}
 
 					aliases, exprs := b.expandStar(e.Expr, inScope)
@@ -180,7 +188,7 @@ func (b *Builder) resolveColRef(e tree.Expr, inScope *scope) tree.TypedExpr {
 		colName := unresolved.Parts[0]
 		_, srcMeta, _, err := inScope.FindSourceProvidingColumn(b.ctx, tree.Name(colName))
 		if err != nil {
-			panic(builderError{err})
+			panic(err)
 		}
 		return srcMeta.(tree.TypedExpr)
 	}
@@ -191,7 +199,7 @@ func (b *Builder) resolveColRef(e tree.Expr, inScope *scope) tree.TypedExpr {
 func (b *Builder) getColName(expr tree.SelectExpr) string {
 	s, err := tree.GetRenderColName(b.semaCtx.SearchPath, expr)
 	if err != nil {
-		panic(builderError{err})
+		panic(err)
 	}
 	return s
 }
@@ -216,12 +224,16 @@ func (b *Builder) getColName(expr tree.SelectExpr) string {
 func (b *Builder) finishBuildScalar(
 	texpr tree.TypedExpr, scalar opt.ScalarExpr, inScope, outScope *scope, outCol *scopeColumn,
 ) (out opt.ScalarExpr) {
+	b.maybeTrackRegclassDependenciesForViews(texpr)
+
 	if outScope == nil {
 		return scalar
 	}
 
 	// Avoid synthesizing a new column if possible.
-	if col := outScope.findExistingCol(texpr); col != nil && col != outCol {
+	if col := outScope.findExistingCol(
+		texpr, false, /* allowSideEffects */
+	); col != nil && col != outCol {
 		outCol.id = col.id
 		outCol.scalar = scalar
 		return scalar
@@ -249,17 +261,17 @@ func (b *Builder) finishBuildScalar(
 func (b *Builder) finishBuildScalarRef(
 	col *scopeColumn, inScope, outScope *scope, outCol *scopeColumn, colRefs *opt.ColSet,
 ) (out opt.ScalarExpr) {
-	isOuterColumn := inScope == nil || inScope.isOuterColumn(col.id)
 
-	// Remember whether the query was correlated for later.
-	b.IsCorrelated = b.IsCorrelated || isOuterColumn
-
+	b.trackReferencedColumnForViews(col)
 	// Update the sets of column references and outer columns if needed.
 	if colRefs != nil {
-		colRefs.Add(int(col.id))
+		colRefs.Add(col.id)
 	}
+
+	// Collect the outer columns of the current subquery, if any.
+	isOuterColumn := inScope == nil || inScope.isOuterColumn(col.id)
 	if isOuterColumn && b.subquery != nil {
-		b.subquery.outerCols.Add(int(col.id))
+		b.subquery.outerCols.Add(col.id)
 	}
 
 	// If this is not a projection context, then wrap the column reference with
@@ -272,7 +284,7 @@ func (b *Builder) finishBuildScalarRef(
 	// column id before projection.
 	if isOuterColumn {
 		// Avoid synthesizing a new column if possible.
-		existing := outScope.findExistingCol(col)
+		existing := outScope.findExistingCol(col, false /* allowSideEffects */)
 		if existing == nil || existing == outCol {
 			if outCol.name == "" {
 				outCol.name = col.name

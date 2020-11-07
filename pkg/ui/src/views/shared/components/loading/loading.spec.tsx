@@ -1,24 +1,20 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 import _ from "lodash";
 import React from "react";
 import { assert } from "chai";
-import {mount, ReactWrapper} from "enzyme";
 
 import "src/enzymeInit";
 import Loading from "src/views/shared/components/loading";
+import { ReactWrapper, mount } from "enzyme";
 
 const LOADING_CLASS_NAME = "loading-class-name";
 const RENDER_CLASS_NAME = "render-class-name";
@@ -35,6 +31,15 @@ interface AssertExpectedProps {
   onlyVisibleClass: string;
   errorCount?: number;
 }
+
+const makeLoadingComponent = (props: MakeLoadingProps) => mount(
+  <Loading
+    loading={props.loading}
+    error={props.error}
+    className={LOADING_CLASS_NAME}
+    render={() => (<div className={props.renderClassName || RENDER_CLASS_NAME}>Hello, world!</div>)}
+  />,
+);
 
 describe("<Loading>", () => {
 
@@ -169,17 +174,4 @@ function assertExpectedState(
       props.errorCount,
     );
   }
-}
-
-function makeLoadingComponent(
-  props: MakeLoadingProps,
-) {
-  return mount(<Loading
-    loading={props.loading}
-    error={props.error}
-    className={LOADING_CLASS_NAME}
-    render={() => (
-      <div className={props.renderClassName || RENDER_CLASS_NAME}>Hello, world!</div>
-    )}
-    />);
 }

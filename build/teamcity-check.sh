@@ -1,26 +1,61 @@
 #!/usr/bin/env bash
 
+# Set this to 1 to require a "release justification" note in the commit message
+# or the PR description.
+require_justification=0
+
 set -euo pipefail
 
 source "$(dirname "${0}")/teamcity-support.sh"
 
+function check_clean() {
+  # The workspace is clean iff `git status --porcelain` produces no output. Any
+  # output is either an error message or a listing of an untracked/dirty file.
+  if [[ "$(git status --porcelain 2>&1)" != "" ]]; then
+    git status >&2 || true
+    git diff -a >&2 || true
+    echo "====================================================" >&2
+    echo "Some automatically generated code is not up to date." >&2
+    echo $1 >&2
+    exit 1
+  fi
+}
+
 tc_prepare
 
-tc_start_block "Ensure dependencies are up-to-date"
-run build/builder.sh go install ./vendor/github.com/golang/dep/cmd/dep ./pkg/cmd/github-pull-request-make
-run build/builder.sh env BUILD_VCS_NUMBER="$BUILD_VCS_NUMBER" TARGET=checkdeps github-pull-request-make
-tc_end_block "Ensure dependencies are up-to-date"
+if [ "$require_justification" = 1 ]; then
+  tc_start_block "Ensure commit message contains a release justification"
+  # Ensure master branch commits have a release justification.
+  if [[ $(git log -n1 | grep -ci "Release justification: \S\+") == 0 ]]; then
+    echo "Build Failed. No Release justification in the commit message or in the PR description." >&2
+    echo "Commits must have a Release justification of the form:" >&2
+    echo "Release justification: <some description of why this commit is safe to add to the release branch.>" >&2
+    exit 1
+  fi
+  tc_end_block "Ensure commit message contains a release justification"
+fi
 
 tc_start_block "Ensure generated code is up-to-date"
-run build/builder.sh make generate buildshort
-# The workspace is clean iff `git status --porcelain` produces no output. Any
-# output is either an error message or a listing of an untracked/dirty file.
-if [[ "$(git status --porcelain 2>&1)" != "" ]]; then
-  git status >&2 || true
-  git diff -a >&2 || true
-  exit 1
-fi
+# Buffer noisy output and only print it on failure.
+run build/builder.sh make generate &> artifacts/generate.log || (cat artifacts/generate.log && false)
+rm artifacts/generate.log
+check_clean "Run \`make generate\` to automatically regenerate these."
+run build/builder.sh make buildshort &> artifacts/buildshort.log || (cat artifacts/buildshort.log && false)
+rm artifacts/buildshort.log
+check_clean "Run \`make buildshort\` to automatically regenerate these."
 tc_end_block "Ensure generated code is up-to-date"
+
+# generated code can generate new dependencies; check dependencies after generated code.
+tc_start_block "Ensure dependencies are up-to-date"
+# Run go mod tidy and `make -k vendor_rebuild` and ensure nothing changes.
+run build/builder.sh go mod tidy
+check_clean "Run \`go mod tidy\` and \`make -k vendor_rebuild\` to automatically regenerate these."
+run build/builder.sh make -k vendor_rebuild
+cd vendor
+check_clean "Run \`make -k vendor_rebuild\` to automatically regenerate these."
+cd ..
+check_clean "Run \`make -k vendor_rebuild\` to automatically regenerate these. If it is only BUILD.bazel files that are affected, run \`bazel run //:gazelle\` to automatically regenerate these."
+tc_end_block "Ensure dependencies are up-to-date"
 
 tc_start_block "Lint"
 # Disable ccache so that Go doesn't try to install dependencies into GOROOT,
@@ -31,11 +66,8 @@ tc_start_block "Lint"
 #
 # TODO(benesch): once GOPATH/pkg goes away because Go static analysis tools can
 # rebuild on demand, remove this. Upstream issue: golang/go#25650.
-COCKROACH_BUILDER_CCACHE= build/builder.sh \
-	stdbuf -eL -oL \
-	make lint 2>&1 \
-	| tee artifacts/lint.log \
-	| go-test-teamcity
+run_json_test env COCKROACH_BUILDER_CCACHE= \
+  build/builder.sh stdbuf -eL -oL make GOTESTFLAGS=-json lint
 tc_end_block "Lint"
 
 tc_start_block "Test web UI"

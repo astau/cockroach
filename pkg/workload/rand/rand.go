@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package rand
 
@@ -24,16 +19,16 @@ import (
 	"math/rand"
 	"reflect"
 	"strings"
-	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
+	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
+	"github.com/cockroachdb/errors"
 	"github.com/lib/pq"
 	"github.com/lib/pq/oid"
-	"github.com/pkg/errors"
 	"github.com/spf13/pflag"
 )
 
@@ -95,13 +90,12 @@ func (w *random) Tables() []workload.Table {
 	tables := make([]workload.Table, w.tables)
 	rng := rand.New(rand.NewSource(w.seed))
 	for i := 0; i < w.tables; i++ {
-		createTable := sqlbase.RandCreateTable(rng, rng.Int())
-		var buf bytes.Buffer
-		ctx := tree.MakeFmtCtx(&buf, tree.FmtParsable)
-		createTable.FormatBody(&ctx)
+		createTable := rowenc.RandCreateTable(rng, "table", rng.Int())
+		ctx := tree.NewFmtCtx(tree.FmtParsable)
+		createTable.FormatBody(ctx)
 		tables[i] = workload.Table{
 			Name:   createTable.Table.String(),
-			Schema: ctx.String(),
+			Schema: ctx.CloseAndGetString(),
 		}
 	}
 	return tables
@@ -109,7 +103,7 @@ func (w *random) Tables() []workload.Table {
 
 type col struct {
 	name          string
-	dataType      sqlbase.ColumnType
+	dataType      *types.T
 	dataPrecision int
 	dataScale     int
 	cdefault      gosql.NullString
@@ -117,7 +111,9 @@ type col struct {
 }
 
 // Ops implements the Opser interface.
-func (w *random) Ops(urls []string, reg *workload.HistogramRegistry) (workload.QueryLoad, error) {
+func (w *random) Ops(
+	ctx context.Context, urls []string, reg *histogram.Registry,
+) (workload.QueryLoad, error) {
 	sqlDatabase, err := workload.SanitizeUrls(w, w.connFlags.DBOverride, urls)
 	if err != nil {
 		return workload.QueryLoad{}, err
@@ -165,11 +161,7 @@ WHERE attrelid=$1`, relid)
 			return workload.QueryLoad{}, err
 		}
 		datumType := types.OidToType[oid.Oid(typOid)]
-		colTyp, err := sqlbase.DatumTypeToColumnType(datumType)
-		if err != nil {
-			return workload.QueryLoad{}, err
-		}
-		c.dataType = colTyp
+		c.dataType = datumType
 		if c.cdefault.String == "unique_rowid()" { // skip
 			continue
 		}
@@ -271,10 +263,6 @@ AND    i.indisprimary`, relid)
 
 	buf.WriteString(dmlSuffix.String())
 
-	if testing.Verbose() {
-		fmt.Println(buf.String())
-	}
-
 	writeStmt, err := db.Prepare(buf.String())
 	if err != nil {
 		return workload.QueryLoad{}, err
@@ -298,14 +286,15 @@ AND    i.indisprimary`, relid)
 
 type randOp struct {
 	config    *random
-	hists     *workload.Histograms
+	hists     *histogram.Histograms
 	db        *gosql.DB
 	cols      []col
 	rng       *rand.Rand
 	writeStmt *gosql.Stmt
 }
 
-func datumToGoSQL(d tree.Datum) (interface{}, error) {
+// DatumToGoSQL converts a datum to a Go type.
+func DatumToGoSQL(d tree.Datum) (interface{}, error) {
 	d = tree.UnwrapDatum(nil, d)
 	if d == tree.DNull {
 		return nil, nil
@@ -338,7 +327,7 @@ func datumToGoSQL(d tree.Datum) (interface{}, error) {
 	case *tree.DArray:
 		arr := make([]interface{}, len(d.Array))
 		for i := range d.Array {
-			elt, err := datumToGoSQL(d.Array[i])
+			elt, err := DatumToGoSQL(d.Array[i])
 			if err != nil {
 				return nil, err
 			}
@@ -352,6 +341,8 @@ func datumToGoSQL(d tree.Datum) (interface{}, error) {
 		return d.UUID, nil
 	case *tree.DIPAddr:
 		return d.IPAddr.String(), nil
+	case *tree.DJSON:
+		return d.JSON.String(), nil
 	}
 	return nil, errors.Errorf("unhandled datum type: %s", reflect.TypeOf(d))
 }
@@ -372,8 +363,8 @@ func (o *randOp) run(ctx context.Context) (err error) {
 			if c.isNullable && o.config.nullPct > 0 {
 				nullPct = 100 / o.config.nullPct
 			}
-			d := sqlbase.RandDatumWithNullChance(o.rng, c.dataType, nullPct)
-			params[k], err = datumToGoSQL(d)
+			d := rowenc.RandDatumWithNullChance(o.rng, c.dataType, nullPct)
+			params[k], err = DatumToGoSQL(d)
 			if err != nil {
 				return err
 			}

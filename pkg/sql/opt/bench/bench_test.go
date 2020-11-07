@@ -1,20 +1,17 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package bench
 
 import (
+	"bytes"
 	"context"
 	gosql "database/sql"
 	"flag"
@@ -29,16 +26,17 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/execbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/optbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/testcat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/xform"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -69,11 +67,8 @@ const (
 	// execbuild time is captured.
 	ExecBuild
 
-	// ExecPlan executes the query end-to-end using the heuristic planner.
-	ExecPlan
-
-	// ExecOpt executes the query end-to-end using the cost-based optimizer.
-	ExecOpt
+	// EndToEnd executes the query end-to-end using the cost-based optimizer.
+	EndToEnd
 )
 
 var benchmarkTypeStrings = [...]string{
@@ -82,8 +77,7 @@ var benchmarkTypeStrings = [...]string{
 	Normalize: "Normalize",
 	Explore:   "Explore",
 	ExecBuild: "ExecBuild",
-	ExecPlan:  "ExecPlan",
-	ExecOpt:   "ExecOpt",
+	EndToEnd:  "EndToEnd",
 }
 
 type benchQuery struct {
@@ -152,8 +146,7 @@ var schemas = [...]string{
 		s_order_cnt  integer,
 		s_remote_cnt integer,
 		s_data       varchar(50),
-		primary key (s_w_id, s_i_id),
-		index (s_i_id)
+		primary key (s_w_id, s_i_id)
 	)
 	`,
 	`
@@ -170,10 +163,18 @@ var schemas = [...]string{
 		ol_amount       decimal(6,2),
 		ol_dist_info    char(24),
 		primary key (ol_w_id, ol_d_id, ol_o_id DESC, ol_number),
-		index order_line_fk (ol_supply_w_id, ol_d_id),
-		foreign key (ol_supply_w_id, ol_d_id) references stock (s_w_id, s_i_id)
+		index order_line_fk (ol_supply_w_id, ol_i_id),
+		foreign key (ol_supply_w_id, ol_i_id) references stock (s_w_id, s_i_id)
 	)
 	`,
+	`
+	CREATE TABLE j
+	(
+	  a INT PRIMARY KEY,
+	  b INT,
+	  INDEX (b)
+	)
+  `,
 }
 
 var queries = [...]benchQuery{
@@ -262,7 +263,7 @@ func init() {
 }
 
 var profileTime = flag.Duration("profile-time", 10*time.Second, "duration of profiling run")
-var profileType = flag.String("profile-type", "ExecBuild", "Parse, OptBuild, Normalize, Explore, ExecBuild, ExecPlan, ExecOpt")
+var profileType = flag.String("profile-type", "ExecBuild", "Parse, OptBuild, Normalize, Explore, ExecBuild, EndToEnd")
 var profileQuery = flag.String("profile-query", "kv-read", "name of query to run")
 
 // TestCPUProfile executes the configured profileQuery in a loop in order to
@@ -275,8 +276,8 @@ var profileQuery = flag.String("profile-query", "kv-read", "name of query to run
 // TestCPUProfile writes the output profile to a cpu.out file in the current
 // directory. See the profile flags for ways to configure what is profiled.
 func TestCPUProfile(t *testing.T) {
-	t.Skip(
-		"Remove this when profiling. Use profile flags above to configure. Sample command line: \n" +
+	skip.IgnoreLint(t,
+		"Remove this when profiling. Use profile flags above to configure. Sample command line: \n"+
 			"GOMAXPROCS=1 go test -run TestCPUProfile --logtostderr NONE && go tool pprof bench.test cpu.out",
 	)
 
@@ -316,15 +317,13 @@ func BenchmarkPhases(b *testing.B) {
 	}
 }
 
-// BenchmarkExec measures the time to execute a query end-to-end using both the
-// heuristic planner and the cost-based optimizer.
-func BenchmarkExec(b *testing.B) {
+// BenchmarkEndToEnd measures the time to execute a query end-to-end.
+func BenchmarkEndToEnd(b *testing.B) {
 	h := newHarness()
 	defer h.close()
 
 	for _, query := range queries {
-		h.runForBenchmark(b, ExecPlan, query)
-		h.runForBenchmark(b, ExecOpt, query)
+		h.runForBenchmark(b, EndToEnd, query)
 	}
 }
 
@@ -352,7 +351,7 @@ func newHarness() *harness {
 
 func (h *harness) close() {
 	if h.s != nil {
-		h.s.Stopper().Stop(context.TODO())
+		h.s.Stopper().Stop(context.Background())
 	}
 }
 
@@ -386,7 +385,7 @@ func (h *harness) runForProfiling(
 		// checking if done.
 		for i := 0; i < 1000; i++ {
 			switch bmType {
-			case ExecPlan, ExecOpt:
+			case EndToEnd:
 				h.runUsingServer(t)
 
 			default:
@@ -403,7 +402,7 @@ func (h *harness) runForBenchmark(b *testing.B, bmType BenchmarkType, query benc
 
 	b.Run(fmt.Sprintf("%s/%s", query.name, benchmarkTypeStrings[bmType]), func(b *testing.B) {
 		switch bmType {
-		case ExecPlan, ExecOpt:
+		case EndToEnd:
 			for i := 0; i < b.N; i++ {
 				h.runUsingServer(b)
 			}
@@ -418,7 +417,7 @@ func (h *harness) runForBenchmark(b *testing.B, bmType BenchmarkType, query benc
 
 func (h *harness) prepare(tb testing.TB) {
 	switch h.bmType {
-	case ExecPlan, ExecOpt:
+	case EndToEnd:
 		h.prepareUsingServer(tb)
 
 	default:
@@ -436,13 +435,6 @@ func (h *harness) prepareUsingServer(tb testing.TB) {
 			h.sr.Exec(tb, schema)
 		}
 		h.ready = true
-	}
-
-	// Set session state.
-	if h.bmType == ExecPlan {
-		h.sr.Exec(tb, `SET OPTIMIZER=OFF`)
-	} else {
-		h.sr.Exec(tb, `SET OPTIMIZER=ON`)
 	}
 
 	if h.query.prepare {
@@ -471,7 +463,7 @@ func (h *harness) runUsingServer(tb testing.TB) {
 func (h *harness) prepareUsingAPI(tb testing.TB) {
 	// Clear any state from previous usage of this harness instance.
 	h.ctx = context.Background()
-	h.semaCtx = tree.MakeSemaContext(false /* privileged */)
+	h.semaCtx = tree.MakeSemaContext()
 	h.evalCtx = tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 	h.prepMemo = nil
 	h.cat = nil
@@ -486,6 +478,9 @@ func (h *harness) prepareUsingAPI(tb testing.TB) {
 		}
 	}
 
+	if err := h.semaCtx.Placeholders.Init(len(h.query.args), nil /* typeHints */); err != nil {
+		tb.Fatal(err)
+	}
 	if h.query.prepare {
 		// Prepare the query by normalizing it (if it has placeholders) or exploring
 		// it (if it doesn't have placeholders), and cache the resulting memo so that
@@ -502,6 +497,7 @@ func (h *harness) prepareUsingAPI(tb testing.TB) {
 	}
 
 	// Construct placeholder values.
+	h.semaCtx.Placeholders.Values = make(tree.QueryArguments, len(h.query.args))
 	for i, arg := range h.query.args {
 		var parg tree.Expr
 		parg, err := parser.ParseExpr(fmt.Sprintf("%v", arg))
@@ -509,23 +505,24 @@ func (h *harness) prepareUsingAPI(tb testing.TB) {
 			tb.Fatalf("%v", err)
 		}
 
-		id := types.PlaceholderIdx(i)
+		id := tree.PlaceholderIdx(i)
 		typ, _ := h.semaCtx.Placeholders.ValueType(id)
-		texpr, err := sqlbase.SanitizeVarFreeExpr(
+		texpr, err := schemaexpr.SanitizeVarFreeExpr(
+			context.Background(),
 			parg,
 			typ,
 			"", /* context */
 			&h.semaCtx,
-			&h.evalCtx,
-			true, /* allowImpure */
+			tree.VolatilityVolatile,
 		)
 		if err != nil {
 			tb.Fatalf("%v", err)
 		}
 
-		h.semaCtx.Placeholders.Values[id] = texpr
+		h.semaCtx.Placeholders.Values[i] = texpr
 	}
 	h.evalCtx.Placeholders = &h.semaCtx.Placeholders
+	h.evalCtx.Annotations = &h.semaCtx.Annotations
 }
 
 func (h *harness) runUsingAPI(tb testing.TB, bmType BenchmarkType, usePrepared bool) {
@@ -542,7 +539,7 @@ func (h *harness) runUsingAPI(tb testing.TB, bmType BenchmarkType, usePrepared b
 		return
 	}
 
-	h.optimizer.Init(&h.evalCtx)
+	h.optimizer.Init(&h.evalCtx, h.cat)
 	if bmType == OptBuild {
 		h.optimizer.DisableOptimizations()
 	}
@@ -564,7 +561,9 @@ func (h *harness) runUsingAPI(tb testing.TB, bmType BenchmarkType, usePrepared b
 	if usePrepared && !h.prepMemo.HasPlaceholders() {
 		execMemo = h.prepMemo
 	} else {
-		h.optimizer.Optimize()
+		if _, err := h.optimizer.Optimize(); err != nil {
+			panic(err)
+		}
 		execMemo = h.optimizer.Memo()
 	}
 
@@ -573,8 +572,62 @@ func (h *harness) runUsingAPI(tb testing.TB, bmType BenchmarkType, usePrepared b
 	}
 
 	root := execMemo.RootExpr()
-	execFactory := stubFactory{}
-	if _, err = execbuilder.New(&execFactory, execMemo, root, &h.evalCtx).Build(); err != nil {
+	eb := execbuilder.New(
+		exec.StubFactory{}, execMemo, nil /* catalog */, root, &h.evalCtx, true, /* allowAutoCommit */
+	)
+	if _, err = eb.Build(); err != nil {
 		tb.Fatalf("%v", err)
+	}
+}
+
+func makeChain(size int) benchQuery {
+	var buf bytes.Buffer
+	buf.WriteString(`SELECT * FROM `)
+	comma := ""
+	for i := 0; i < size; i++ {
+		buf.WriteString(comma)
+		fmt.Fprintf(&buf, "j AS tab%d", i+1)
+		comma = ", "
+	}
+
+	if size > 1 {
+		buf.WriteString(" WHERE ")
+	}
+
+	comma = ""
+	for i := 0; i < size-1; i++ {
+		buf.WriteString(comma)
+		fmt.Fprintf(&buf, "tab%d.a = tab%d.b", i+1, i+2)
+		comma = " AND "
+	}
+
+	return benchQuery{
+		name:  fmt.Sprintf("chain-%d", size),
+		query: buf.String(),
+	}
+}
+
+// BenchmarkChain benchmarks the planning of a "chain" query, where
+// some number of tables are joined together, with there being a
+// predicate joining the first and second, second and third, third
+// and fourth, etc.
+//
+// For example, a 5-chain looks like:
+//
+//   SELECT * FROM a, b, c, d, e
+//   WHERE a.x = b.y
+//     AND b.x = c.y
+//     AND c.x = d.y
+//     AND d.x = e.y
+//
+func BenchmarkChain(b *testing.B) {
+	h := newHarness()
+	defer h.close()
+
+	for i := 1; i < 20; i++ {
+		q := makeChain(i)
+		for i := 0; i < b.N; i++ {
+			h.runForBenchmark(b, Explore, q)
+		}
 	}
 }

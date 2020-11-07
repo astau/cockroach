@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sqlutils
 
@@ -23,7 +19,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/testutils"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // SQLRunner wraps a testing.TB and *gosql.DB connection and provides
@@ -33,7 +29,7 @@ type SQLRunner struct {
 }
 
 // DBHandle is an interface that applies to *gosql.DB, *gosql.Conn, and
-// *gosql.Tx.
+// *gosql.Tx, as well as *RoundRobinDBHandle.
 type DBHandle interface {
 	ExecContext(ctx context.Context, query string, args ...interface{}) (gosql.Result, error)
 	QueryContext(ctx context.Context, query string, args ...interface{}) (*gosql.Rows, error)
@@ -50,6 +46,12 @@ func MakeSQLRunner(db DBHandle) *SQLRunner {
 	return &SQLRunner{DB: db}
 }
 
+// MakeRoundRobinSQLRunner returns a SQLRunner that uses a set of database
+// connections, in a round-robin fashion.
+func MakeRoundRobinSQLRunner(dbs ...DBHandle) *SQLRunner {
+	return MakeSQLRunner(MakeRoundRobinDBHandle(dbs...))
+}
+
 // Exec is a wrapper around gosql.Exec that kills the test on error.
 func (sr *SQLRunner) Exec(t testing.TB, query string, args ...interface{}) gosql.Result {
 	t.Helper()
@@ -58,6 +60,16 @@ func (sr *SQLRunner) Exec(t testing.TB, query string, args ...interface{}) gosql
 		t.Fatalf("error executing '%s': %s", query, err)
 	}
 	return r
+}
+
+// ExecSucceedsSoon is a wrapper around gosql.Exec that wraps
+// the exec in a succeeds soon.
+func (sr *SQLRunner) ExecSucceedsSoon(t testing.TB, query string, args ...interface{}) {
+	t.Helper()
+	testutils.SucceedsSoon(t, func() error {
+		_, err := sr.DB.ExecContext(context.Background(), query, args...)
+		return err
+	})
 }
 
 // ExecRowsAffected executes the statement and verifies that RowsAffected()
@@ -84,6 +96,20 @@ func (sr *SQLRunner) ExpectErr(t testing.TB, errRE string, query string, args ..
 	if !testutils.IsError(err, errRE) {
 		t.Fatalf("expected error '%s', got: %v", errRE, err)
 	}
+}
+
+// ExpectErrSucceedsSoon wraps ExpectErr with a SucceedsSoon.
+func (sr *SQLRunner) ExpectErrSucceedsSoon(
+	t testing.TB, errRE string, query string, args ...interface{},
+) {
+	t.Helper()
+	testutils.SucceedsSoon(t, func() error {
+		_, err := sr.DB.ExecContext(context.Background(), query, args...)
+		if !testutils.IsError(err, errRE) {
+			return errors.Newf("expected error '%s', got: %v", errRE, err)
+		}
+		return nil
+	})
 }
 
 // Query is a wrapper around gosql.Query that kills the test on error.
@@ -166,7 +192,9 @@ func RowsToStrMatrix(rows *gosql.Rows) ([][]string, error) {
 	return res, nil
 }
 
-func maxtrixToStr(rows [][]string) string {
+// MatrixToStr converts a set of rows into a single string where each row is on
+// a separate line and the columns with a row are comma separated.
+func MatrixToStr(rows [][]string) string {
 	res := strings.Builder{}
 	for _, row := range rows {
 		res.WriteString(strings.Join(row, ", "))
@@ -182,7 +210,7 @@ func (sr *SQLRunner) CheckQueryResults(t testing.TB, query string, expected [][]
 	res := sr.QueryStr(t, query)
 	if !reflect.DeepEqual(res, expected) {
 		t.Errorf("query '%s': expected:\n%v\ngot:\n%v\n",
-			query, maxtrixToStr(expected), maxtrixToStr(res),
+			query, MatrixToStr(expected), MatrixToStr(res),
 		)
 	}
 }
@@ -196,9 +224,50 @@ func (sr *SQLRunner) CheckQueryResultsRetry(t testing.TB, query string, expected
 		res := sr.QueryStr(t, query)
 		if !reflect.DeepEqual(res, expected) {
 			return errors.Errorf("query '%s': expected:\n%v\ngot:\n%v\n",
-				query, maxtrixToStr(expected), maxtrixToStr(res),
+				query, MatrixToStr(expected), MatrixToStr(res),
 			)
 		}
 		return nil
 	})
+}
+
+// RoundRobinDBHandle aggregates multiple DBHandles into a single one; each time
+// a query is issued, a handle is selected in round-robin fashion.
+type RoundRobinDBHandle struct {
+	handles []DBHandle
+	current int
+}
+
+var _ DBHandle = &RoundRobinDBHandle{}
+
+// MakeRoundRobinDBHandle creates a RoundRobinDBHandle.
+func MakeRoundRobinDBHandle(handles ...DBHandle) *RoundRobinDBHandle {
+	return &RoundRobinDBHandle{handles: handles}
+}
+
+func (rr *RoundRobinDBHandle) next() DBHandle {
+	h := rr.handles[rr.current]
+	rr.current = (rr.current + 1) % len(rr.handles)
+	return h
+}
+
+// ExecContext is part of the DBHandle interface.
+func (rr *RoundRobinDBHandle) ExecContext(
+	ctx context.Context, query string, args ...interface{},
+) (gosql.Result, error) {
+	return rr.next().ExecContext(ctx, query, args...)
+}
+
+// QueryContext is part of the DBHandle interface.
+func (rr *RoundRobinDBHandle) QueryContext(
+	ctx context.Context, query string, args ...interface{},
+) (*gosql.Rows, error) {
+	return rr.next().QueryContext(ctx, query, args...)
+}
+
+// QueryRowContext is part of the DBHandle interface.
+func (rr *RoundRobinDBHandle) QueryRowContext(
+	ctx context.Context, query string, args ...interface{},
+) *gosql.Row {
+	return rr.next().QueryRowContext(ctx, query, args...)
 }

@@ -1,30 +1,38 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 //
@@ -36,23 +44,13 @@ import (
 //
 
 var (
-	errEmptyDatabaseName = pgerror.NewError(pgerror.CodeSyntaxError, "empty database name")
-	errNoDatabase        = pgerror.NewError(pgerror.CodeInvalidNameError, "no database specified")
-	errNoTable           = pgerror.NewError(pgerror.CodeInvalidNameError, "no table specified")
-	errNoMatch           = pgerror.NewError(pgerror.CodeUndefinedObjectError, "no object matched")
+	errEmptyDatabaseName = pgerror.New(pgcode.Syntax, "empty database name")
+	errNoDatabase        = pgerror.New(pgcode.InvalidName, "no database specified")
+	errNoSchema          = pgerror.Newf(pgcode.InvalidName, "no schema specified")
+	errNoTable           = pgerror.New(pgcode.InvalidName, "no table specified")
+	errNoType            = pgerror.New(pgcode.InvalidName, "no type specified")
+	errNoMatch           = pgerror.New(pgcode.UndefinedObject, "no object matched")
 )
-
-// GenerateUniqueDescID returns the next available Descriptor ID and increments
-// the counter. The incrementing is non-transactional, and the counter could be
-// incremented multiple times because of retries.
-func GenerateUniqueDescID(ctx context.Context, db *client.DB) (sqlbase.ID, error) {
-	// Increment unique descriptor counter.
-	newVal, err := client.IncrementValRetryable(ctx, db, keys.DescIDGenerator, 1)
-	if err != nil {
-		return 0, err
-	}
-	return sqlbase.ID(newVal - 1), nil
-}
 
 // createdatabase takes Database descriptor and creates it if needed,
 // incrementing the descriptor counter. Returns true if the descriptor
@@ -61,46 +59,97 @@ func GenerateUniqueDescID(ctx context.Context, db *client.DB) (sqlbase.ID, error
 // state should be an error (false) or a no-op (true).
 // createDatabase implements the DatabaseDescEditor interface.
 func (p *planner) createDatabase(
-	ctx context.Context, desc *sqlbase.DatabaseDescriptor, ifNotExists bool,
-) (bool, error) {
-	plainKey := databaseKey{desc.Name}
-	idKey := plainKey.Key()
+	ctx context.Context, database *tree.CreateDatabase, jobDesc string,
+) (*dbdesc.Mutable, bool, error) {
 
-	if exists, err := descExists(ctx, p.txn, idKey); err == nil && exists {
-		if ifNotExists {
+	dbName := string(database.Name)
+	shouldCreatePublicSchema := true
+	dKey := catalogkv.MakeDatabaseNameKey(ctx, p.ExecCfg().Settings, dbName)
+	// TODO(solon): This conditional can be removed in 20.2. Every database
+	// is created with a public schema for cluster version >= 20.1, so we can remove
+	// the `shouldCreatePublicSchema` logic as well.
+	if !p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.VersionNamespaceTableWithSchemas) {
+		shouldCreatePublicSchema = false
+	}
+
+	if exists, _, err := catalogkv.LookupDatabaseID(ctx, p.txn, p.ExecCfg().Codec, dbName); err == nil && exists {
+		if database.IfNotExists {
 			// Noop.
-			return false, nil
+			return nil, false, nil
 		}
-		return false, sqlbase.NewDatabaseAlreadyExistsError(plainKey.Name())
+		return nil, false, sqlerrors.NewDatabaseAlreadyExistsError(dbName)
 	} else if err != nil {
-		return false, err
+		return nil, false, err
 	}
 
-	id, err := GenerateUniqueDescID(ctx, p.ExecCfg().DB)
+	id, err := catalogkv.GenerateUniqueDescID(ctx, p.ExecCfg().DB, p.ExecCfg().Codec)
 	if err != nil {
-		return false, err
+		return nil, false, err
 	}
 
-	return true, p.createDescriptorWithID(ctx, idKey, id, desc, nil)
-}
+	if len(database.Regions) > 0 {
+		liveRegions, err := p.getLiveClusterRegions()
+		if err != nil {
+			return nil, false, err
+		}
+		regions := make([]string, 0, len(database.Regions))
+		seenRegions := make(map[string]struct{}, len(database.Regions))
+		for _, r := range database.Regions {
+			region := string(r)
+			if err := checkLiveClusterRegion(liveRegions, region); err != nil {
+				return nil, false, err
+			}
 
-func descExists(ctx context.Context, txn *client.Txn, idKey roachpb.Key) (bool, error) {
-	// Check whether idKey exists.
-	gr, err := txn.Get(ctx, idKey)
-	if err != nil {
-		return false, err
+			// Check names are not duplicated.
+			// This check makes this function O(regions^2), but we expect the number of regions to
+			// be added to be small.
+			if _, ok := seenRegions[region]; ok {
+				return nil, false, pgerror.Newf(
+					pgcode.InvalidName,
+					"region %q defined multiple times",
+					region,
+				)
+			}
+			seenRegions[region] = struct{}{}
+			regions = append(regions, region)
+		}
+		// regions is not currently stored anywhere.
+		_ = regions
+		return nil, false, unimplemented.New("create database with region", "implementation pending")
 	}
-	return gr.Exists(), nil
+
+	desc := dbdesc.NewInitial(id, string(database.Name), p.SessionData().User())
+	if err := p.createDescriptorWithID(ctx, dKey.Key(p.ExecCfg().Codec), id, desc, nil, jobDesc); err != nil {
+		return nil, true, err
+	}
+
+	// TODO(solon): This check should be removed and a public schema should
+	// be created in every database in >= 20.2.
+	if shouldCreatePublicSchema {
+		// Every database must be initialized with the public schema.
+		if err := p.createSchemaNamespaceEntry(ctx, catalogkeys.NewPublicSchemaKey(id).Key(p.ExecCfg().Codec), keys.PublicSchemaID); err != nil {
+			return nil, true, err
+		}
+	}
+
+	return desc, true, nil
 }
 
 func (p *planner) createDescriptorWithID(
 	ctx context.Context,
 	idKey roachpb.Key,
-	id sqlbase.ID,
-	descriptor sqlbase.DescriptorProto,
+	id descpb.ID,
+	descriptor catalog.Descriptor,
 	st *cluster.Settings,
+	jobDesc string,
 ) error {
-	descriptor.SetID(id)
+	if descriptor.GetID() == 0 {
+		// TODO(ajwerner): Return the error here rather than fatal.
+		log.Fatalf(ctx, "%v", errors.AssertionFailedf("cannot create descriptor with an empty ID: %v", descriptor))
+	}
+	if descriptor.GetID() != id {
+		log.Fatalf(ctx, "%v", errors.AssertionFailedf("cannot create descriptor with an unexpected (%v) ID: %v", id, descriptor))
+	}
 	// TODO(pmattis): The error currently returned below is likely going to be
 	// difficult to interpret.
 	//
@@ -110,129 +159,74 @@ func (p *planner) createDescriptorWithID(
 	// but not going through the normal INSERT logic and not performing a precise
 	// mimicry. In particular, we're only writing a single key per table, while
 	// perfect mimicry would involve writing a sentinel key for each row as well.
-	descKey := sqlbase.MakeDescMetadataKey(descriptor.GetID())
 
-	b := &client.Batch{}
+	b := &kv.Batch{}
 	descID := descriptor.GetID()
-	descDesc := sqlbase.WrapDescriptor(descriptor)
 	if p.ExtendedEvalContext().Tracing.KVTracingEnabled() {
 		log.VEventf(ctx, 2, "CPut %s -> %d", idKey, descID)
-		log.VEventf(ctx, 2, "CPut %s -> %s", descKey, descDesc)
 	}
 	b.CPut(idKey, descID, nil)
-	b.CPut(descKey, descDesc, nil)
+	if err := catalogkv.WriteNewDescToBatch(
+		ctx,
+		p.ExtendedEvalContext().Tracing.KVTracingEnabled(),
+		st,
+		b,
+		p.ExecCfg().Codec,
+		descID,
+		descriptor,
+	); err != nil {
+		return err
+	}
 
-	mutDesc, isTable := descriptor.(*sqlbase.MutableTableDescriptor)
-	if isTable {
-		if err := mutDesc.ValidateTable(st); err != nil {
+	mutDesc, ok := descriptor.(catalog.MutableDescriptor)
+	if !ok {
+		log.Fatalf(ctx, "unexpected type %T when creating descriptor", descriptor)
+	}
+	isTable := false
+	switch desc := mutDesc.(type) {
+	case *typedesc.Mutable:
+		dg := catalogkv.NewOneLevelUncachedDescGetter(p.txn, p.ExecCfg().Codec)
+		if err := desc.Validate(ctx, dg); err != nil {
 			return err
 		}
-		if err := p.Tables().addUncommittedTable(*mutDesc); err != nil {
+		if err := p.Descriptors().AddUncommittedDescriptor(mutDesc); err != nil {
 			return err
 		}
+	case *tabledesc.Mutable:
+		isTable = true
+		if err := desc.ValidateTable(ctx); err != nil {
+			return err
+		}
+		if err := p.Descriptors().AddUncommittedDescriptor(mutDesc); err != nil {
+			return err
+		}
+	case *dbdesc.Mutable:
+		if err := desc.Validate(); err != nil {
+			return err
+		}
+		if err := p.Descriptors().AddUncommittedDescriptor(mutDesc); err != nil {
+			return err
+		}
+	case *schemadesc.Mutable:
+		if err := p.Descriptors().AddUncommittedDescriptor(mutDesc); err != nil {
+			return err
+		}
+	default:
+		log.Fatalf(ctx, "unexpected type %T when creating descriptor", mutDesc)
 	}
 
 	if err := p.txn.Run(ctx, b); err != nil {
 		return err
 	}
 	if isTable && mutDesc.Adding() {
-		p.queueSchemaChange(mutDesc.TableDesc(), sqlbase.InvalidMutationID)
-	}
-	return nil
-}
-
-// getDescriptor looks up the descriptor for `plainKey`, validates it,
-// and unmarshals it into `descriptor`.
-//
-// If `plainKey` doesn't exist, returns false and nil error.
-// In most cases you'll want to use wrappers: `getDatabaseDesc` or
-// `getTableDesc`.
-func getDescriptor(
-	ctx context.Context,
-	txn *client.Txn,
-	plainKey sqlbase.DescriptorKey,
-	descriptor sqlbase.DescriptorProto,
-) (bool, error) {
-	key := plainKey.Key()
-	log.Eventf(ctx, "looking up descriptor ID for name key %q", key)
-	gr, err := txn.Get(ctx, key)
-	if err != nil {
-		return false, err
-	}
-	if !gr.Exists() {
-		return false, nil
-	}
-
-	if err := getDescriptorByID(ctx, txn, sqlbase.ID(gr.ValueInt()), descriptor); err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-// getDescriptorByID looks up the descriptor for `id`, validates it,
-// and unmarshals it into `descriptor`.
-//
-// In most cases you'll want to use wrappers: `getDatabaseDescByID` or
-// `getTableDescByID`.
-func getDescriptorByID(
-	ctx context.Context, txn *client.Txn, id sqlbase.ID, descriptor sqlbase.DescriptorProto,
-) error {
-	log.Eventf(ctx, "fetching descriptor with ID %d", id)
-	descKey := sqlbase.MakeDescMetadataKey(id)
-	desc := &sqlbase.Descriptor{}
-	if err := txn.GetProto(ctx, descKey, desc); err != nil {
-		return err
-	}
-
-	switch t := descriptor.(type) {
-	case *sqlbase.TableDescriptor:
-		table := desc.GetTable()
-		if table == nil {
-			return errors.Errorf("%q is not a table", desc.String())
-		}
-		table.MaybeFillInDescriptor()
-
-		if err := table.Validate(ctx, txn, nil /* clusterVersion */); err != nil {
+		// Queue a schema change job to eventually make the table public.
+		if err := p.createOrUpdateSchemaChangeJob(
+			ctx,
+			mutDesc.(*tabledesc.Mutable),
+			jobDesc,
+			descpb.InvalidMutationID); err != nil {
 			return err
 		}
-		*t = *table
-	case *sqlbase.DatabaseDescriptor:
-		database := desc.GetDatabase()
-		if database == nil {
-			return errors.Errorf("%q is not a database", desc.String())
-		}
-
-		if err := database.Validate(); err != nil {
-			return err
-		}
-		*t = *database
 	}
 	return nil
-}
-
-// GetAllDescriptors looks up and returns all available descriptors.
-func GetAllDescriptors(ctx context.Context, txn *client.Txn) ([]sqlbase.DescriptorProto, error) {
-	log.Eventf(ctx, "fetching all descriptors")
-	descsKey := sqlbase.MakeAllDescsMetadataKey()
-	kvs, err := txn.Scan(ctx, descsKey, descsKey.PrefixEnd(), 0)
-	if err != nil {
-		return nil, err
-	}
-
-	descs := make([]sqlbase.DescriptorProto, len(kvs))
-	for i, kv := range kvs {
-		desc := &sqlbase.Descriptor{}
-		if err := kv.ValueProto(desc); err != nil {
-			return nil, err
-		}
-		switch t := desc.Union.(type) {
-		case *sqlbase.Descriptor_Table:
-			descs[i] = desc.GetTable()
-		case *sqlbase.Descriptor_Database:
-			descs[i] = desc.GetDatabase()
-		default:
-			return nil, errors.Errorf("Descriptor.Union has unexpected type %T", t)
-		}
-	}
-	return descs, nil
 }

@@ -40,7 +40,8 @@ send "begin;\r"
 eexpect BEGIN
 
 send "select 3+;\r"
-eexpect "pq: syntax error"
+eexpect "ERROR: at or near"
+eexpect "syntax error"
 eexpect root@
 
 send "select 1;\r"
@@ -84,7 +85,6 @@ send "\\set display_format csv\r\\set\r"
 eexpect "check_syntax,false"
 eexpect "echo,true"
 eexpect "prompt1,%n@%M>"
-eexpect "smart_prompt,false"
 eexpect "root@"
 send "\\q\r"
 eexpect ":/# "

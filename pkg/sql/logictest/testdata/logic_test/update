@@ -1,21 +1,19 @@
-# LogicTest: local local-opt local-parallel-stmts fakedist fakedist-opt
-
 statement ok
 CREATE TABLE kv (
   k INT PRIMARY KEY,
   v INT
 )
 
-statement error value type tuple{int, int} doesn't match type INT8 of column "v"
+statement error value type tuple{int, int} doesn't match type int of column "v"
 UPDATE kv SET v = (SELECT (10, 11))
 
-statement error value type decimal doesn't match type INT8 of column "v"
+statement error value type decimal doesn't match type int of column "v"
 UPDATE kv SET v = 3.2
 
-statement error value type decimal doesn't match type INT8 of column "v"
+statement error value type decimal doesn't match type int of column "v"
 UPDATE kv SET (k, v) = (3, 3.2)
 
-statement error value type decimal doesn't match type INT8 of column "v"
+statement error value type decimal doesn't match type int of column "v"
 UPDATE kv SET (k, v) = (SELECT 3, 3.2)
 
 statement count 4
@@ -46,13 +44,13 @@ SELECT * FROM kv
 statement error pgcode 42703 column "m" does not exist
 UPDATE kv SET m = 9 WHERE k IN (1, 3)
 
-statement error unimplemented at or near "k"
+statement error at or near "k": syntax error: unimplemented
 UPDATE kv SET kv.k = 9
 
-statement error unimplemented at or near "*"
+statement error at or near "\*": syntax error: unimplemented
 UPDATE kv SET k.* = 9
 
-statement error unimplemented at or near "v"
+statement error at or near "v": syntax error: unimplemented
 UPDATE kv SET k.v = 9
 
 statement ok
@@ -113,6 +111,40 @@ f   g
 
 statement count 1
 UPDATE kv2 SET v = 'b' WHERE k IN ('a')
+
+query TT rowsort
+SELECT * FROM kv2
+----
+a   b
+c   d
+e   f
+f   g
+
+# Confirm ONLY and * are no-ops
+statement count 1
+UPDATE ONLY kv2 SET v = 'h' WHERE k IN ('a')
+
+query TT rowsort
+SELECT * FROM kv2
+----
+a   h
+c   d
+e   f
+f   g
+
+statement count 1
+UPDATE kv2 * SET v = 'b' WHERE k IN ('a')
+
+query TT rowsort
+SELECT * FROM kv2
+----
+a   b
+c   d
+e   f
+f   g
+
+statement count 1
+UPDATE ONLY kv2 * SET v = 'b' WHERE k IN ('a')
 
 query TT rowsort
 SELECT * FROM kv2
@@ -265,14 +297,13 @@ statement count 1
 INSERT INTO xyz VALUES (111, 222, 333)
 
 
-# TODO(jordan): re-enable post #28716
-# statement count 1
-# UPDATE xyz SET (z, y) = (SELECT 666, 777), x = (SELECT 2)
-# 
-# query III
-# SELECT * from xyz
-# ----
-# 2 777 666
+statement count 1
+UPDATE xyz SET (z, y) = (SELECT 666, 777), x = (SELECT 2)
+
+query III
+SELECT * from xyz
+----
+2 777 666
 
 statement ok
 CREATE TABLE lots (
@@ -418,7 +449,7 @@ CREATE TABLE src(x VARCHAR PRIMARY KEY);
   INSERT INTO derived(x, y) VALUES ('abc', 'abc')
 
 # Sanity check that the FK constraints gets actually validated
-statement error foreign key violation
+statement error foreign key
 UPDATE derived SET x = 'xxx'
 
 statement error value too long for type CHAR\(3\)
@@ -439,7 +470,7 @@ BEGIN; ALTER TABLE t29494 ADD COLUMN y INT NOT NULL DEFAULT 123
 query T
 SELECT create_statement FROM [SHOW CREATE t29494]
 ----
-CREATE TABLE t29494 (
+CREATE TABLE public.t29494 (
    x INT8 NOT NULL,
    CONSTRAINT "primary" PRIMARY KEY (x ASC),
    FAMILY "primary" (x)
@@ -460,8 +491,7 @@ UPDATE t29494 SET x = 124 WHERE x = 12 RETURNING *
 ----
 124
 
-# The HP and CBO show different errors for this case.
-statement error [column "y" does not exist | column "y" is being backfilled]
+statement error column "y" does not exist
 UPDATE t29494 SET y = 123
 
 # Check the new column is not usable in assignments. We need to
@@ -507,7 +537,65 @@ statement error aggregate functions are not allowed in UPDATE SET
 UPDATE t32477 SET x = count(x)
 
 statement error window functions are not allowed in UPDATE SET
-UPDATE t32477 SET x = rank(x) OVER ()
+UPDATE t32477 SET x = rank() OVER ()
 
 statement error generator functions are not allowed in UPDATE SET
 UPDATE t32477 SET x = generate_series(1,2)
+
+#regression test for #32054
+subtest empty_update_subquery
+
+statement ok
+CREATE TABLE t32054(x,y) AS SELECT 1,2
+
+statement ok
+CREATE TABLE t32054_empty(x INT, y INT)
+
+statement ok
+UPDATE t32054 SET (x,y) = (SELECT x,y FROM t32054_empty)
+
+query II
+SELECT * FROM t32054
+----
+NULL  NULL
+
+# ------------------------------------------------------------------------------
+# Regression for #35364.
+# ------------------------------------------------------------------------------
+subtest regression_35364
+
+statement ok
+CREATE TABLE t35364(x DECIMAL(1,0) CHECK (x >= 1))
+
+statement ok
+INSERT INTO t35364 VALUES (2)
+
+statement ok
+UPDATE t35364 SET x=0.5
+
+query T
+SELECT x FROM t35364
+----
+1
+
+# ------------------------------------------------------------------------------
+# Regression for #35970.
+# ------------------------------------------------------------------------------
+statement ok
+CREATE TABLE table35970 (
+    a INT PRIMARY KEY,
+    b INT,
+    c INT8[],
+    FAMILY fam0 (a, b),
+    FAMILY fam1 (c)
+)
+
+statement ok
+INSERT INTO table35970 VALUES (1, 1, NULL);
+
+query I
+UPDATE table35970
+SET c = c
+RETURNING b
+----
+1

@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package ledger
 
@@ -33,13 +28,6 @@ type querier interface {
 	Exec(query string, args ...interface{}) (gosql.Result, error)
 	Query(query string, args ...interface{}) (*gosql.Rows, error)
 	QueryRow(query string, args ...interface{}) *gosql.Row
-}
-
-func maybeParallelize(config *ledger, stmt string) string {
-	if config.parallelStmts {
-		return stmt + " RETURNING NOTHING"
-	}
-	return stmt
 }
 
 var sqlParamRE = regexp.MustCompile(`\$(\d+)`)
@@ -142,14 +130,14 @@ func getBalance(q querier, config *ledger, id int, historical bool) (customer, e
 }
 
 func updateBalance(q querier, config *ledger, c customer) error {
-	stmt, args := maybeInlineStmtArgs(config, maybeParallelize(config, `
+	stmt, args := maybeInlineStmtArgs(config, `
 		UPDATE customer SET
 			balance         = $1,
 			credit_limit    = $2,
 			is_active       = $3,
 			name            = $4,
 			sequence_number = $5
-		WHERE id = $6`),
+		WHERE id = $6`,
 		c.balance, c.creditLimit, c.isActive, c.name, c.sequence, c.id,
 	)
 	_, err := q.Exec(stmt, args...)
@@ -159,11 +147,11 @@ func updateBalance(q querier, config *ledger, c customer) error {
 func insertTransaction(q querier, config *ledger, rng *rand.Rand, username string) (string, error) {
 	tID := randPaymentID(rng)
 
-	stmt, args := maybeInlineStmtArgs(config, maybeParallelize(config, `
+	stmt, args := maybeInlineStmtArgs(config, `
 		INSERT INTO transaction (
 			tcomment, context, response, reversed_by, created_ts, 
 			transaction_type_reference, username, external_id
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`),
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
 		nil, randContext(rng), randResponse(rng), nil,
 		timeutil.Now(), txnTypeReference, username, tID,
 	)
@@ -176,12 +164,12 @@ func insertEntries(q querier, config *ledger, rng *rand.Rand, cIDs [2]int, tID s
 	sysAmount := 88.433571
 	ts := timeutil.Now()
 
-	stmt, args := maybeInlineStmtArgs(config, maybeParallelize(config, `
+	stmt, args := maybeInlineStmtArgs(config, `
 		INSERT INTO entry (
 			amount, system_amount, created_ts, transaction_id, customer_id, money_type
 		) VALUES
 			($1 , $2 , $3 , $4 , $5 , $6 ),
-			($7 , $8 , $9 , $10, $11, $12)`),
+			($7 , $8 , $9 , $10, $11, $12)`,
 		amount1, sysAmount, ts, tID, cIDs[0], cashMoneyType,
 		-amount1, -sysAmount, ts, tID, cIDs[1], cashMoneyType,
 	)
@@ -214,10 +202,10 @@ func getSession(q querier, config *ledger, rng *rand.Rand) error {
 }
 
 func insertSession(q querier, config *ledger, rng *rand.Rand) error {
-	stmt, args := maybeInlineStmtArgs(config, maybeParallelize(config, `
+	stmt, args := maybeInlineStmtArgs(config, `
 		INSERT INTO session (
 			data, expiry_timestamp, last_update, session_id
-		) VALUES ($1, $2, $3, $4)`),
+		) VALUES ($1, $2, $3, $4)`,
 		randSessionData(rng), randTimestamp(rng), timeutil.Now(), randSessionID(rng),
 	)
 	_, err := q.Exec(stmt, args...)

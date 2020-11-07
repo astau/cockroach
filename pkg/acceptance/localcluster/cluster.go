@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package localcluster
 
@@ -35,7 +31,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security"
@@ -50,10 +46,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/proto"
 	// Import postgres driver.
 	_ "github.com/lib/pq"
-	"github.com/pkg/errors"
 )
 
 func repoRoot() string {
@@ -272,11 +268,17 @@ func (c *Cluster) RPCPort(nodeIdx int) string {
 
 func (c *Cluster) makeNode(ctx context.Context, nodeIdx int, cfg NodeConfig) (*Node, <-chan error) {
 	baseCtx := &base.Config{
-		User:     security.NodeUser,
+		User:     security.NodeUserName(),
 		Insecure: true,
 	}
-	rpcCtx := rpc.NewContext(log.AmbientContext{Tracer: tracing.NewTracer()}, baseCtx,
-		hlc.NewClock(hlc.UnixNano, 0), c.stopper, &cluster.MakeTestingClusterSettings().Version)
+	rpcCtx := rpc.NewContext(rpc.ContextOptions{
+		TenantID:   roachpb.SystemTenantID,
+		AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
+		Config:     baseCtx,
+		Clock:      hlc.NewClock(hlc.UnixNano, 0),
+		Stopper:    c.stopper,
+		Settings:   cluster.MakeTestingClusterSettings(),
+	})
 
 	n := &Node{
 		Cfg:    cfg,
@@ -306,7 +308,7 @@ func (c *Cluster) makeNode(ctx context.Context, nodeIdx int, cfg NodeConfig) (*N
 	n.Cfg.ExtraArgs = append(args, cfg.ExtraArgs...)
 
 	if err := os.MkdirAll(n.logDir(), 0755); err != nil {
-		log.Fatal(context.Background(), err)
+		log.Fatalf(context.Background(), "%v", err)
 	}
 
 	joins := c.joins()
@@ -346,7 +348,7 @@ func (c *Cluster) isReplicated() (bool, string) {
 		if testutils.IsError(err, "(table|relation) \"crdb_internal.ranges\" does not exist") {
 			return true, ""
 		}
-		log.Fatal(context.Background(), err)
+		log.Fatalf(context.Background(), "%v", err)
 	}
 	defer rows.Close()
 
@@ -374,17 +376,17 @@ func (c *Cluster) isReplicated() (bool, string) {
 
 // UpdateZoneConfig updates the default zone config for the cluster.
 func (c *Cluster) UpdateZoneConfig(rangeMinBytes, rangeMaxBytes int64) {
-	zone := config.DefaultZoneConfig()
+	zone := zonepb.DefaultZoneConfig()
 	zone.RangeMinBytes = proto.Int64(rangeMinBytes)
 	zone.RangeMaxBytes = proto.Int64(rangeMaxBytes)
 
 	buf, err := protoutil.Marshal(&zone)
 	if err != nil {
-		log.Fatal(context.Background(), err)
+		log.Fatalf(context.Background(), "%v", err)
 	}
 	_, err = c.Nodes[0].DB().Exec(`UPSERT INTO system.zones (id, config) VALUES (0, $1)`, buf)
 	if err != nil {
-		log.Fatal(context.Background(), err)
+		log.Fatalf(context.Background(), "%v", err)
 	}
 }
 
@@ -510,7 +512,7 @@ func (n *Node) listeningURLFile() string {
 // Start starts a node.
 func (n *Node) Start(ctx context.Context, joins ...string) {
 	if err := <-n.StartAsync(ctx, joins...); err != nil {
-		log.Fatal(ctx, err)
+		log.Fatalf(ctx, "%v", err)
 	}
 }
 
@@ -568,10 +570,10 @@ func (n *Node) startAsyncInnerLocked(ctx context.Context, joins ...string) error
 
 	if err := n.cmd.Start(); err != nil {
 		if err := stdout.Close(); err != nil {
-			log.Warning(ctx, err)
+			log.Warningf(ctx, "%v", err)
 		}
 		if err := stderr.Close(); err != nil {
-			log.Warning(ctx, err)
+			log.Warningf(ctx, "%v", err)
 		}
 		return errors.Wrapf(err, "running %s %v", n.cmd.Path, n.cmd.Args)
 	}
@@ -581,18 +583,19 @@ func (n *Node) startAsyncInnerLocked(ctx context.Context, joins ...string) error
 	go func(cmd *exec.Cmd) {
 		waitErr := cmd.Wait()
 		if waitErr != nil {
-			log.Warning(ctx, waitErr)
+			log.Warningf(ctx, "%v", waitErr)
 		}
 		if err := stdout.Close(); err != nil {
-			log.Warning(ctx, err)
+			log.Warningf(ctx, "%v", err)
 		}
 		if err := stderr.Close(); err != nil {
-			log.Warning(ctx, err)
+			log.Warningf(ctx, "%v", err)
 		}
 
 		log.Infof(ctx, "process %d: %s", cmd.Process.Pid, cmd.ProcessState)
 
-		execErr, _ := waitErr.(*exec.ExitError)
+		var execErr *exec.ExitError
+		_ = errors.As(waitErr, &execErr)
 		n.Lock()
 		n.setNotRunningLocked(execErr)
 		n.Unlock()
@@ -643,7 +646,7 @@ func portFromURL(rawURL string) (string, *url.URL, error) {
 func makeDB(url string, numWorkers int, dbName string) *gosql.DB {
 	conn, err := gosql.Open("postgres", url)
 	if err != nil {
-		log.Fatal(context.Background(), err)
+		log.Fatalf(context.Background(), "%v", err)
 	}
 	if numWorkers == 0 {
 		numWorkers = 1
@@ -710,14 +713,14 @@ func (n *Node) waitUntilLive(dur time.Duration) error {
 
 		urlBytes, err := ioutil.ReadFile(n.listeningURLFile())
 		if err != nil {
-			log.Info(ctx, err)
+			log.Infof(ctx, "%v", err)
 			continue
 		}
 
 		var pgURL *url.URL
 		_, pgURL, err = portFromURL(string(urlBytes))
 		if err != nil {
-			log.Info(ctx, err)
+			log.Infof(ctx, "%v", err)
 			continue
 		}
 
@@ -753,13 +756,13 @@ func (n *Node) waitUntilLive(dur time.Duration) error {
 			if err := n.db.QueryRow(
 				`SELECT value FROM crdb_internal.node_runtime_info WHERE component='UI' AND field = 'URL'`,
 			).Scan(&uiStr); err != nil {
-				log.Info(ctx, err)
+				log.Infof(ctx, "%v", err)
 				return nil
 			}
 
 			_, uiURL, err = portFromURL(uiStr)
 			if err != nil {
-				log.Info(ctx, err)
+				log.Infof(ctx, "%v", err)
 				// TODO(tschottdorf): see above.
 			}
 		}
@@ -802,7 +805,7 @@ func (n *Node) Signal(s os.Signal) {
 		return
 	}
 	if err := n.cmd.Process.Signal(s); err != nil {
-		log.Warning(context.Background(), err)
+		log.Warningf(context.Background(), "%v", err)
 	}
 }
 

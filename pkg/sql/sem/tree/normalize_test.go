@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tree_test
 
@@ -22,18 +18,51 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	_ "github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
+func TestContainsVars(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	testData := []struct {
+		expr     string
+		expected bool
+	}{
+		{`123`, false},
+		{`123+123`, false},
+		{`$1`, true},
+		{`123+$1`, true},
+		{`@1`, true},
+		{`123+@1`, true},
+	}
+
+	for _, d := range testData {
+		t.Run(d.expr, func(t *testing.T) {
+			expr, err := parser.ParseExpr(d.expr)
+			if err != nil {
+				t.Fatalf("%s: %v", d.expr, err)
+			}
+			res := tree.ContainsVars(expr)
+			if res != d.expected {
+				t.Fatalf("%s: expected %v, got %v", d.expr, d.expected, res)
+			}
+		})
+	}
+}
+
 func TestNormalizeExpr(t *testing.T) {
-	defer tree.MockNameTypes(map[string]types.T{
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	defer tree.MockNameTypes(map[string]*types.T{
 		"a":  types.Int,
 		"b":  types.Int,
 		"c":  types.Int,
 		"d":  types.Bool,
 		"s":  types.String,
-		"j":  types.JSON,
-		"jv": types.JSON,
+		"j":  types.Jsonb,
+		"jv": types.Jsonb,
 	})()
 	testData := []struct {
 		expr     string
@@ -41,12 +70,12 @@ func TestNormalizeExpr(t *testing.T) {
 	}{
 		{`(a)`, `a`},
 		{`((((a))))`, `a`},
-		// This loss of type information occurs because we wind up trying
-		// to reconstitute a data from from a datum. Ideally, this would
-		// be addressed by future work on
+		// These expression previously always mapped INT2/INT4 to INT8, but after
+		// unifying the type system, they now produce better results. Leaving the
+		// tests here to make sure they don't regress. See
 		// https://github.com/cockroachdb/cockroach/issues/32639
-		{`CAST(NULL AS INT2)`, `CAST(NULL AS INT8)`},
-		{`CAST(NULL AS INT4)`, `CAST(NULL AS INT8)`},
+		{`CAST(NULL AS INT2)`, `CAST(NULL AS INT2)`},
+		{`CAST(NULL AS INT4)`, `CAST(NULL AS INT4)`},
 		{`CAST(NULL AS INT8)`, `CAST(NULL AS INT8)`},
 		{`+a`, `a`},
 		{`-(-a)`, `a`},
@@ -68,6 +97,7 @@ func TestNormalizeExpr(t *testing.T) {
 		{`12 BETWEEN 24 AND 36`, `false`},
 		{`12 BETWEEN 10 AND 20`, `true`},
 		{`10 BETWEEN a AND 20`, `a <= 10`},
+		{`(1 + 2) BETWEEN b AND c`, `(b <= 3) AND (c >= 3)`},
 		{`a BETWEEN b AND c`, `(a >= b) AND (a <= c)`},
 		{`a BETWEEN SYMMETRIC b AND c`, `((a >= b) AND (a <= c)) OR ((a >= c) AND (a <= b))`},
 		{`a NOT BETWEEN b AND c`, `(a < b) OR (a > c)`},
@@ -157,6 +187,7 @@ func TestNormalizeExpr(t *testing.T) {
 		{`clock_timestamp()`, `clock_timestamp()`},
 		{`now()`, `now()`},
 		{`current_timestamp()`, `current_timestamp()`},
+		{`current_timestamp(5)`, `current_timestamp(5)`},
 		{`transaction_timestamp()`, `transaction_timestamp()`},
 		{`statement_timestamp()`, `statement_timestamp()`},
 		{`cluster_logical_timestamp()`, `cluster_logical_timestamp()`},
@@ -203,8 +234,8 @@ func TestNormalizeExpr(t *testing.T) {
 		{`NULL IS DISTINCT FROM NULL`, `false`},
 		{`1 IS NOT DISTINCT FROM NULL`, `false`},
 		{`1 IS DISTINCT FROM NULL`, `true`},
-		{`d IS NOT DISTINCT FROM NULL`, `d IS NULL`},
-		{`d IS DISTINCT FROM NULL`, `d IS NOT NULL`},
+		{`d IS NOT DISTINCT FROM NULL`, `d IS NOT DISTINCT FROM NULL`},
+		{`d IS DISTINCT FROM NULL`, `d IS DISTINCT FROM NULL`},
 		{`NULL IS NOT DISTINCT FROM TRUE`, `false`},
 		{`NULL IS DISTINCT FROM TRUE`, `true`},
 		{`false IS NOT DISTINCT FROM TRUE`, `false`},
@@ -215,8 +246,8 @@ func TestNormalizeExpr(t *testing.T) {
 		{`false IS DISTINCT FROM FALSE`, `false`},
 		{`NULL IS NOT DISTINCT FROM 1`, `false`},
 		{`NULL IS DISTINCT FROM 1`, `true`},
-		{`NULL IS NOT DISTINCT FROM d`, `d IS NULL`},
-		{`NULL IS DISTINCT FROM d`, `d IS NOT NULL`},
+		{`NULL IS NOT DISTINCT FROM d`, `d IS NOT DISTINCT FROM NULL`},
+		{`NULL IS DISTINCT FROM d`, `d IS DISTINCT FROM NULL`},
 		// #15454: ensure that operators are pretty-printed correctly after normalization.
 		{`(random() + 1.0)::INT8`, `(random() + 1.0)::INT8`},
 		{`('a' || left('b', random()::INT8)) COLLATE en`, `('a' || left('b', random()::INT8)) COLLATE en`},
@@ -248,21 +279,21 @@ func TestNormalizeExpr(t *testing.T) {
 		{`(ROW (a) AS a)`, `((a,) AS a)`}, // Tuple
 	}
 
-	semaCtx := tree.MakeSemaContext(true /* privileged */)
+	ctx := context.Background()
+	semaCtx := tree.MakeSemaContext()
 	for _, d := range testData {
 		t.Run(d.expr, func(t *testing.T) {
 			expr, err := parser.ParseExpr(d.expr)
 			if err != nil {
 				t.Fatalf("%s: %v", d.expr, err)
 			}
-			typedExpr, err := expr.TypeCheck(&semaCtx, types.Any)
+			typedExpr, err := expr.TypeCheck(ctx, &semaCtx, types.Any)
 			if err != nil {
 				t.Fatalf("%s: %v", d.expr, err)
 			}
 			rOrig := typedExpr.String()
 			ctx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 			defer ctx.Mon.Stop(context.Background())
-			defer ctx.ActiveMemAcc.Close(context.Background())
 			r, err := ctx.NormalizeExpr(typedExpr)
 			if err != nil {
 				t.Fatalf("%s: %v", d.expr, err)

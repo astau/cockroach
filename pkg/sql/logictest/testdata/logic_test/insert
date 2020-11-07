@@ -1,5 +1,3 @@
-# LogicTest: local local-opt local-parallel-stmts fakedist fakedist-opt
-
 statement error pgcode 42P01 relation "kv" does not exist
 INSERT INTO kv VALUES ('a', 'b')
 
@@ -131,13 +129,13 @@ INSERT INTO kv4 (int, bool) VALUES (3, 'a')
 statement ok
 INSERT INTO kv4 (int, bool) VALUES (3, true)
 
-statement error value type int doesn't match type CHAR of column "char"
+statement error value type int doesn't match type char of column "char"
 INSERT INTO kv4 (int, char) VALUES (4, 1)
 
 statement ok
 INSERT INTO kv4 (int, char) VALUES (4, 'a')
 
-statement error value type int doesn't match type FLOAT8 of column "float"
+statement error value type int doesn't match type float of column "float"
 INSERT INTO kv4 (int, float) VALUES (5, 1::INT)
 
 statement ok
@@ -363,13 +361,13 @@ CREATE TABLE nocols()
 statement error INSERT has more expressions than target columns, 2 expressions for 0 targets
 INSERT INTO nocols VALUES (true, default)
 
-statement error unimplemented at or near "k"
+statement error at or near "k": syntax error: unimplemented
 INSERT INTO kv (kv.k) VALUES ('hello')
 
-statement error unimplemented at or near "*"
+statement error at or near "\*": syntax error: unimplemented
 INSERT INTO kv (k.*) VALUES ('hello')
 
-statement error unimplemented at or near "v"
+statement error at or near "v": syntax error: unimplemented
 INSERT INTO kv (k.v) VALUES ('hello')
 
 
@@ -445,10 +443,10 @@ CREATE TABLE string_t (
 statement ok
 INSERT INTO string_t VALUES ('str')
 
-query error value type string doesn't match type BYTES of column "b"
+query error value type string doesn't match type bytes of column "b"
 INSERT INTO bytes_t SELECT * FROM string_t
 
-query error value type bytes doesn't match type STRING of column "s"
+query error value type bytes doesn't match type string of column "s"
 INSERT INTO string_t SELECT * FROM bytes_t
 
 subtest string_width_check
@@ -467,13 +465,14 @@ CREATE TABLE sw (
  cc VARCHAR COLLATE en,
  dc VARCHAR(3) COLLATE en,
  ec STRING COLLATE en,
- fc STRING(3) COLLATE en
+ fc STRING(3) COLLATE en,
+ FAMILY "primary" (a, b, c, d, e, f, g, ac, bc, cc, dc, ec, fc, rowid)
 )
 
 query T
 SELECT create_statement FROM [SHOW CREATE TABLE sw]
 ----
-CREATE TABLE sw (
+CREATE TABLE public.sw (
    a CHAR NULL,
    b CHAR(3) NULL,
    c VARCHAR NULL,
@@ -534,7 +533,7 @@ subtest regression_26742
 statement ok
 CREATE TABLE ct(x INT, derived INT AS (x+1) STORED)
 
-statement error value type string doesn't match type INT8 of column "x"
+statement error value type varchar doesn't match type int of column "x"
 INSERT INTO ct(x) SELECT c FROM sw
 
 subtest contraint_check_validation_ordering
@@ -575,7 +574,7 @@ CREATE TABLE src(x VARCHAR PRIMARY KEY);
                        y VARCHAR CHECK(length(y) < 4) REFERENCES src(x))
 
 # Sanity check that the FK constraints gets actually validated
-statement error foreign key violation
+statement error foreign key
 INSERT INTO derived(x) VALUES('xxx')
 
 statement error value too long for type CHAR\(3\)
@@ -596,7 +595,7 @@ BEGIN; ALTER TABLE t29494 ADD COLUMN y INT NOT NULL DEFAULT 123
 query T
 SELECT create_statement FROM [SHOW CREATE t29494]
 ----
-CREATE TABLE t29494 (
+CREATE TABLE public.t29494 (
    x INT8 NULL,
    FAMILY "primary" (x, rowid)
 )
@@ -622,7 +621,10 @@ COMMIT
 subtest regression_32759_33012
 
 statement ok
-CREATE TABLE t32759(x INT, y STRING NOT NULL DEFAULT 'b', z INT)
+CREATE TABLE t32759 (
+  x INT, y STRING DEFAULT 'b' NOT NULL, z INT,
+  FAMILY "primary" (x, z, rowid)
+)
 
 statement ok
 BEGIN; ALTER TABLE t32759 DROP COLUMN y
@@ -631,15 +633,14 @@ BEGIN; ALTER TABLE t32759 DROP COLUMN y
 query T
 SELECT create_statement FROM [SHOW CREATE t32759]
 ----
-CREATE TABLE t32759 (
+CREATE TABLE public.t32759 (
    x INT8 NULL,
    z INT8 NULL,
    FAMILY "primary" (x, z, rowid)
 )
 
 # Check that values cannot be inserted into the dropped column.
-# HP and CBO return different errors, so accept both.
-statement error [column "y" does not exist | column "y" is being backfilled]
+statement error column "y" does not exist
 INSERT INTO t32759(x, y, z) VALUES (2, 'c', 2)
 
 statement ok
@@ -672,3 +673,36 @@ INSERT INTO xy (x, y) SELECT a, b FROM ab ORDER BY -b LIMIT 10 RETURNING *;
 
 statement ok
 DROP TABLE xy; DROP TABLE ab
+
+subtest regression_35611
+
+statement ok
+CREATE TABLE t35611(a INT PRIMARY KEY, CHECK (a > 0))
+
+statement ok
+BEGIN; ALTER TABLE t35611 ADD COLUMN b INT
+
+statement ok
+INSERT INTO t35611 (a) VALUES (1)
+
+statement ok
+COMMIT
+
+# ------------------------------------------------------------------------------
+# Regression for #35364.
+# ------------------------------------------------------------------------------
+subtest regression_35364
+
+statement ok
+CREATE TABLE t35364(x DECIMAL(1,0) CHECK (x = 0))
+
+statement ok
+INSERT INTO t35364(x) VALUES (0.1)
+
+query T
+SELECT x FROM t35364
+----
+0
+
+statement ok
+DROP TABLE t35364

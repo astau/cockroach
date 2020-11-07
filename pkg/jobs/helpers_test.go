@@ -1,66 +1,97 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package jobs
 
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/errors"
 )
-
-func ResetResumeHooks() func() {
-	oldResumeHooks := resumeHooks
-	return func() { resumeHooks = oldResumeHooks }
-}
 
 // FakeResumer calls optional callbacks during the job lifecycle.
 type FakeResumer struct {
-	OnResume func(job *Job) error
-	Fail     func(job *Job) error
-	Success  func(job *Job) error
-	Terminal func(job *Job)
-}
-
-func (d FakeResumer) Resume(
-	_ context.Context, job *Job, _ interface{}, _ chan<- tree.Datums,
-) error {
-	if d.OnResume != nil {
-		return d.OnResume(job)
-	}
-	return nil
-}
-
-func (d FakeResumer) OnFailOrCancel(_ context.Context, _ *client.Txn, job *Job) error {
-	if d.Fail != nil {
-		return d.Fail(job)
-	}
-	return nil
-}
-
-func (d FakeResumer) OnSuccess(_ context.Context, _ *client.Txn, job *Job) error {
-	if d.Success != nil {
-		return d.Success(job)
-	}
-	return nil
-}
-
-func (d FakeResumer) OnTerminal(_ context.Context, job *Job, _ Status, _ chan<- tree.Datums) {
-	if d.Terminal != nil {
-		d.Terminal(job)
-	}
+	OnResume     func(context.Context, chan<- tree.Datums) error
+	FailOrCancel func(context.Context) error
+	Success      func() error
+	PauseRequest onPauseRequestFunc
 }
 
 var _ Resumer = FakeResumer{}
+
+func (d FakeResumer) Resume(
+	ctx context.Context, _ interface{}, resultsCh chan<- tree.Datums,
+) error {
+	if d.OnResume != nil {
+		if err := d.OnResume(ctx, resultsCh); err != nil {
+			return err
+		}
+	}
+	if d.Success != nil {
+		return d.Success()
+	}
+	return nil
+}
+
+func (d FakeResumer) OnFailOrCancel(ctx context.Context, _ interface{}) error {
+	if d.FailOrCancel != nil {
+		return d.FailOrCancel(ctx)
+	}
+	return nil
+}
+
+// OnPauseRequestFunc forwards the definition for use in tests.
+type OnPauseRequestFunc = onPauseRequestFunc
+
+var _ PauseRequester = FakeResumer{}
+
+func (d FakeResumer) OnPauseRequest(
+	ctx context.Context, execCtx interface{}, txn *kv.Txn, details *jobspb.Progress,
+) error {
+	if d.PauseRequest == nil {
+		return nil
+	}
+	return d.PauseRequest(ctx, execCtx, txn, details)
+}
+
+// Started is a wrapper around the internal function that moves a job to the
+// started state.
+func (j *Job) Started(ctx context.Context) error {
+	return j.started(ctx)
+}
+
+// Created is a test only function that inserts a new jobs table row.
+func (j *Job) Created(ctx context.Context) error {
+	if j.ID() != nil {
+		return errors.Errorf("job already created with ID %v", *j.ID())
+	}
+	return j.deprecatedInsert(ctx, j.registry.makeJobID(), nil /* lease */, nil /* session */)
+}
+
+// Paused is a wrapper around the internal function that moves a job to the
+// paused state.
+func (j *Job) Paused(ctx context.Context) error {
+	return j.paused(ctx, nil /* fn */)
+}
+
+// Failed is a wrapper around the internal function that moves a job to the
+// failed state.
+func (j *Job) Failed(ctx context.Context, causingErr error) error {
+	return j.failed(ctx, causingErr, nil /* fn */)
+}
+
+// Succeeded is a wrapper around the internal function that moves a job to the
+// succeeded state.
+func (j *Job) Succeeded(ctx context.Context) error {
+	return j.succeeded(ctx, nil /* fn */)
+}

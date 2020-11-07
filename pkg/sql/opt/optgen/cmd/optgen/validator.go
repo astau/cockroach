@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -42,22 +38,43 @@ func (v *validator) validate(compiled *lang.CompiledExpr) []error {
 		// 2. Ensure that fields are defined in the following order:
 		//      Expr*
 		//      Private?
+		//      unexported*
 		// That is, there can be zero or more expression-typed fields, followed
-		// by zero or one private field.
-		for i, field := range define.Fields {
+		// by zero or one private field, followed by zero or more unexported fields.
+		// The unexported fields are initialized separately
+		var exprsDone, privateDone bool
+		for _, field := range define.Fields {
 			typ := md.typeOf(field)
 			if typ == nil {
-				format := "%s is not registered as a valid type in metadata.go"
+				format := "%s is not registered as a valid type in optgen/metadata.go"
 				v.addErrorf(field.Source(), format, field.Type)
 				continue
 			}
 
+			if typ.isExpr && exprsDone {
+				format := "expression field '%s' cannot follow private or unexported fields in '%s'"
+				v.addErrorf(field.Source(), format, field.Name, define.Name)
+				break
+			}
+
 			if !typ.isExpr {
-				if i != len(define.Fields)-1 {
-					format := "private field '%s' is not the last field in '%s'"
-					v.addErrorf(field.Source(), format, field.Name, define.Name)
-					break
+				exprsDone = true
+
+				if isExportedField(field) || isEmbeddedField(field) {
+					// Tolerate a Typ field for Scalars (even if there was a Private
+					// field).
+					if !(define.Tags.Contains("Scalar") && field.Name == "Typ" && field.Type == "Type") {
+						// Private definition.
+						if privateDone {
+							format := "private field '%s' cannot follow private or unexported field in '%s'"
+							v.addErrorf(field.Source(), format, field.Name, define.Name)
+							break
+						}
+					}
 				}
+				// This is either a private definition, a Typ field, or an unexported
+				// field. In either case, we can no longer accept a private definition.
+				privateDone = true
 			}
 		}
 	}

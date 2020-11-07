@@ -1,25 +1,19 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package memo
 
 import (
-	"fmt"
-
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/errors"
 )
 
 // This file contains various helper functions that extract useful information
@@ -84,57 +78,81 @@ func ExtractConstDatum(e opt.Expr) tree.Datum {
 		for i := range datums {
 			datums[i] = ExtractConstDatum(t.Elems[i])
 		}
-		typ := t.Typ.(types.TTuple)
-		return tree.NewDTuple(typ, datums...)
+		return tree.NewDTuple(t.Typ, datums...)
 
 	case *ArrayExpr:
-		elementType := t.Typ.(types.TArray).Typ
+		elementType := t.Typ.ArrayContents()
 		a := tree.NewDArray(elementType)
 		a.Array = make(tree.Datums, len(t.Elems))
 		for i := range a.Array {
 			a.Array[i] = ExtractConstDatum(t.Elems[i])
 			if a.Array[i] == tree.DNull {
 				a.HasNulls = true
+			} else {
+				a.HasNonNulls = true
 			}
 		}
 		return a
 	}
-	panic(fmt.Sprintf("non-const expression: %+v", e))
+	panic(errors.AssertionFailedf("non-const expression: %+v", e))
 }
 
-// ExtractAggSingleInputColumn returns the input ColumnID of an aggregate
-// operator that has a single input.
-func ExtractAggSingleInputColumn(e opt.ScalarExpr) opt.ColumnID {
-	if !opt.IsAggregateOp(e) {
-		panic("not an Aggregate")
+// ExtractAggFunc digs down into the given aggregate expression and returns the
+// aggregate function, skipping past any AggFilter or AggDistinct operators.
+func ExtractAggFunc(e opt.ScalarExpr) opt.ScalarExpr {
+	if filter, ok := e.(*AggFilterExpr); ok {
+		e = filter.Input
 	}
-	return ExtractVarFromAggInput(e.Child(0).(opt.ScalarExpr)).Col
+
+	if distinct, ok := e.(*AggDistinctExpr); ok {
+		e = distinct.Input
+	}
+
+	if !opt.IsAggregateOp(e) {
+		panic(errors.AssertionFailedf("not an Aggregate"))
+	}
+
+	return e
 }
 
-// ExtractAggInputColumns returns the input columns of an aggregate (which can
-// be empty).
+// ExtractAggInputColumns returns the set of columns the aggregate depends on.
 func ExtractAggInputColumns(e opt.ScalarExpr) opt.ColSet {
-	if !opt.IsAggregateOp(e) {
-		panic("not an Aggregate")
+	var res opt.ColSet
+	if filter, ok := e.(*AggFilterExpr); ok {
+		res.Add(filter.Filter.(*VariableExpr).Col)
+		e = filter.Input
 	}
 
-	var res opt.ColSet
-	if e.ChildCount() > 0 {
-		res.Add(int(ExtractVarFromAggInput(e.Child(0).(opt.ScalarExpr)).Col))
+	if distinct, ok := e.(*AggDistinctExpr); ok {
+		e = distinct.Input
 	}
+
+	if !opt.IsAggregateOp(e) {
+		panic(errors.AssertionFailedf("not an Aggregate"))
+	}
+
+	for i, n := 0, e.ChildCount(); i < n; i++ {
+		if variable, ok := e.Child(i).(*VariableExpr); ok {
+			res.Add(variable.Col)
+		}
+	}
+
 	return res
 }
 
-// ExtractVarFromAggInput is given an argument to an Aggregate and returns the
-// inner Variable expression, stripping out modifiers like AggDistinct.
-func ExtractVarFromAggInput(arg opt.ScalarExpr) *VariableExpr {
-	if distinct, ok := arg.(*AggDistinctExpr); ok {
-		arg = distinct.Input
+// ExtractAggFirstVar is given an aggregate expression and returns the Variable
+// expression for the first argument, skipping past modifiers like AggDistinct.
+func ExtractAggFirstVar(e opt.ScalarExpr) *VariableExpr {
+	e = ExtractAggFunc(e)
+	if e.ChildCount() == 0 {
+		panic(errors.AssertionFailedf("aggregate does not have any arguments"))
 	}
-	if variable, ok := arg.(*VariableExpr); ok {
+
+	if variable, ok := e.Child(0).(*VariableExpr); ok {
 		return variable
 	}
-	panic("aggregate input not a Variable")
+
+	panic(errors.AssertionFailedf("first aggregate input is not a Variable"))
 }
 
 // ExtractJoinEqualityColumns returns pairs of columns (one from the left side,
@@ -145,7 +163,7 @@ func ExtractJoinEqualityColumns(
 ) (leftEq opt.ColList, rightEq opt.ColList) {
 	for i := range on {
 		condition := on[i].Condition
-		ok, left, right := isJoinEquality(leftCols, rightCols, condition)
+		ok, left, right := ExtractJoinEquality(leftCols, rightCols, condition)
 		if !ok {
 			continue
 		}
@@ -167,6 +185,32 @@ func ExtractJoinEqualityColumns(
 	return leftEq, rightEq
 }
 
+// ExtractJoinEqualityFilters returns the filters containing pairs of columns
+// (one from the left side, one from the right side) which are constrained to
+// be equal in a join (and have equivalent types).
+func ExtractJoinEqualityFilters(leftCols, rightCols opt.ColSet, on FiltersExpr) FiltersExpr {
+	// We want to avoid allocating a new slice unless strictly necessary.
+	var newFilters FiltersExpr
+	for i := range on {
+		condition := on[i].Condition
+		ok, _, _ := ExtractJoinEquality(leftCols, rightCols, condition)
+		if ok {
+			if newFilters != nil {
+				newFilters = append(newFilters, on[i])
+			}
+		} else {
+			if newFilters == nil {
+				newFilters = make(FiltersExpr, i, len(on)-1)
+				copy(newFilters, on[:i])
+			}
+		}
+	}
+	if newFilters != nil {
+		return newFilters
+	}
+	return on
+}
+
 func isVarEquality(condition opt.ScalarExpr) (leftVar, rightVar *VariableExpr, ok bool) {
 	if eq, ok := condition.(*EqExpr); ok {
 		if leftVar, ok := eq.Left.(*VariableExpr); ok {
@@ -178,7 +222,11 @@ func isVarEquality(condition opt.ScalarExpr) (leftVar, rightVar *VariableExpr, o
 	return nil, nil, false
 }
 
-func isJoinEquality(
+// ExtractJoinEquality returns true if the given condition is a simple equality
+// condition with two variables (e.g. a=b), where one of the variables (returned
+// as "left") is in the set of leftCols and the other (returned as "right") is
+// in the set of rightCols.
+func ExtractJoinEquality(
 	leftCols, rightCols opt.ColSet, condition opt.ScalarExpr,
 ) (ok bool, left, right opt.ColumnID) {
 	lvar, rvar, ok := isVarEquality(condition)
@@ -191,10 +239,10 @@ func isJoinEquality(
 		return false, 0, 0
 	}
 
-	if leftCols.Contains(int(lvar.Col)) && rightCols.Contains(int(rvar.Col)) {
+	if leftCols.Contains(lvar.Col) && rightCols.Contains(rvar.Col) {
 		return true, lvar.Col, rvar.Col
 	}
-	if leftCols.Contains(int(rvar.Col)) && rightCols.Contains(int(lvar.Col)) {
+	if leftCols.Contains(rvar.Col) && rightCols.Contains(lvar.Col) {
 		return true, rvar.Col, lvar.Col
 	}
 
@@ -239,7 +287,7 @@ func ExtractConstColumns(
 ) (fixedCols opt.ColSet) {
 	for i := range on {
 		scalar := on[i]
-		scalarProps := scalar.ScalarProps(mem)
+		scalarProps := scalar.ScalarProps()
 		if scalarProps.Constraints != nil && !scalarProps.Constraints.IsUnconstrained() {
 			fixedCols.UnionWith(scalarProps.Constraints.ExtractConstCols(evalCtx))
 		}
@@ -247,32 +295,19 @@ func ExtractConstColumns(
 	return fixedCols
 }
 
-// ExtractValuesFromFilter returns a map of constant columns, to the values
-// they're constrained to.
-func ExtractValuesFromFilter(on FiltersExpr, cols opt.ColSet) map[opt.ColumnID]tree.Datum {
-	vals := make(map[opt.ColumnID]tree.Datum)
+// ExtractValueForConstColumn returns the constant value of a column returned by
+// ExtractConstColumns.
+func ExtractValueForConstColumn(
+	on FiltersExpr, mem *Memo, evalCtx *tree.EvalContext, col opt.ColumnID,
+) tree.Datum {
 	for i := range on {
-		ok, col, val := extractConstEquality(on[i].Condition)
-		if !ok || !cols.Contains(col) {
-			continue
-		}
-		vals[opt.ColumnID(col)] = val
-	}
-	return vals
-}
-
-// extractConstEquality extracts a column that's being equated to a constant
-// value if possible.
-func extractConstEquality(condition opt.ScalarExpr) (bool, int, tree.Datum) {
-	if eq, ok := condition.(*EqExpr); ok {
-		// Only check the left side - the variable is always on the left side
-		// due to the CommuteVar norm rule.
-		if leftVar, ok := eq.Left.(*VariableExpr); ok {
-			if CanExtractConstDatum(eq.Right) {
-				return true, int(leftVar.Col), ExtractConstDatum(eq.Right)
+		scalar := on[i]
+		scalarProps := scalar.ScalarProps()
+		if scalarProps.Constraints != nil {
+			if val := scalarProps.Constraints.ExtractValueForConstCol(evalCtx, col); val != nil {
+				return val
 			}
 		}
 	}
-
-	return false, 0, nil
+	return nil
 }

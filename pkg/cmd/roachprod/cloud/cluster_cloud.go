@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package cloud
 
@@ -24,7 +19,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachprod/config"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachprod/vm"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 const vmNameFormat = "user-<clusterid>-<nodeid>"
@@ -217,7 +212,7 @@ func ListCloud() (*Cloud, error) {
 }
 
 // CreateCluster TODO(peter): document
-func CreateCluster(name string, nodes int, opts vm.CreateOpts) error {
+func CreateCluster(nodes int, opts vm.CreateOpts) error {
 	providerCount := len(opts.VMProviders)
 	if providerCount == 0 {
 		return errors.New("no VMProviders configured")
@@ -227,7 +222,7 @@ func CreateCluster(name string, nodes int, opts vm.CreateOpts) error {
 	vmLocations := map[string][]string{}
 	for i, p := 1, 0; i <= nodes; i++ {
 		pName := opts.VMProviders[p]
-		vmName := fmt.Sprintf("%s-%0.4d", name, i)
+		vmName := vm.Name(opts.ClusterName, i)
 		vmLocations[pName] = append(vmLocations[pName], vmName)
 
 		p = (p + 1) % providerCount
@@ -241,6 +236,10 @@ func CreateCluster(name string, nodes int, opts vm.CreateOpts) error {
 // DestroyCluster TODO(peter): document
 func DestroyCluster(c *Cluster) error {
 	return vm.FanOut(c.VMs, func(p vm.Provider, vms vm.List) error {
+		// Enable a fast-path for providers that can destroy a cluster in one shot.
+		if x, ok := p.(vm.DeleteCluster); ok {
+			return x.DeleteCluster(c.Name)
+		}
 		return p.Delete(vms)
 	})
 }

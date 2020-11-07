@@ -1,37 +1,42 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tracing
 
 import (
-	"fmt"
 	"strings"
+
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 )
 
-// FindMsgInRecording returns the index of the first span containing msg in its
-// logs, or -1 if no span is found.
-func FindMsgInRecording(recording []RecordedSpan, msg string) int {
-	for i, recSp := range recording {
-		spMsg := ""
-		for _, l := range recSp.Logs {
-			for _, f := range l.Fields {
-				spMsg = spMsg + fmt.Sprintf("  %s: %v", f.Key, f.Value)
-			}
-		}
-		if strings.Contains(spMsg, msg) {
+// FindMsgInRecording returns the index of the first Span containing msg in its
+// logs, or -1 if no Span is found.
+func FindMsgInRecording(recording Recording, msg string) int {
+	for i, sp := range recording {
+		if LogsContainMsg(sp, msg) {
 			return i
 		}
 	}
 	return -1
+}
+
+// LogsContainMsg returns true if a Span's logs contain the given message.
+func LogsContainMsg(sp tracingpb.RecordedSpan, msg string) bool {
+	for _, l := range sp.Logs {
+		// NOTE: With out logs, each LogRecord has a single field ("event") and
+		// value.
+		for _, f := range l.Fields {
+			if strings.Contains(f.Value, msg) {
+				return true
+			}
+		}
+	}
+	return false
 }

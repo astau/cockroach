@@ -30,7 +30,6 @@
 # at the end of their journey. See the PruneCols comment for more details.
 # =============================================================================
 
-
 # PruneProjectCols discards columns from a nested project which are not used by
 # the outer project.
 [PruneProjectCols, Normalize]
@@ -40,15 +39,14 @@
     $passthrough:* &
         (CanPruneCols
             $project
-            $needed:(UnionCols (ProjectionOuterCols $projections) $passthrough)
+            $needed:(UnionCols
+                (ProjectionOuterCols $projections)
+                $passthrough
+            )
         )
 )
 =>
-(Project
-    (PruneCols $project $needed)
-    $projections
-    $passthrough
-)
+(Project (PruneCols $project $needed) $projections $passthrough)
 
 # PruneScanCols discards Scan operator columns that are never used. The needed
 # columns are pushed down into the Scan's opt.ScanOpDef private.
@@ -59,15 +57,14 @@
     $passthrough:* &
         (CanPruneCols
             $input
-            $needed:(UnionCols (ProjectionOuterCols $projections) $passthrough)
+            $needed:(UnionCols
+                (ProjectionOuterCols $projections)
+                $passthrough
+            )
         )
 )
 =>
-(Project
-    (PruneCols $input $needed)
-    $projections
-    $passthrough
-)
+(Project (PruneCols $input $needed) $projections $passthrough)
 
 # PruneSelectCols discards Select input columns that are never used.
 #
@@ -76,10 +73,7 @@
 # below Project).
 [PruneSelectCols, Normalize]
 (Project
-    (Select
-        $input:*
-        $filters:*
-    )
+    (Select $input:* $filters:*)
     $projections:*
     $passthrough:* &
         (CanPruneCols
@@ -93,10 +87,7 @@
 )
 =>
 (Project
-    (Select
-        (PruneCols $input $needed)
-        $filters
-    )
+    (Select (PruneCols $input $needed) $filters)
     $projections
     $passthrough
 )
@@ -108,11 +99,7 @@
 # below Project).
 [PruneLimitCols, Normalize]
 (Project
-    (Limit
-        $input:*
-        $limit:*
-        $ordering:*
-    )
+    (Limit $input:* $limit:* $ordering:*)
     $projections:*
     $passthrough:* &
         (CanPruneCols
@@ -142,11 +129,7 @@
 # below Project).
 [PruneOffsetCols, Normalize]
 (Project
-    (Offset
-        $input:*
-        $offset:*
-        $ordering:*
-    )
+    (Offset $input:* $offset:* $ordering:*)
     $projections:*
     $passthrough:* &
         (CanPruneCols
@@ -173,11 +156,7 @@
 # used.
 [PruneJoinLeftCols, Normalize]
 (Project
-    $input:(Join
-        $left:*
-        $right:*
-        $on:*
-    )
+    $input:(Join $left:* $right:* $on:* $private:*)
     $projections:*
     $passthrough:* &
         (CanPruneCols
@@ -196,6 +175,7 @@
         (PruneCols $left $needed)
         $right
         $on
+        $private
     )
     $projections
     $passthrough
@@ -209,11 +189,7 @@
 # below Project).
 [PruneJoinRightCols, Normalize]
 (Project
-    $input:(Join
-        $left:*
-        $right:*
-        $on:*
-    )
+    $input:(Join $left:* $right:* $on:* $private:*)
     $projections:*
     $passthrough:* &
         (CanPruneCols
@@ -231,15 +207,36 @@
         $left
         (PruneCols $right $needed)
         $on
+        $private
     )
     $projections
     $passthrough
 )
 
+# PruneSemiAntiJoinRightCols discards columns on the right side of a
+# Semi or Anti join that are never used. This is similar to PruneJoinRightCols.
+# PruneJoinRightCols normally prunes the RHS of a join but it can't do that
+# in the case of Semi/Anti joins because the projection is eliminated after
+# the LHS is pruned. This rule doesn't require a projection over the Semi/Anti
+# join in order to prune the RHS.
+[PruneSemiAntiJoinRightCols, Normalize]
+(SemiJoin | SemiJoinApply | AntiJoin | AntiJoinApply
+    $left:*
+    $right:*
+    $on:*
+    $private:* &
+        (CanPruneCols $right $needed:(FilterOuterCols $on))
+)
+=>
+((OpName) $left (PruneCols $right $needed) $on $private)
+
 # PruneAggCols discards aggregation columns in a GroupBy that are never used.
+# Note that UpsertDistinctOn is not included here because its columns are always
+# used.
 [PruneAggCols, Normalize]
 (Project
     $input:(GroupBy | ScalarGroupBy | DistinctOn
+            | EnsureDistinctOn
         $innerInput:*
         $aggregations:*
         $groupingPrivate:*
@@ -248,7 +245,10 @@
     $passthrough:* &
         (CanPruneAggCols
             $aggregations
-            $needed:(UnionCols (ProjectionOuterCols $projections) $passthrough)
+            $needed:(UnionCols
+                (ProjectionOuterCols $projections)
+                $passthrough
+            )
         )
 )
 =>
@@ -262,9 +262,10 @@
     $passthrough
 )
 
-# PruneGroupByCols discards GroupBy input columns that are never used.
+# PruneGroupByCols discards GroupBy input columns that are never used. Note that
+# UpsertDistinctOn is not included here because its columns are always used.
 [PruneGroupByCols, Normalize]
-(GroupBy | DistinctOn
+(GroupBy | ScalarGroupBy | DistinctOn | EnsureDistinctOn
     $input:*
     $aggregations:*
     $groupingPrivate:* &
@@ -272,7 +273,7 @@
             $input
             $needed:(UnionCols
                 (AggregationOuterCols $aggregations)
-                (NeededColsGrouping $groupingPrivate)
+                (NeededGroupingCols $groupingPrivate)
             )
         )
 )
@@ -291,26 +292,25 @@
     $passthrough:* &
         (CanPruneCols
             $input
-            $needed:(UnionCols (ProjectionOuterCols $projections) $passthrough)
+            $needed:(UnionCols
+                (ProjectionOuterCols $projections)
+                $passthrough
+            )
         )
 )
 =>
-(Project
-    (PruneCols $input $needed)
-    $projections
-    $passthrough
-)
+(Project (PruneCols $input $needed) $projections $passthrough)
 
-# PruneRowNumberCols discards RowNumber input columns that are never used.
-[PruneRowNumberCols, Normalize]
+# PruneOrdinalityCols discards Ordinality input columns that are never used.
+[PruneOrdinalityCols, Normalize]
 (Project
-    (RowNumber $input:* $rowNumberPrivate:*)
+    (Ordinality $input:* $ordinalityPrivate:*)
     $projections:*
     $passthrough:* &
         (CanPruneCols
             $input
             $needed:(UnionCols3
-                (NeededColsRowNumber $rowNumberPrivate)
+                (NeededOrdinalityCols $ordinalityPrivate)
                 (ProjectionOuterCols $projections)
                 $passthrough
             )
@@ -318,9 +318,9 @@
 )
 =>
 (Project
-    (RowNumber
+    (Ordinality
         (PruneCols $input $needed)
-        (PruneOrderingRowNumber $rowNumberPrivate $needed)
+        (PruneOrderingOrdinality $ordinalityPrivate $needed)
     )
     $projections
     $passthrough
@@ -331,13 +331,14 @@
 [PruneExplainCols, Normalize]
 (Explain
     $input:*
-    $explainPrivate:* & (CanPruneCols $input $needed:(NeededColsExplain $explainPrivate))
+    $explainPrivate:* &
+        (CanPruneCols
+            $input
+            $needed:(NeededExplainCols $explainPrivate)
+        )
 )
 =>
-(Explain
-    (PruneCols $input $needed)
-    $explainPrivate
-)
+(Explain (PruneCols $input $needed) $explainPrivate)
 
 # PruneProjectSetCols discards ProjectSet columns that are never used.
 [PruneProjectSetCols, Normalize]
@@ -356,9 +357,199 @@
 )
 =>
 (Project
-    (ProjectSet
-      (PruneCols $innerInput $needed)
-      $zip
+    (ProjectSet (PruneCols $innerInput $needed) $zip)
+    $projections
+    $passthrough
+)
+
+# PruneWindowOutputCols eliminates unused window functions from a Window
+# expression.
+[PruneWindowOutputCols, Normalize]
+(Project
+    (Window $input:* $windows:* $private:*)
+    $projections:*
+    $passthrough:* &
+        (CanPruneWindows
+            $needed:(UnionCols
+                (ProjectionOuterCols $projections)
+                $passthrough
+            )
+            $windows
+        )
+)
+=>
+(Project
+    (Window $input (PruneWindows $needed $windows) $private)
+    $projections
+    $passthrough
+)
+
+# PruneWindowInputCols discards window passthrough columns which are never used.
+# NB: This rule should go after PruneWindowOutputCols, or else this rule can get
+# into a cycle.
+[PruneWindowInputCols, Normalize]
+(Project
+    $input:(Window $innerInput:* $fn:* $private:*)
+    $projections:*
+    $passthrough:* &
+        (CanPruneCols
+            $input
+            $needed:(UnionCols3
+                (NeededWindowCols $fn $private)
+                (ProjectionOuterCols $projections)
+                $passthrough
+            )
+        )
+)
+=>
+(Project
+    (Window (PruneCols $innerInput $needed) $fn $private)
+    $projections
+    $passthrough
+)
+
+# PruneMutationFetchCols removes columns from the mutation operator's FetchCols
+# set if they are never used. Removing FetchCols can in turn can trigger the
+# PruneMutationInputCols rule, which can prune any input columns which are now
+# unreferenced.
+[PruneMutationFetchCols, Normalize]
+(Update | Upsert | Delete
+    $input:*
+    $checks:*
+    $mutationPrivate:* &
+        (CanPruneMutationFetchCols
+            $mutationPrivate
+            $needed:(NeededMutationFetchCols
+                (OpName)
+                $mutationPrivate
+            )
+        )
+)
+=>
+((OpName)
+    $input
+    $checks
+    (PruneMutationFetchCols $mutationPrivate $needed)
+)
+
+# PruneMutationInputCols discards input columns that are never used by the
+# mutation operator.
+[PruneMutationInputCols, Normalize]
+(Insert | Update | Upsert | Delete
+    $input:*
+    $checks:*
+    $mutationPrivate:* &
+        (CanPruneCols
+            $input
+            $needed:(NeededMutationCols $mutationPrivate $checks)
+        )
+)
+=>
+((OpName) (PruneCols $input $needed) $checks $mutationPrivate)
+
+# PruneReturningCols removes columns from the mutation operator's ReturnCols
+# set if they are not used in the RETURNING clause of the mutation.
+# Removing ReturnCols will then allow the PruneMutationFetchCols to be more
+# conservative with the fetch columns.
+# TODO(ridwanmsharif): Mutations shouldn't need to return the primary key
+# columns. Make appropriate changes to SQL execution to accommodate this.
+[PruneMutationReturnCols, Normalize]
+(Project
+    $input:(Insert | Update | Upsert | Delete
+        $innerInput:*
+        $checks:*
+        $mutationPrivate:*
+    )
+    $projections:*
+    $passthrough:* &
+        (CanPruneMutationReturnCols
+            $mutationPrivate
+            $needed:(UnionCols3
+                (PrimaryKeyCols (MutationTable $mutationPrivate))
+                (ProjectionOuterCols $projections)
+                $passthrough
+            )
+        )
+)
+=>
+(Project
+    ((OpName $input)
+        $innerInput
+        $checks
+        (PruneMutationReturnCols $mutationPrivate $needed)
+    )
+    $projections
+    $passthrough
+)
+
+# PruneWithScanCols discards columns scanned from the WithScan that are never
+# used.
+[PruneWithScanCols, Normalize]
+(Project
+    $input:(WithScan)
+    $projections:*
+    $passthrough:* &
+        (CanPruneCols
+            $input
+            $needed:(UnionCols
+                (ProjectionOuterCols $projections)
+                $passthrough
+            )
+        )
+)
+=>
+(Project (PruneCols $input $needed) $projections $passthrough)
+
+# PruneWithCols pushes a Project operator beneath a With. It's ok to
+# unconditionally push this Project down, since in the pruning case, we're
+# getting the project closer to the source of any prune requests, and if we
+# just end up with a Project incidentally, it's safe to just always push it
+# down.
+[PruneWithCols, Normalize]
+(Project
+    (With $binding:* $input:* $private:*)
+    $projections:*
+    $passthrough:*
+)
+=>
+(With
+    $binding
+    (Project $input $projections $passthrough)
+    $private
+)
+
+# PruneUnionAllCols prunes columns from the left and right input relations that
+# are never used. Since UNION ALL preserves duplicates, any column may be pruned
+# if it is not needed, which is not generally true of set operators.
+#
+# Since UnionAll requires that both inputs have an equal number of columns,
+# rather than using PruneCols to prune the left and right sides, this rule
+# pushes down Projects on both sides to ensure that exactly the needed columns
+# are passed as input to the UnionAll, to prevent situations where one side has
+# more columns left over after PruneCols than the other (for instance, if $left
+# is a normal scan where all columns may be pruned, but $right is a scan with a
+# filter, leading to an additional column being kept on just the right side).
+# If extraneous, these Projects may be cleaned up later by rules like
+# EliminateProject.
+[PruneUnionAllCols, Normalize]
+(Project
+    $union:(UnionAll $left:* $right:* $colmap:*)
+    $projections:*
+    $passthrough:* &
+        (CanPruneCols
+            $union
+            $needed:(UnionCols
+                (ProjectionOuterCols $projections)
+                $passthrough
+            )
+        )
+)
+=>
+(Project
+    (UnionAll
+        (Project $left [] (NeededColMapLeft $needed $colmap))
+        (Project $right [] (NeededColMapRight $needed $colmap))
+        (PruneSetPrivate $needed $colmap)
     )
     $projections
     $passthrough

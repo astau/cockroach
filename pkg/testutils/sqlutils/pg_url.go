@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sqlutils
 
@@ -28,7 +24,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/fileutil"
 )
 
-// PGUrl returns a postgres connection url which connects to this server with the given user, and a
+// PGUrl is like PGUrlE, but uses t.Fatal to handle errors.
+func PGUrl(t testing.TB, servingAddr, prefix string, user *url.Userinfo) (url.URL, func()) {
+	return PGUrlWithOptionalClientCerts(t, servingAddr, prefix, user, true /* withCerts */)
+}
+
+// PGUrlE returns a postgres connection url which connects to this server with the given user, and a
 // cleanup function which must be called after all connections created using the connection url have
 // been closed.
 //
@@ -40,43 +41,72 @@ import (
 //
 // Args:
 //  prefix: A prefix to be prepended to the temp file names generated, for debugging.
-func PGUrl(t testing.TB, servingAddr, prefix string, user *url.Userinfo) (url.URL, func()) {
-	host, port, err := net.SplitHostPort(servingAddr)
+func PGUrlE(servingAddr, prefix string, user *url.Userinfo) (url.URL, func(), error) {
+	return PGUrlWithOptionalClientCertsE(servingAddr, prefix, user, true /* withCerts */)
+}
+
+// PGUrlWithOptionalClientCerts is like PGUrlWithOptionalClientCertsE, but uses t.Fatal to handle
+// errors.
+func PGUrlWithOptionalClientCerts(
+	t testing.TB, servingAddr, prefix string, user *url.Userinfo, withClientCerts bool,
+) (url.URL, func()) {
+	u, f, err := PGUrlWithOptionalClientCertsE(servingAddr, prefix, user, withClientCerts)
 	if err != nil {
 		t.Fatal(err)
+	}
+	return u, f
+}
+
+// PGUrlWithOptionalClientCertsE is like PGUrlE but the caller can
+// customize whether the client certificates are loaded on-disk and in the URL.
+func PGUrlWithOptionalClientCertsE(
+	servingAddr, prefix string, user *url.Userinfo, withClientCerts bool,
+) (url.URL, func(), error) {
+	host, port, err := net.SplitHostPort(servingAddr)
+	if err != nil {
+		return url.URL{}, func() {}, err
 	}
 
 	// TODO(benesch): Audit usage of prefix and replace the following line with
 	// `testutils.TempDir(t)` if prefix can always be `t.Name()`.
 	tempDir, err := ioutil.TempDir("", fileutil.EscapeFilename(prefix))
 	if err != nil {
-		t.Fatal(err)
+		return url.URL{}, func() {}, err
 	}
 
 	caPath := filepath.Join(security.EmbeddedCertsDir, security.EmbeddedCACert)
-	certPath := filepath.Join(security.EmbeddedCertsDir, fmt.Sprintf("client.%s.crt", user.Username()))
-	keyPath := filepath.Join(security.EmbeddedCertsDir, fmt.Sprintf("client.%s.key", user.Username()))
-
-	// Copy these assets to disk from embedded strings, so this test can
-	// run from a standalone binary.
-	tempCAPath := securitytest.RestrictedCopy(t, caPath, tempDir, "ca")
-	tempCertPath := securitytest.RestrictedCopy(t, certPath, tempDir, "cert")
-	tempKeyPath := securitytest.RestrictedCopy(t, keyPath, tempDir, "key")
+	tempCAPath, err := securitytest.RestrictedCopy(caPath, tempDir, "ca")
+	if err != nil {
+		return url.URL{}, func() {}, err
+	}
 	options := url.Values{}
-	options.Add("sslmode", "verify-full")
 	options.Add("sslrootcert", tempCAPath)
-	options.Add("sslcert", tempCertPath)
-	options.Add("sslkey", tempKeyPath)
+
+	if withClientCerts {
+		certPath := filepath.Join(security.EmbeddedCertsDir, fmt.Sprintf("client.%s.crt", user.Username()))
+		keyPath := filepath.Join(security.EmbeddedCertsDir, fmt.Sprintf("client.%s.key", user.Username()))
+
+		// Copy these assets to disk from embedded strings, so this test can
+		// run from a standalone binary.
+		tempCertPath, err := securitytest.RestrictedCopy(certPath, tempDir, "cert")
+		if err != nil {
+			return url.URL{}, func() {}, err
+		}
+		tempKeyPath, err := securitytest.RestrictedCopy(keyPath, tempDir, "key")
+		if err != nil {
+			return url.URL{}, func() {}, err
+		}
+		options.Add("sslcert", tempCertPath)
+		options.Add("sslkey", tempKeyPath)
+		options.Add("sslmode", "verify-full")
+	} else {
+		options.Add("sslmode", "verify-ca")
+	}
 
 	return url.URL{
-			Scheme:   "postgres",
-			User:     user,
-			Host:     net.JoinHostPort(host, port),
-			RawQuery: options.Encode(),
-		}, func() {
-			if err := os.RemoveAll(tempDir); err != nil {
-				// Not Fatal() because we might already be panicking.
-				t.Error(err)
-			}
-		}
+		Scheme:   "postgres",
+		User:     user,
+		Host:     net.JoinHostPort(host, port),
+		RawQuery: options.Encode(),
+	}, func() { _ = os.RemoveAll(tempDir) }, nil
 }

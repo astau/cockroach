@@ -1,20 +1,17 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
-import React from "react";
-
+import React, { ReactNode } from "react";
+import { RequestError } from "src/util/api";
 import spinner from "assets/spinner.gif";
+import { adminUIAccess } from "src/util/docs";
 import "./index.styl";
 
 interface LoadingProps {
@@ -22,7 +19,7 @@ interface LoadingProps {
   error?: Error | Error[] | null;
   className?: string;
   image?: string;
-  render: () => React.ReactNode;
+  render: () => any;
 }
 
 /**
@@ -47,6 +44,24 @@ function getValidErrorsList (errors?: Error | Error[] | null): Error[] | null {
 }
 
 /**
+ * getDetails produces a hint for the given error object.
+ */
+function getDetails (error: Error): ReactNode {
+  if (error instanceof RequestError) {
+     if (error.status === 403) {
+       return (
+         <p>
+           Insufficient privileges to view this resource. <a href={adminUIAccess} target="_blank">
+             Learn more
+           </a>
+         </p>
+       );
+     }
+  }
+  return <p>no details available</p>;
+}
+
+/**
  * Loading will display a background image instead of the content if the
  * loading prop is true.
  */
@@ -68,9 +83,8 @@ export default function Loading(props: LoadingProps) {
         <p>{errorCountMessage} while loading this data:</p>
         <ul>
           {errors.map((error, idx) => (
-            <li key={idx}>
-              <pre>{error.message}</pre>
-            </li>
+            <li key={idx}><b>{error.message}</b>
+            {getDetails(error)}</li>
           ))}
         </ul>
       </div>
@@ -79,9 +93,5 @@ export default function Loading(props: LoadingProps) {
   if (props.loading) {
     return <div className={className} style={image} />;
   }
-  return (
-    <React.Fragment>
-      {props.render()}
-    </React.Fragment>
-  );
+  return props.render();
 }

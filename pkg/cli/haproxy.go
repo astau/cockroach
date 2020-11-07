@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package cli
 
@@ -27,10 +23,11 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
@@ -45,9 +42,11 @@ var genHAProxyCmd = &cobra.Command{
 reached through the client flags.
 The file is written to --out. Use "--out -" for stdout.
 
-The addresses used are those advertized by the nodes themselves. Make sure haproxy
+The addresses used are those advertised by the nodes themselves. Make sure haproxy
 can resolve the hostnames in the configuration file, either by using full-qualified names, or
 running haproxy in the same network.
+
+Notes that have been decommissioned are excluded from the generated configuration.
 
 Nodes to include can be filtered by localities matching the '--locality' regular expression. eg:
   --locality=region=us-east                  # Nodes in region "us-east"
@@ -70,7 +69,7 @@ type haProxyNodeInfo struct {
 	Locality  roachpb.Locality
 }
 
-func nodeStatusesToNodeInfos(statuses []statuspb.NodeStatus) []haProxyNodeInfo {
+func nodeStatusesToNodeInfos(nodes *serverpb.NodesResponse) []haProxyNodeInfo {
 	fs := pflag.NewFlagSet("haproxy", pflag.ContinueOnError)
 
 	httpAddr := ""
@@ -81,26 +80,56 @@ func nodeStatusesToNodeInfos(statuses []statuspb.NodeStatus) []haProxyNodeInfo {
 	// Discard parsing output.
 	fs.SetOutput(ioutil.Discard)
 
-	nodeInfos := make([]haProxyNodeInfo, len(statuses))
-	for i, status := range statuses {
-		nodeInfos[i].NodeID = status.Desc.NodeID
-		nodeInfos[i].NodeAddr = status.Desc.Address.AddressField
-		nodeInfos[i].Locality = status.Desc.Locality
+	nodeInfos := make([]haProxyNodeInfo, 0, len(nodes.Nodes))
+
+	// The response can present nodes in arbitrary order. We want them sorted.
+	nodeIDs := make([]int, 0, len(nodes.Nodes))
+	statusByID := make(map[roachpb.NodeID]statuspb.NodeStatus)
+	for _, status := range nodes.Nodes {
+		statusByID[status.Desc.NodeID] = status
+		nodeIDs = append(nodeIDs, int(status.Desc.NodeID))
+	}
+	sort.Ints(nodeIDs)
+
+	for _, inodeID := range nodeIDs {
+		nodeID := roachpb.NodeID(inodeID)
+		status := statusByID[nodeID]
+		liveness := nodes.LivenessByNodeID[nodeID]
+		switch liveness {
+		case livenesspb.NodeLivenessStatus_DECOMMISSIONING:
+			fmt.Fprintf(stderr, "warning: node %d status is %s, excluding from haproxy configuration\n",
+				nodeID, liveness)
+			fallthrough
+		case livenesspb.NodeLivenessStatus_DECOMMISSIONED:
+			continue
+		}
+
+		info := haProxyNodeInfo{
+			NodeID:   nodeID,
+			NodeAddr: status.Desc.Address.AddressField,
+			Locality: status.Desc.Locality,
+		}
 
 		httpPort = base.DefaultHTTPPort
 		// Iterate over the arguments until the ServerHTTPPort flag is found and
 		// parse the remainder of the arguments. This is done because Parse returns
 		// when it encounters an undefined flag and we do not want to define all
 		// possible flags.
-		for i, arg := range status.Args {
+		//
+		// TODO(knz): this logic is horrendously broken and
+		// incorrect. Replace it.
+		for j, arg := range status.Args {
 			if strings.Contains(arg, cliflags.ListenHTTPPort.Name) ||
 				strings.Contains(arg, cliflags.ListenHTTPAddr.Name) {
-				_ = fs.Parse(status.Args[i:])
+				_ = fs.Parse(status.Args[j:])
+				break
 			}
 		}
 
-		nodeInfos[i].CheckPort = httpPort
+		info.CheckPort = httpPort
+		nodeInfos = append(nodeInfos, info)
 	}
+
 	return nodeInfos
 }
 
@@ -191,7 +220,7 @@ func runGenHAProxyCmd(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	conn, _, finish, err := getClientGRPCConn(ctx)
+	conn, _, finish, err := getClientGRPCConn(ctx, serverCfg)
 	if err != nil {
 		return err
 	}
@@ -207,13 +236,13 @@ func runGenHAProxyCmd(cmd *cobra.Command, args []string) error {
 	var f *os.File
 	if haProxyPath == "-" {
 		w = os.Stdout
-	} else if f, err = os.OpenFile(haProxyPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0755); err != nil {
+	} else if f, err = os.OpenFile(haProxyPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644); err != nil {
 		return err
 	} else {
 		w = f
 	}
 
-	nodeInfos := nodeStatusesToNodeInfos(nodeStatuses.Nodes)
+	nodeInfos := nodeStatusesToNodeInfos(nodeStatuses)
 	filteredNodeInfos, err := filterByLocality(nodeInfos)
 	if err != nil {
 		return err

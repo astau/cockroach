@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package ordering
 
@@ -18,6 +14,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/errors"
 )
 
 func scanCanProvideOrdering(expr memo.RelExpr, required *physical.OrderingChoice) bool {
@@ -40,7 +38,7 @@ func ScanIsReverse(scan *memo.ScanExpr, required *physical.OrderingChoice) bool 
 		required,
 	)
 	if !ok {
-		panic("scan can't provide required ordering")
+		panic(errors.AssertionFailedf("scan can't provide required ordering"))
 	}
 	return reverse
 }
@@ -75,6 +73,11 @@ func ScanPrivateCanProvide(
 		if s.HardLimit.Reverse() {
 			direction = rev
 		}
+	} else if s.Flags.Direction != 0 {
+		direction = fwd
+		if s.Flags.Direction == tree.Descending {
+			direction = rev
+		}
 	}
 	index := md.Table(s.Table).Index(s.Index)
 	for left, right := 0, 0; right < len(required.Columns); {
@@ -82,13 +85,13 @@ func ScanPrivateCanProvide(
 			return false, false
 		}
 		indexCol := index.Column(left)
-		indexColID := s.Table.ColumnID(indexCol.Ordinal)
-		if required.Optional.Contains(int(indexColID)) {
+		indexColID := s.Table.ColumnID(indexCol.Ordinal())
+		if required.Optional.Contains(indexColID) {
 			left++
 			continue
 		}
 		reqCol := &required.Columns[right]
-		if !reqCol.Group.Contains(int(indexColID)) {
+		if !reqCol.Group.Contains(indexColID) {
 			return false, false
 		}
 		// The directions of the index column and the required column impose either
@@ -127,12 +130,12 @@ func scanBuildProvided(expr memo.RelExpr, required *physical.OrderingChoice) opt
 	provided := make(opt.Ordering, 0, numCols)
 	for i := 0; i < numCols; i++ {
 		indexCol := index.Column(i)
-		colID := scan.Table.ColumnID(indexCol.Ordinal)
-		if !scan.Cols.Contains(int(colID)) {
+		colID := scan.Table.ColumnID(indexCol.Ordinal())
+		if !scan.Cols.Contains(colID) {
 			// Column not in output; we are done.
 			break
 		}
-		if constCols.Contains(int(colID)) {
+		if constCols.Contains(colID) {
 			// Column constrained to a constant, ignore.
 			continue
 		}
@@ -149,7 +152,7 @@ func init() {
 	) bool {
 		ok, reverse := ScanPrivateCanProvide(md, s, required)
 		if !ok {
-			panic("scan can't provide required ordering")
+			panic(errors.AssertionFailedf("scan can't provide required ordering"))
 		}
 		return reverse
 	}

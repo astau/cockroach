@@ -35,7 +35,7 @@ type Overload struct {
 
 `Overload` contains a number of fields, reflecting the
 diversity of built-in functions. Three important fields for us to pay
-attention to our the argument types (`Types`), the return type
+attention to are the argument types (`Types`), the return type
 (`ReturnType`) and the implementation function pointer (`Fn`).
 
 Multiple function overloads are then grouped into a single "built-in
@@ -348,7 +348,7 @@ check your solution against ours.
     "whois": makeBuiltin(defProps(),
       tree.Overload{
         Types:      tree.VariadicType{VarType: types.String},
-        ReturnType: tree.FixedReturnType(types.TypeString),
+        ReturnType: tree.FixedReturnType(types.String),
         Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
           users := map[string]string{
             "bdarnell": "Ben Darnell",

@@ -1,49 +1,38 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
 import (
 	"context"
 	"fmt"
-	"runtime"
-	"strconv"
+	"strings"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/util/binfetcher"
+	"github.com/cockroachdb/cockroach/pkg/util/version"
+	"github.com/cockroachdb/errors"
 	_ "github.com/lib/pq"
 )
 
-func registerVersion(r *registry) {
-	runVersion := func(ctx context.Context, t *test, c *cluster, version string) {
-		nodes := c.nodes - 1
-		goos := ifLocal(runtime.GOOS, "linux")
+// TODO(tbg): remove this test. Use the harness in versionupgrade.go
+// to make a much better one, much more easily.
+func registerVersion(r *testRegistry) {
+	runVersion := func(ctx context.Context, t *test, c *cluster, binaryVersion string) {
+		nodes := c.spec.NodeCount - 1
 
-		b, err := binfetcher.Download(ctx, binfetcher.Options{
-			Binary:  "cockroach",
-			Version: version,
-			GOOS:    goos,
-			GOARCH:  "amd64",
-		})
-		if err != nil {
+		if err := c.Stage(ctx, c.l, "release", "v"+binaryVersion, "", c.Range(1, nodes)); err != nil {
 			t.Fatal(err)
 		}
 
 		c.Put(ctx, workload, "./workload", c.Node(nodes+1))
 
-		c.Put(ctx, b, "./cockroach", c.Range(1, nodes))
 		// Force disable encryption.
 		// TODO(mberhault): allow it once version >= 2.1.
 		c.Start(ctx, t, c.Range(1, nodes), startArgsDontEncrypt)
@@ -58,24 +47,22 @@ func registerVersion(r *registry) {
 
 		loadDuration := " --duration=" + (time.Duration(3*nodes+2)*stageDuration + buffer).String()
 
+		var deprecatedWorkloadsStr string
+		if !t.buildVersion.AtLeast(version.MustParse("v20.2.0")) {
+			deprecatedWorkloadsStr += " --deprecated-fk-indexes"
+		}
+
 		workloads := []string{
-			"./workload run tpcc --tolerate-errors --wait=false --drop --init --warehouses=1 " + loadDuration + " {pgurl:1-%d}",
+			"./workload run tpcc --tolerate-errors --wait=false --drop --init --warehouses=1 " + deprecatedWorkloadsStr + loadDuration + " {pgurl:1-%d}",
 			"./workload run kv --tolerate-errors --init" + loadDuration + " {pgurl:1-%d}",
 		}
 
 		m := newMonitor(ctx, c, c.Range(1, nodes))
-		for i, cmd := range workloads {
+		for _, cmd := range workloads {
 			cmd := cmd // loop-local copy
-			i := i     // ditto
 			m.Go(func(ctx context.Context) error {
 				cmd = fmt.Sprintf(cmd, nodes)
-				// Direct stderr only to disk. We expect errors from the workload as
-				// nodes are stopped and started.
-				childL, err := t.l.ChildLogger("workload"+strconv.Itoa(i), quietStderr)
-				if err != nil {
-					return err
-				}
-				return c.RunL(ctx, childL, c.Node(nodes+1), cmd)
+				return c.RunE(ctx, c.Node(nodes+1), cmd)
 			})
 		}
 
@@ -95,7 +82,7 @@ func registerVersion(r *registry) {
 				// Make sure everyone is still running.
 				for i := 1; i <= nodes; i++ {
 					t.WorkerStatus("checking ", i)
-					db := c.Conn(ctx, 1)
+					db := c.Conn(ctx, i)
 					defer db.Close()
 					rows, err := db.Query(`SHOW DATABASES`)
 					if err != nil {
@@ -104,12 +91,25 @@ func registerVersion(r *registry) {
 					if err := rows.Close(); err != nil {
 						return err
 					}
+					// Regression test for #37425. We can't run this in 2.1 because
+					// 19.1 changed downstream-of-raft semantics for consistency
+					// checks but unfortunately our versioning story for these
+					// checks had been broken for a long time. See:
+					//
+					// https://github.com/cockroachdb/cockroach/issues/37737#issuecomment-496026918
+					if !strings.HasPrefix(binaryVersion, "2.") {
+						if err := c.CheckReplicaDivergenceOnDB(ctx, db); err != nil {
+							return errors.Wrapf(err, "node %d", i)
+						}
+					}
 				}
 				return nil
 			}
 
 			db := c.Conn(ctx, 1)
 			defer db.Close()
+			// See analogous comment in the upgrade/mixedWith roachtest.
+			db.SetMaxIdleConns(0)
 
 			// First let the load generators run in the cluster at `version`.
 			if err := sleepAndCheck(); err != nil {
@@ -119,24 +119,7 @@ func registerVersion(r *registry) {
 			stop := func(node int) error {
 				m.ExpectDeath()
 				l.Printf("stopping node %d\n", node)
-				port := fmt.Sprintf("{pgport:%d}", node)
-				// Note that the following command line needs to run against both v2.0
-				// and the current branch. Do not change it in a manner that is
-				// incompatible with 2.0.
-				if err := c.RunE(ctx, c.Node(node), "./cockroach quit --insecure --port="+port); err != nil {
-					return err
-				}
-				// NB: we still call Stop to make sure the process is dead when we try
-				// to restart it (or we'll catch an error from the RocksDB dir being
-				// locked). This won't happen unless run with --local due to timing.
-				// However, it serves as a reminder that `./cockroach quit` doesn't yet
-				// work well enough -- ideally all listeners and engines are closed by
-				// the time it returns to the client.
-				//
-				// TODO(tschottdorf): should return an error. I doubt that we want to
-				// call these *testing.T-style methods on goroutines.
-				c.Stop(ctx, c.Node(node))
-				return nil
+				return c.StopCockroachGracefullyOnNode(ctx, node)
 			}
 
 			var oldVersion string
@@ -189,7 +172,9 @@ func registerVersion(r *registry) {
 				if err := stop(i); err != nil {
 					return err
 				}
-				c.Put(ctx, b, "./cockroach", c.Node(i))
+				if err := c.Stage(ctx, c.l, "release", "v"+binaryVersion, "", c.Node(i)); err != nil {
+					t.Fatal(err)
+				}
 				c.Start(ctx, t, c.Node(i), startArgsDontEncrypt)
 				if err := sleepAndCheck(); err != nil {
 					return err
@@ -223,14 +208,18 @@ func registerVersion(r *registry) {
 		m.Wait()
 	}
 
-	const version = "v2.0.5"
 	for _, n := range []int{3, 5} {
 		r.Add(testSpec{
-			Name:       fmt.Sprintf("version/mixedWith=%s/nodes=%d", version, n),
+			Name:       fmt.Sprintf("version/mixed/nodes=%d", n),
+			Owner:      OwnerKV,
 			MinVersion: "v2.1.0",
-			Nodes:      nodes(n + 1),
+			Cluster:    makeClusterSpec(n + 1),
 			Run: func(ctx context.Context, t *test, c *cluster) {
-				runVersion(ctx, t, c, version)
+				pred, err := PredecessorVersion(r.buildVersion)
+				if err != nil {
+					t.Fatal(err)
+				}
+				runVersion(ctx, t, c, pred)
 			},
 		})
 	}

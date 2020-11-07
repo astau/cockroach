@@ -1,5 +1,3 @@
-# LogicTest: local local-opt local-parallel-stmts fakedist fakedist-opt fakedist-metadata fakedist-disk
-
 statement ok
 CREATE TABLE t (
   a INT PRIMARY KEY,
@@ -189,18 +187,6 @@ SELECT * FROM t ORDER BY foo
 query error no data source matches prefix: a
 SELECT a FROM t ORDER BY a.b
 
-query error can't order by column type int\[\]
-SELECT generate_series FROM generate_series(1, 100) ORDER BY ARRAY[generate_series]
-
-query error can't order by column type int\[\]
-SELECT ARRAY[generate_series] FROM generate_series(1, 100) ORDER BY ARRAY[generate_series]
-
-query error can't order by column type int\[\]
-SELECT ARRAY[generate_series] FROM generate_series(1, 100) ORDER BY 1
-
-query error can't order by column type int\[\]
-SELECT ARRAY[generate_series] AS a FROM generate_series(1, 100) ORDER BY a
-
 query IT
 SELECT generate_series, ARRAY[generate_series] FROM generate_series(1, 1) ORDER BY 1
 ----
@@ -307,7 +293,7 @@ statement ok
 CREATE TABLE nan (id INT PRIMARY KEY, x REAL)
 
 statement ok
-INSERT INTO nan VALUES (1, 0/0), (2, -1), (3, 1), (4, 0/0)
+INSERT INTO nan VALUES (1, 'NaN'), (2, -1), (3, 1), (4, 'NaN')
 
 query R
 SELECT x FROM nan ORDER BY x
@@ -446,3 +432,9 @@ SELECT a, b, c FROM abc2 AS x ORDER BY INDEX x@bc
 
 statement error no data source matches prefix: test.public.abc2
 SELECT a, b, c FROM abc2 AS x ORDER BY INDEX abc2@bc
+
+# Check that telemetry is being collected on the usage of ORDER BY.
+query B
+SELECT usage_count > 0 FROM crdb_internal.feature_usage WHERE feature_name = 'sql.plan.opt.node.sort'
+----
+true

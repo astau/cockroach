@@ -1,24 +1,19 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package aws
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
-	"math"
 	"math/rand"
 	"os"
 	"os/exec"
@@ -27,10 +22,12 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachprod/vm"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachprod/vm/flagstub"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/spf13/pflag"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/time/rate"
 )
 
 // ProviderName is aws.
@@ -62,20 +59,59 @@ func init() {
 	} else {
 		p = flagstub.New(p, unimplemented)
 	}
+
 	vm.Providers[ProviderName] = p
 }
 
 // providerOpts implements the vm.ProviderFlags interface for aws.Provider.
 type providerOpts struct {
-	AMI                []string
+	Profile string
+	Config  *awsConfig
+
 	MachineType        string
-	SecurityGroups     []string
 	SSDMachineType     string
-	Subnets            []string
+	CPUOptions         string
 	RemoteUserName     string
 	EBSVolumeType      string
 	EBSVolumeSize      int
 	EBSProvisionedIOPs int
+	UseMultipleDisks   bool
+
+	// Use specified ImageAMI when provisioning.
+	// Overrides config.json AMI.
+	ImageAMI string
+
+	// CreateZones stores the list of zones for used cluster creation.
+	// When > 1 zone specified, geo is automatically used, otherwise, geo depends
+	// on the geo flag being set. If no zones specified, defaultCreateZones are
+	// used. See defaultCreateZones.
+	CreateZones []string
+	// CreateRateLimit specifies the rate limit used for aws instance creation.
+	// The request limit from aws' side can vary across regions, as well as the
+	// size of cluster being created.
+	CreateRateLimit float64
+}
+
+const (
+	defaultSSDMachineType = "m5d.xlarge"
+	defaultMachineType    = "m5.xlarge"
+)
+
+var defaultConfig = func() (cfg *awsConfig) {
+	cfg = new(awsConfig)
+	if err := json.Unmarshal(MustAsset("config.json"), cfg); err != nil {
+		panic(errors.Wrap(err, "failed to embedded configuration"))
+	}
+	return cfg
+}()
+
+// defaultCreateZones is the list of availability zones used by default for
+// cluster creation. If the geo flag is specified, nodes are distributed between
+// zones.
+var defaultCreateZones = []string{
+	"us-east-2b",
+	"us-west-2b",
+	"eu-west-2b",
 }
 
 // ConfigureCreateFlags is part of the vm.ProviderFlags interface.
@@ -84,48 +120,18 @@ type providerOpts struct {
 // somewhat complicated because different EC2 regions may as well
 // be parallel universes.
 func (o *providerOpts) ConfigureCreateFlags(flags *pflag.FlagSet) {
-	// You can find AMI ids here https://cloud-images.ubuntu.com/locator/ec2/
-	// Ubuntu Server 16.04 LTS (HVM), SSD Volume Type
-	flags.StringSliceVar(&o.AMI, ProviderName+"-ami",
-		[]string{
-			"us-east-2:ami-965e6bf3",
-			"us-west-2:ami-79873901",
-			"eu-west-2:ami-941e04f0",
-		},
-		"AMI images for each region")
 
 	// m5.xlarge is a 4core, 16Gb instance, approximately equal to a GCE n1-standard-4
-	flags.StringVar(&o.MachineType, ProviderName+"-machine-type", "m5.xlarge",
+	flags.StringVar(&o.MachineType, ProviderName+"-machine-type", defaultMachineType,
 		"Machine type (see https://aws.amazon.com/ec2/instance-types/)")
 
 	// The m5 devices only support EBS volumes, so we need a different instance type
 	// for directly-attached SSD support. This is 4 core, 16GB ram, 150GB ssd.
-	flags.StringVar(&o.SSDMachineType, ProviderName+"-machine-type-ssd", "m5d.xlarge",
+	flags.StringVar(&o.SSDMachineType, ProviderName+"-machine-type-ssd", defaultSSDMachineType,
 		"Machine type for --local-ssd (see https://aws.amazon.com/ec2/instance-types/)")
 
-	// The subnet actually controls placement into a particular AZ
-	flags.StringSliceVar(&o.Subnets, ProviderName+"-subnet",
-		[]string{
-			// m5 machines not yet available in us-east-2a.
-			// "us-east-2a:subnet-3ea05c57",
-			"us-east-2b:subnet-49170331",
-			"us-east-2c:subnet-46c7f20c",
-			"us-west-2a:subnet-0ffd1c2a34c9231ca",
-			"us-west-2b:subnet-0e6c3c944d64cdcaf",
-			"us-west-2c:subnet-0987b45308598f96a",
-			"eu-west-2a:subnet-056b3d8c21c5ea593",
-			"eu-west-2b:subnet-018fa0ae185054048",
-			"eu-west-2c:subnet-0678178e17d36f556",
-		},
-		"Subnet id for zones in each region")
-
-	// Set up a roachprod security group in each region
-	flags.StringSliceVar(&o.SecurityGroups, ProviderName+"-sg",
-		[]string{
-			"us-east-2:sg-06a4c809644e32920",
-			"us-west-2:sg-03548a0ccc7870601",
-			"eu-west-2:sg-0ebb21d61843dd82f"},
-		"Security group id in each region")
+	flags.StringVar(&o.CPUOptions, ProviderName+"-cpu-options", "",
+		"Options to specify number of cores and threads per core (see https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-optimize-cpu.html#instance-specify-cpu-options)")
 
 	// AWS images generally use "ubuntu" or "ec2-user"
 	flags.StringVar(&o.RemoteUserName, ProviderName+"-user",
@@ -137,10 +143,31 @@ func (o *providerOpts) ConfigureCreateFlags(flags *pflag.FlagSet) {
 		500, "Size in GB of EBS volume, only used if local-ssd=false")
 	flags.IntVar(&o.EBSProvisionedIOPs, ProviderName+"-ebs-iops",
 		1000, "Number of IOPs to provision, only used if "+ProviderName+
-			"-ebs-volume-type=io2")
+			"-ebs-volume-type=io1")
+
+	flags.StringSliceVar(&o.CreateZones, ProviderName+"-zones", nil,
+		fmt.Sprintf("aws availability zones to use for cluster creation. If zones are formatted\n"+
+			"as AZ:N where N is an integer, the zone will be repeated N times. If > 1\n"+
+			"zone specified, the cluster will be spread out evenly by zone regardless\n"+
+			"of geo (default [%s])", strings.Join(defaultCreateZones, ",")))
+	flags.StringVar(&o.ImageAMI, ProviderName+"-image-ami",
+		"", "Override image AMI to use.  See https://awscli.amazonaws.com/v2/documentation/api/latest/reference/ec2/describe-images.html")
+	flags.BoolVar(&o.UseMultipleDisks, ProviderName+"-enable-multiple-stores",
+		false, "Enable the use of multiple stores by creating one store directory per disk.  Default is to raid0 stripe all disks.")
+	flags.Float64Var(&o.CreateRateLimit, ProviderName+"-create-rate-limit", 2, "aws"+
+		" rate limit (per second) for instance creation. This is used to avoid hitting the request"+
+		" limits from aws, which can vary based on the region, and the size of the cluster being"+
+		" created. Try lowering this limit when hitting 'Request limit exceeded' errors.")
 }
 
-func (o *providerOpts) ConfigureClusterFlags(flags *pflag.FlagSet) {
+func (o *providerOpts) ConfigureClusterFlags(flags *pflag.FlagSet, _ vm.MultipleProjectsOption) {
+	profile := os.Getenv("AWS_DEFAULT_PROFILE") // "" if unset
+	flags.StringVar(&o.Profile, ProviderName+"-profile", profile,
+		"Profile to manage cluster in")
+	configFlagVal := awsConfigValue{awsConfig: *defaultConfig}
+	o.Config = &configFlagVal.awsConfig
+	flags.Var(&configFlagVal, ProviderName+"-config",
+		"Path to json for aws configuration, defaults to predefined configuration")
 }
 
 // Provider implements the vm.Provider interface for AWS.
@@ -166,7 +193,7 @@ func (p *Provider) ConfigSSH() error {
 		return err
 	}
 
-	regions, err := p.allRegions()
+	regions, err := p.allRegions(p.opts.Config.availabilityZoneNames())
 	if err != nil {
 		return err
 	}
@@ -176,12 +203,12 @@ func (p *Provider) ConfigSSH() error {
 		// capture loop variable
 		region := r
 		g.Go(func() error {
-			exists, err := sshKeyExists(keyName, region)
+			exists, err := p.sshKeyExists(keyName, region)
 			if err != nil {
 				return err
 			}
 			if !exists {
-				err = sshKeyImport(keyName, region)
+				err = p.sshKeyImport(keyName, region)
 				if err != nil {
 					return err
 				}
@@ -202,7 +229,17 @@ func (p *Provider) Create(names []string, opts vm.CreateOpts) error {
 		return err
 	}
 
-	regions, err := p.allRegions()
+	expandedZones, err := vm.ExpandZonesFlag(p.opts.CreateZones)
+	if err != nil {
+		return err
+	}
+
+	useDefaultZones := len(expandedZones) == 0
+	if useDefaultZones {
+		expandedZones = defaultCreateZones
+	}
+
+	regions, err := p.allRegions(expandedZones)
 	if err != nil {
 		return err
 	}
@@ -210,41 +247,77 @@ func (p *Provider) Create(names []string, opts vm.CreateOpts) error {
 		return errors.Errorf("Please specify a valid region.")
 	}
 
-	// Only use one region if we're not creating a distributed cluster
-	if !opts.GeoDistributed {
-		regions = []string{regions[0]}
-	}
-
-	nodeCount := len(names)
-
-	var g errgroup.Group
-	// We're looping over regions to create all of the nodes in one region
-	// in the same iteration so they're contiguous.
-	node := 0
-	for i, region := range regions {
-		zones, err := p.allZones(region)
+	var zones []string // contains an az corresponding to each entry in names
+	if !opts.GeoDistributed && (useDefaultZones || len(expandedZones) == 1) {
+		// Only use one zone in the region if we're not creating a geo cluster.
+		regionZones, err := p.regionZones(regions[0], expandedZones)
 		if err != nil {
 			return err
 		}
-		nodesPerRegion := int(math.Ceil(float64(nodeCount-node) / float64(len(regions)-i)))
-		// We're choosing a random availability zone now which will be consistent
-		// per region.
-		availabilityZone := rand.Int31n(int32(len(zones)))
-		for j := 0; j < nodesPerRegion; j++ {
-			if node >= nodeCount {
-				break
-			}
-			capName := names[node]
-			placement := zones[availabilityZone]
-
-			g.Go(func() error {
-				return p.runInstance(capName, placement, opts)
-			})
-			node++
+		// Select a random AZ from the first region.
+		zone := regionZones[rand.Intn(len(regionZones))]
+		for range names {
+			zones = append(zones, zone)
+		}
+	} else {
+		// Distribute the nodes amongst availability zones if geo distributed.
+		nodeZones := vm.ZonePlacement(len(expandedZones), len(names))
+		zones = make([]string, len(nodeZones))
+		for i, z := range nodeZones {
+			zones[i] = expandedZones[z]
 		}
 	}
+	var g errgroup.Group
+	limiter := rate.NewLimiter(rate.Limit(p.opts.CreateRateLimit), 2 /* buckets */)
+	for i := range names {
+		capName := names[i]
+		placement := zones[i]
+		res := limiter.Reserve()
+		g.Go(func() error {
+			time.Sleep(res.Delay())
+			return p.runInstance(capName, placement, opts)
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return err
+	}
+	return p.waitForIPs(names, regions)
+}
 
-	return g.Wait()
+// waitForIPs waits until AWS reports both internal and external IP addresses
+// for all newly created VMs. If we did not wait for these IPs then attempts to
+// list the new VMs after the creation might find VMs without an external IP.
+// We do a bad job at higher layers detecting this lack of IP which can lead to
+// commands hanging indefinitely.
+func (p *Provider) waitForIPs(names []string, regions []string) error {
+	waitForIPRetry := retry.Start(retry.Options{
+		InitialBackoff: 100 * time.Millisecond,
+		MaxBackoff:     500 * time.Millisecond,
+		MaxRetries:     120, // wait a bit less than 90s for IPs
+	})
+	makeNameSet := func() map[string]struct{} {
+		m := make(map[string]struct{}, len(names))
+		for _, n := range names {
+			m[n] = struct{}{}
+		}
+		return m
+	}
+	for waitForIPRetry.Next() {
+		vms, err := p.listRegions(regions)
+		if err != nil {
+			return err
+		}
+		nameSet := makeNameSet()
+		for _, vm := range vms {
+			if vm.PublicIP != "" && vm.PrivateIP != "" {
+				delete(nameSet, vm.Name)
+			}
+		}
+		if len(nameSet) == 0 {
+			return nil
+		}
+	}
+	return fmt.Errorf("failed to retrieve IPs for all vms")
 }
 
 // Delete is part of vm.Provider.
@@ -272,7 +345,7 @@ func (p *Provider) Delete(vms vm.List) error {
 			if len(data.TerminatingInstances) > 0 {
 				_ = data.TerminatingInstances[0].InstanceID // silence unused warning
 			}
-			return runJSONCommand(args, &data)
+			return p.runJSONCommand(args, &data)
 		})
 	}
 	return g.Wait()
@@ -297,7 +370,8 @@ func (p *Provider) Extend(vms vm.List, lifetime time.Duration) error {
 		args = append(args, list.ProviderIDs()...)
 
 		g.Go(func() error {
-			return runCommand(args)
+			_, err := p.runCommand(args)
+			return err
 		})
 	}
 	return g.Wait()
@@ -307,23 +381,62 @@ func (p *Provider) Extend(vms vm.List, lifetime time.Duration) error {
 var cachedActiveAccount string
 
 // FindActiveAccount is part of the vm.Provider interface.
-// This queries the AWS command for the current IAM user.
+// This queries the AWS command for the current IAM user or role.
 func (p *Provider) FindActiveAccount() (string, error) {
 	if len(cachedActiveAccount) > 0 {
 		return cachedActiveAccount, nil
 	}
+	var account string
+	var err error
+	if p.opts.Profile == "" {
+		account, err = p.iamGetUser()
+		if err != nil {
+			return "", err
+		}
+	} else {
+		account, err = p.stsGetCallerIdentity()
+		if err != nil {
+			return "", err
+		}
+	}
+	cachedActiveAccount = account
+	return cachedActiveAccount, nil
+}
+
+// iamGetUser returns the identity of an IAM user.
+func (p *Provider) iamGetUser() (string, error) {
 	var userInfo struct {
 		User struct {
 			UserName string
 		}
 	}
 	args := []string{"iam", "get-user"}
-	err := runJSONCommand(args, &userInfo)
+	err := p.runJSONCommand(args, &userInfo)
 	if err != nil {
 		return "", err
 	}
-	cachedActiveAccount = userInfo.User.UserName
-	return cachedActiveAccount, nil
+	if userInfo.User.UserName == "" {
+		return "", errors.Errorf("username not configured. run 'aws iam get-user'")
+	}
+	return userInfo.User.UserName, nil
+}
+
+// stsGetCallerIdentity returns the identity of a user assuming a role
+// into the account.
+func (p *Provider) stsGetCallerIdentity() (string, error) {
+	var userInfo struct {
+		Arn string
+	}
+	args := []string{"sts", "get-caller-identity"}
+	err := p.runJSONCommand(args, &userInfo)
+	if err != nil {
+		return "", err
+	}
+	s := strings.Split(userInfo.Arn, "/")
+	if len(s) < 2 {
+		return "", errors.Errorf("Could not parse caller identity ARN '%s'", userInfo.Arn)
+	}
+	return s[1], nil
 }
 
 // Flags is part of the vm.Provider interface.
@@ -333,11 +446,14 @@ func (p *Provider) Flags() vm.ProviderFlags {
 
 // List is part of the vm.Provider interface.
 func (p *Provider) List() (vm.List, error) {
-	regions, err := p.allRegions()
+	regions, err := p.allRegions(p.opts.Config.availabilityZoneNames())
 	if err != nil {
 		return nil, err
 	}
+	return p.listRegions(regions)
+}
 
+func (p *Provider) listRegions(regions []string) (vm.List, error) {
 	var ret vm.List
 	var mux syncutil.Mutex
 	var g errgroup.Group
@@ -371,46 +487,38 @@ func (p *Provider) Name() string {
 
 // allRegions returns the regions that have been configured with
 // AMI and SecurityGroup instances.
-func (p *Provider) allRegions() ([]string, error) {
-	// We're using an ordered list instead of a map here to guarantee
-	// the same ordering between calls.
-	regionList, err := orderedKeyList(p.opts.AMI)
-	if err != nil {
-		return nil, err
-	}
-
-	securityMap, err := splitMap(p.opts.SecurityGroups)
-	if err != nil {
-		return nil, err
-	}
-
-	var keys []string
-	for _, region := range regionList {
-		if _, ok := securityMap[region]; ok {
-			keys = append(keys, region)
-		} else {
-			log.Printf("ignoring region %s because it has no associated SecurityGroup", region)
+func (p *Provider) allRegions(zones []string) (regions []string, err error) {
+	byName := make(map[string]struct{})
+	for _, z := range zones {
+		az := p.opts.Config.getAvailabilityZone(z)
+		if az == nil {
+			return nil, fmt.Errorf("unknown availability zone %v, please provide a "+
+				"correct value or update your config accordingly", z)
+		}
+		if _, have := byName[az.region.Name]; !have {
+			byName[az.region.Name] = struct{}{}
+			regions = append(regions, az.region.Name)
 		}
 	}
-	return keys, nil
+	return regions, nil
 }
 
-// allZones returns all AWS availability zones which have been correctly
+// regionZones returns all AWS availability zones which have been correctly
 // configured within the given region.
-func (p *Provider) allZones(region string) ([]string, error) {
-	subnetMap, err := splitMap(p.opts.Subnets)
-	if err != nil {
-		return nil, err
+func (p *Provider) regionZones(region string, allZones []string) (zones []string, _ error) {
+	r := p.opts.Config.getRegion(region)
+	if r == nil {
+		return nil, fmt.Errorf("region %s not found", region)
 	}
-
-	var ret []string
-	for zone := range subnetMap {
-		if strings.Index(zone, region) == 0 && len(zone) == len(region)+1 {
-			ret = append(ret, zone)
+	for _, z := range allZones {
+		for _, az := range r.AvailabilityZones {
+			if az.name == z {
+				zones = append(zones, z)
+				break
+			}
 		}
 	}
-
-	return ret, nil
+	return zones, nil
 }
 
 // listRegion extracts the roachprod-managed instances in the
@@ -445,7 +553,7 @@ func (p *Provider) listRegion(region string) (vm.List, error) {
 		"ec2", "describe-instances",
 		"--region", region,
 	}
-	err := runJSONCommand(args, &data)
+	err := p.runJSONCommand(args, &data)
 	if err != nil {
 		return nil, err
 	}
@@ -514,18 +622,27 @@ func (p *Provider) listRegion(region string) (vm.List, error) {
 // we need to do a bit of work to look up all of the various ids that
 // we need in order to actually allocate an instance.
 func (p *Provider) runInstance(name string, zone string, opts vm.CreateOpts) error {
-	region, err := zoneToRegion(zone)
-	if err != nil {
-		return err
+	// There exist different flags to control the machine type when ssd is true.
+	// This enables sane defaults for either setting but the behavior can be
+	// confusing when a user attempts to use `--aws-machine-type` and the command
+	// succeeds but the flag is ignored. Rather than permit this behavior we
+	// return an error instructing the user to use the other flag.
+	if opts.SSDOpts.UseLocalSSD &&
+		p.opts.MachineType != defaultMachineType &&
+		p.opts.SSDMachineType == defaultSSDMachineType {
+		return errors.Errorf("use the --aws-machine-type-ssd flag to set the " +
+			"machine type when --local-ssd=true")
+	} else if !opts.SSDOpts.UseLocalSSD &&
+		p.opts.MachineType == defaultMachineType &&
+		p.opts.SSDMachineType != defaultSSDMachineType {
+		return errors.Errorf("use the --aws-machine-type flag to set the " +
+			"machine type when --local-ssd=false")
 	}
 
-	amiMap, err := splitMap(p.opts.AMI)
-	if err != nil {
-		return err
-	}
-	amiID, ok := amiMap[region]
+	az, ok := p.opts.Config.azByName[zone]
 	if !ok {
-		return errors.Errorf("could not find an AMI image id for region %s", region)
+		return fmt.Errorf("no region in %v corresponds to availability zone %v",
+			p.opts.Config.regionNames(), zone)
 	}
 
 	keyName, err := p.sshKeyName()
@@ -540,23 +657,7 @@ func (p *Provider) runInstance(name string, zone string, opts vm.CreateOpts) err
 		machineType = p.opts.MachineType
 	}
 
-	sgMap, err := splitMap(p.opts.SecurityGroups)
-	if err != nil {
-		return err
-	}
-	sgID, ok := sgMap[region]
-	if !ok {
-		return errors.Errorf("could not find a security group id for region %s", region)
-	}
-
-	subnetMap, err := splitMap(p.opts.Subnets)
-	if err != nil {
-		return err
-	}
-	subnetID, ok := subnetMap[zone]
-	if !ok {
-		return errors.Errorf("could not find a subnet id for zone %s", zone)
-	}
+	cpuOptions := p.opts.CPUOptions
 
 	// We avoid the need to make a second call to set the tags by jamming
 	// all of our metadata into the TagSpec.
@@ -585,26 +686,37 @@ func (p *Provider) runInstance(name string, zone string, opts vm.CreateOpts) err
 			extraMountOpts = "nobarrier"
 		}
 	}
-	filename, err := writeStartupScript(extraMountOpts)
+	filename, err := writeStartupScript(extraMountOpts, p.opts.UseMultipleDisks)
 	if err != nil {
-		return errors.Wrapf(err, "could not write GCE startup script to temp file")
+		return errors.Wrapf(err, "could not write AWS startup script to temp file")
 	}
 	defer func() {
 		_ = os.Remove(filename)
 	}()
 
+	withFlagOverride := func(cfg string, fl *string) string {
+		if *fl == "" {
+			return cfg
+		}
+		return *fl
+	}
+
 	args := []string{
 		"ec2", "run-instances",
 		"--associate-public-ip-address",
 		"--count", "1",
-		"--image-id", amiID,
 		"--instance-type", machineType,
+		"--image-id", withFlagOverride(az.region.AMI, &p.opts.ImageAMI),
 		"--key-name", keyName,
-		"--region", region,
-		"--security-group-ids", sgID,
-		"--subnet-id", subnetID,
+		"--region", az.region.Name,
+		"--security-group-ids", az.region.SecurityGroup,
+		"--subnet-id", az.subnetID,
 		"--tag-specifications", tagSpecs,
 		"--user-data", "file://" + filename,
+	}
+
+	if cpuOptions != "" {
+		args = append(args, "--cpu-options", cpuOptions)
 	}
 
 	// The local NVMe devices are automatically mapped.  Otherwise, we need to map an EBS data volume.
@@ -614,7 +726,7 @@ func (p *Provider) runInstance(name string, zone string, opts vm.CreateOpts) err
 		case "gp2":
 			ebsParams = fmt.Sprintf("{VolumeSize=%d,VolumeType=%s,DeleteOnTermination=true}",
 				p.opts.EBSVolumeSize, t)
-		case "io1":
+		case "io1", "io2":
 			ebsParams = fmt.Sprintf("{VolumeSize=%d,VolumeType=%s,Iops=%d,DeleteOnTermination=true}",
 				p.opts.EBSVolumeSize, t, p.opts.EBSProvisionedIOPs)
 		default:
@@ -626,6 +738,10 @@ func (p *Provider) runInstance(name string, zone string, opts vm.CreateOpts) err
 			"DeviceName=/dev/sdd,Ebs="+ebsParams,
 		)
 	}
+	return p.runJSONCommand(args, &data)
+}
 
-	return runJSONCommand(args, &data)
+// Active is part of the vm.Provider interface.
+func (p *Provider) Active() bool {
+	return true
 }

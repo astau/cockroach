@@ -1,27 +1,23 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package optbuilder
 
 import (
-	"fmt"
-
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 // analyzeOrderBy analyzes an Ordering physical property from the ORDER BY
@@ -40,8 +36,8 @@ func (b *Builder) analyzeOrderBy(
 	// semaCtx in case we are recursively called within a subquery
 	// context.
 	defer b.semaCtx.Properties.Restore(b.semaCtx.Properties)
-	b.semaCtx.Properties.Require("ORDER BY", tree.RejectGenerators)
-	inScope.context = "ORDER BY"
+	b.semaCtx.Properties.Require(exprKindOrderBy.String(), tree.RejectGenerators)
+	inScope.context = exprKindOrderBy
 
 	for i := range orderBy {
 		b.analyzeOrderByArg(orderBy[i], inScope, projectionsScope, orderByScope)
@@ -94,17 +90,22 @@ func (b *Builder) findIndexByName(table cat.Table, name tree.UnrestrictedName) (
 		}
 	}
 
-	return nil, fmt.Errorf(`index %q not found`, name)
+	return nil, pgerror.Newf(pgcode.UndefinedObject,
+		`index %q not found`, name)
 }
 
-// addExtraColumn builds extraCol.expr as a column in extraColsScope; if it is
+// addOrderByOrDistinctOnColumn builds extraCol.expr as a column in extraColsScope; if it is
 // already projected in projectionsScope then that projection is re-used.
-func (b *Builder) addExtraColumn(
+func (b *Builder) addOrderByOrDistinctOnColumn(
 	inScope, projectionsScope, extraColsScope *scope, extraCol *scopeColumn,
 ) {
-	// Use an existing projection if possible. Otherwise, build a new
+	// Use an existing projection if possible (even if it has side-effects; see
+	// the SQL99 rules described in analyzeExtraArgument). Otherwise, build a new
 	// projection.
-	if col := projectionsScope.findExistingCol(extraCol.getExpr()); col != nil {
+	if col := projectionsScope.findExistingCol(
+		extraCol.getExpr(),
+		true, /* allowSideEffects */
+	); col != nil {
 		extraCol.id = col.id
 	} else {
 		b.buildScalar(extraCol.getExpr(), inScope, extraColsScope, extraCol, nil)
@@ -116,11 +117,16 @@ func (b *Builder) addExtraColumn(
 func (b *Builder) analyzeOrderByIndex(
 	order *tree.Order, inScope, projectionsScope, orderByScope *scope,
 ) {
-	tab := b.resolveTable(&order.Table, privilege.SELECT)
+	tab, tn := b.resolveTable(&order.Table, privilege.SELECT)
 	index, err := b.findIndexByName(tab, order.Index)
 	if err != nil {
-		panic(builderError{err})
+		panic(err)
 	}
+
+	// We fully qualify the table name in case another table expression was
+	// aliased to the same name as an existing table.
+	tn.ExplicitCatalog = true
+	tn.ExplicitSchema = true
 
 	// Append each key column from the index (including the implicit primary key
 	// columns) to the ordering scope.
@@ -138,7 +144,7 @@ func (b *Builder) analyzeOrderByIndex(
 			desc = !desc
 		}
 
-		colItem := tree.NewColumnItem(tab.Name(), col.Column.ColName())
+		colItem := tree.NewColumnItem(&tn, col.ColName())
 		expr := inScope.resolveType(colItem, types.Any)
 		outCol := b.addColumn(orderByScope, "" /* alias */, expr)
 		outCol.descending = desc
@@ -172,7 +178,7 @@ func (b *Builder) buildOrderByArg(
 	inScope, projectionsScope, orderByScope *scope, orderByCol *scopeColumn,
 ) {
 	// Build the ORDER BY column.
-	b.addExtraColumn(inScope, projectionsScope, orderByScope, orderByCol)
+	b.addOrderByOrDistinctOnColumn(inScope, projectionsScope, orderByScope, orderByCol)
 
 	// Add the new column to the ordering.
 	orderByScope.ordering = append(orderByScope.ordering,
@@ -225,12 +231,12 @@ func (b *Builder) analyzeExtraArgument(
 	//    e.g. SELECT a, b FROM t ORDER by a+b
 
 	// First, deal with projection aliases.
-	idx := colIdxByProjectionAlias(expr, inScope.context, projectionsScope)
+	idx := colIdxByProjectionAlias(expr, inScope.context.String(), projectionsScope)
 
 	// If the expression does not refer to an alias, deal with
 	// column ordinals.
 	if idx == -1 {
-		idx = colIndex(len(projectionsScope.cols), expr, inScope.context)
+		idx = colIndex(len(projectionsScope.cols), expr, inScope.context.String())
 	}
 
 	var exprs tree.TypedExprs
@@ -251,7 +257,9 @@ func (b *Builder) analyzeExtraArgument(
 }
 
 func ensureColumnOrderable(e tree.TypedExpr) {
-	if _, ok := e.ResolvedType().(types.TArray); ok || e.ResolvedType() == types.JSON {
-		panic(unimplementedf("can't order by column type %s", e.ResolvedType()))
+	typ := e.ResolvedType()
+	if typ.Family() == types.JsonFamily ||
+		(typ.Family() == types.ArrayFamily && typ.ArrayContents().Family() == types.JsonFamily) {
+		panic(unimplementedWithIssueDetailf(35706, "", "can't order by column type jsonb"))
 	}
 }

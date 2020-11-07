@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package ordering
 
@@ -26,7 +22,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/testcat"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/util"
 )
 
 func TestScan(t *testing.T) {
@@ -38,9 +33,10 @@ func TestScan(t *testing.T) {
 	}
 	evalCtx := tree.NewTestingEvalContext(nil /* st */)
 	var f norm.Factory
-	f.Init(evalCtx)
+	f.Init(evalCtx, tc)
 	md := f.Metadata()
-	tab := md.AddTable(tc.Table(tree.NewUnqualifiedTableName("t")))
+	tn := tree.NewUnqualifiedTableName("t")
+	tab := md.AddTable(tc.Table(tn), tn)
 
 	if c1 := tab.ColumnID(0); c1 != 1 {
 		t.Fatalf("unexpected ID for column c1: %d\n", c1)
@@ -77,7 +73,7 @@ func TestScan(t *testing.T) {
 			p: memo.ScanPrivate{
 				Table: tab,
 				Index: cat.PrimaryIndex,
-				Cols:  util.MakeFastIntSet(1, 2, 3, 4),
+				Cols:  opt.MakeColSet(1, 2, 3, 4),
 			},
 			cases: []testCase{
 				{req: "", exp: "fwd", prov: ""},               // case 1
@@ -96,7 +92,7 @@ func TestScan(t *testing.T) {
 			p: memo.ScanPrivate{
 				Table: tab,
 				Index: 1,
-				Cols:  util.MakeFastIntSet(1, 2, 3, 4),
+				Cols:  opt.MakeColSet(1, 2, 3, 4),
 			},
 			cases: []testCase{
 				{req: "", exp: "fwd", prov: ""},                          // case 1
@@ -115,7 +111,7 @@ func TestScan(t *testing.T) {
 			p: memo.ScanPrivate{
 				Table:     tab,
 				Index:     cat.PrimaryIndex,
-				Cols:      util.MakeFastIntSet(1, 2, 3, 4),
+				Cols:      opt.MakeColSet(1, 2, 3, 4),
 				HardLimit: +10,
 			},
 			cases: []testCase{
@@ -135,7 +131,7 @@ func TestScan(t *testing.T) {
 			p: memo.ScanPrivate{
 				Table:     tab,
 				Index:     cat.PrimaryIndex,
-				Cols:      util.MakeFastIntSet(1, 2, 3, 4),
+				Cols:      opt.MakeColSet(1, 2, 3, 4),
 				HardLimit: -10,
 			},
 			cases: []testCase{
@@ -155,7 +151,7 @@ func TestScan(t *testing.T) {
 			p: memo.ScanPrivate{
 				Table:      tab,
 				Index:      1,
-				Cols:       util.MakeFastIntSet(1, 2, 3, 4),
+				Cols:       opt.MakeColSet(1, 2, 3, 4),
 				Constraint: &c,
 			},
 			cases: []testCase{

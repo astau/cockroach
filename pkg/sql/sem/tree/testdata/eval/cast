@@ -378,6 +378,11 @@ eval
 'he'
 
 eval
+'a🐛b🏠c'::char(3)
+----
+e'a\U0001F41Bb'
+
+eval
 'hello'::bytes
 ----
 '\x68656c6c6f'
@@ -435,6 +440,11 @@ eval
 '2010-09-28'
 
 eval
+'1969-12-30 01:00:00'::timestamp::date
+----
+'1969-12-30'
+
+eval
 time '12:00:00'
 ----
 '12:00:00'
@@ -455,19 +465,44 @@ eval
 '12:00:00'
 
 eval
+timetz '12:00:00'
+----
+'12:00:00+00:00:00'
+
+eval
+timetz '12:00:00+01'
+----
+'12:00:00+01:00:00'
+
+eval
+CAST('12:00:00+01' AS timetz)
+----
+'12:00:00+01:00:00'
+
+eval
+'12:00:00+01'::timetz
+----
+'12:00:00+01:00:00'
+
+eval
+'12:00:00+01'::timetz::text
+----
+'12:00:00+01:00:00'
+
+eval
 timestamp '2010-09-28'
 ----
-'2010-09-28 00:00:00+00:00'
+'2010-09-28 00:00:00'
 
 eval
 CAST('2010-09-28' AS timestamp)
 ----
-'2010-09-28 00:00:00+00:00'
+'2010-09-28 00:00:00'
 
 eval
 '2010-09-28'::timestamp
 ----
-'2010-09-28 00:00:00+00:00'
+'2010-09-28 00:00:00'
 
 eval
 timestamptz '2010-09-28'
@@ -492,57 +527,77 @@ eval
 eval
 '2010-09-28 12:00:00.1'::timestamp
 ----
-'2010-09-28 12:00:00.1+00:00'
+'2010-09-28 12:00:00.1'
 
 eval
 '2010-09-28 12:00:00.1+02:00'::timestamp
 ----
-'2010-09-28 12:00:00.1+00:00'
+'2010-09-28 12:00:00.1'
 
 eval
 '2010-09-28 12:00:00.524000 +02:00:00'::timestamp
 ----
-'2010-09-28 12:00:00.524+00:00'
+'2010-09-28 12:00:00.524'
 
 eval
 '2010-09-28 12:00:00.1-07:00'::timestamp
 ----
-'2010-09-28 12:00:00.1+00:00'
+'2010-09-28 12:00:00.1'
 
 eval
 '2010-09-28T12:00:00'::timestamp
 ----
-'2010-09-28 12:00:00+00:00'
+'2010-09-28 12:00:00'
 
 eval
 '2010-09-28T12:00:00Z'::timestamp
 ----
-'2010-09-28 12:00:00+00:00'
+'2010-09-28 12:00:00'
 
 eval
 '2010-09-28T12:00:00.1'::timestamp
 ----
-'2010-09-28 12:00:00.1+00:00'
+'2010-09-28 12:00:00.1'
 
 eval
 ('2010-09-28'::date)::timestamp
 ----
-'2010-09-28 00:00:00+00:00'
+'2010-09-28 00:00:00'
 
 eval
 '2010-09-28 12:00:00.1-04'::timestamp
 ----
-'2010-09-28 12:00:00.1+00:00'
+'2010-09-28 12:00:00.1'
 
 eval
 '2010-09-28 12:00:00.1-04'::timestamp::text
 ----
-'2010-09-28 12:00:00.1+00:00'
+'2010-09-28 12:00:00.1'
 
 eval
 '2010-09-28 12:00:00.1-04'::timestamptz::text
 ----
-'2010-09-28 12:00:00.1-04:00'
+'2010-09-28 16:00:00.1+00:00'
+
+eval
+'1969-12-30-01.00.00'::timestamp
+----
+'1969-12-30 01:00:00'
+
+eval
+'1969-12-30 01.00.00'::timestamp
+----
+'1969-12-30 01:00:00'
+
+eval
+'1969-12-30 01.00.00.12300'::timestamp
+----
+'1969-12-30 01:00:00.123'
+
+eval
+'1969-12-30-01.00.00.'::timestamp
+----
+'1969-12-30 01:00:00'
 
 eval
 '12h2m1s23ms'::interval
@@ -553,6 +608,26 @@ eval
 '12h2m1s23ms'::interval::text
 ----
 '12:02:01.023'
+
+eval
+'12:01:02.123456789'::interval::text
+----
+'12:01:02.123457'
+
+eval
+'12:01:02.1234564'::interval
+----
+'12:01:02.123456'
+
+eval
+'12:01:02.1234565'::interval
+----
+'12:01:02.123457'
+
+eval
+'12:01:02.1234566'::interval
+----
+'12:01:02.123457'
 
 eval
 interval '1'
@@ -578,6 +653,46 @@ eval
 (1::interval)::interval
 ----
 '00:00:01'
+
+eval
+'00:00:01.123456'::interval::interval(3)
+----
+'00:00:01.123'
+
+eval
+'00:00:01.123'::interval::interval(3)
+----
+'00:00:01.123'
+
+eval
+'00:00:01.123456'::interval::interval second(3)
+----
+'00:00:01.123'
+
+eval
+'00:00:01.123'::interval::interval second(3)
+----
+'00:00:01.123'
+
+eval
+'00:02:01.123456'::interval::interval minute
+----
+'00:02:00'
+
+eval
+'00:02:01.123456'::interval minute
+----
+'00:02:00'
+
+eval
+interval '1 year 1 day 02:03:04.567'::int
+----
+31651384
+
+eval
+interval '1 year 1 day 02:03:04.567'::float
+----
+3.1651384567e+07
 
 eval
 '2010-09-28'::date + 3
@@ -617,47 +732,47 @@ eval
 eval
 '2010-09-28 12:00:00.1-04:00'::timestamp + '12h2m'::interval
 ----
-'2010-09-29 00:02:00.1+00:00'
+'2010-09-29 00:02:00.1'
 
 eval
 '12h2m'::interval + '2010-09-28 12:00:00.1-04:00'::timestamp
 ----
-'2010-09-29 00:02:00.1+00:00'
+'2010-09-29 00:02:00.1'
 
 eval
 '12 hours 2 minutes'::interval + '2010-09-28 12:00:00.1-04:00'::timestamp
 ----
-'2010-09-29 00:02:00.1+00:00'
+'2010-09-29 00:02:00.1'
 
 eval
 'PT12H2M'::interval + '2010-09-28 12:00:00.1-04:00'::timestamp
 ----
-'2010-09-29 00:02:00.1+00:00'
+'2010-09-29 00:02:00.1'
 
 eval
 '12:2'::interval + '2010-09-28 12:00:00.1-04:00'::timestamp
 ----
-'2010-09-29 00:02:00.1+00:00'
+'2010-09-29 00:02:00.1'
 
 eval
 '2010-09-28 12:00:00.1-04:00'::timestamp - '12h2m'::interval
 ----
-'2010-09-27 23:58:00.1+00:00'
+'2010-09-27 23:58:00.1'
 
 eval
 '2010-09-28 12:00:00.1-04:00'::timestamp - '12 hours 2 minutes'::interval
 ----
-'2010-09-27 23:58:00.1+00:00'
+'2010-09-27 23:58:00.1'
 
 eval
 '2010-09-28 12:00:00.1-04:00'::timestamp - 'PT12H2M'::interval
 ----
-'2010-09-27 23:58:00.1+00:00'
+'2010-09-27 23:58:00.1'
 
 eval
 '2010-09-28 12:00:00.1-04:00'::timestamp - '12:2'::interval
 ----
-'2010-09-27 23:58:00.1+00:00'
+'2010-09-27 23:58:00.1'
 
 eval
 '2010-09-28 12:00:00.1-04:00'::timestamp - '2010-09-28 12:00:00.1+00:00'::timestamp
@@ -688,12 +803,12 @@ eval
 eval
 '1970-01-01 00:01:00.1-01:00'::timestamptz::timestamp
 ----
-'1970-01-01 01:01:00.1+00:00'
+'1970-01-01 01:01:00.1'
 
 eval
 '1970-01-01 00:01:00.1-01:00'::timestamp
 ----
-'1970-01-01 00:01:00.1+00:00'
+'1970-01-01 00:01:00.1'
 
 eval
 '1970-01-10'::date::int
@@ -701,17 +816,17 @@ eval
 9
 
 eval
-'2h3s4us5ns'::interval::int
+'2h3s4us'::interval::int
 ----
 7203
 
 eval
-'2h3s4us5ns'::interval::int::interval
+'2h3s4us'::interval::int::interval
 ----
 '02:00:03'
 
 eval
-'-2h-3s-4us-5ns'::interval::int::interval
+'-2h-3s-4us'::interval::int::interval
 ----
 '-02:00:03'
 
@@ -735,30 +850,6 @@ eval
 ----
 '-1 mons -2 days -03:00:04'
 
-# MaxInt64
-eval
-9223372036854775807::int::interval::int
-----
-9223372036854775807
-
-# MinInt64
-eval
-(-9223372036854775808)::int::interval::int
-----
--9223372036854775808
-
-# MaxInt64
-eval
-'296533308798y20d15h30m7s'::interval::int::interval
-----
-'296533308798 years 20 days 15:30:07'
-
-# MinInt64
-eval
-'-296533308798y-20d-15h-30m-8s'::interval::int::interval
-----
-'-296533308798 years -20 days -15:30:08'
-
 eval
 '1970-01-01 00:01:00.123456-00:00'::timestamp::decimal
 ----
@@ -775,68 +866,68 @@ eval
 9
 
 eval
-'2h3s4us5ns'::interval::decimal
+'2h3s4us'::interval::decimal
 ----
-7203.000004005
+7203.000004000
 
 eval
 7203.000004005::decimal::interval
 ----
-'02:00:03.000004005'
+'02:00:03.000004'
 
 eval
-'2h3s4us5ns'::interval::decimal::interval
+'2h3s4us'::interval::decimal::interval
 ----
-'02:00:03.000004005'
+'02:00:03.000004'
 
 eval
-'-2h-3s-4us-5ns'::interval::decimal::interval
+'-2h-3s-4us'::interval::decimal::interval
 ----
-'-02:00:03.000004005'
+'-02:00:03.000004'
 
 eval
-'1mon2d3h4s5us6ns'::interval::decimal
+'1mon2d3h4s5us'::interval::decimal
 ----
-2775604.000005006
+2775604.000005000
 
 eval
-'1mon2d3h4s5us6ns'::interval::decimal::interval
+'1mon2d3h4s5us'::interval::decimal::interval
 ----
-'1 mon 2 days 03:00:04.000005006'
+'1 mon 2 days 03:00:04.000005'
 
 eval
 (-2775604.000005006)::decimal::interval
 ----
-'-1 mons -2 days -03:00:04.000005006'
+'-1 mons -2 days -03:00:04.000005'
 
 eval
-'-1mon-2d-3h-4s-5us-6ns'::interval::decimal::interval
+'-1mon-2d-3h-4s-5us'::interval::decimal::interval
 ----
-'-1 mons -2 days -03:00:04.000005006'
+'-1 mons -2 days -03:00:04.000005'
 
 # MaxInt64
 eval
 (decimal '9223372036854775807.000000001')::interval::decimal
 ----
-9223372036854775807.000000001
+9223372036854775807.000000000
 
 # MinInt64
 eval
 (decimal '-9223372036854775808.000000001')::interval::decimal
 ----
--9223372036854775808.000000001
+-9223372036854775808.000000000
 
 # MaxInt64
 eval
-'296533308798y20d15h30m7s1ns'::interval::decimal::interval
+'296533308798y20d15h30m7s'::interval::decimal::interval
 ----
-'296533308798 years 20 days 15:30:07.000000001'
+'296533308798 years 20 days 15:30:07'
 
 # MinInt64
 eval
-'-296533308798y-20d-15h-30m-8s-1ns'::interval::decimal::interval
+'-296533308798y-20d-15h-30m-8s'::interval::decimal::interval
 ----
-'-296533308798 years -20 days -15:30:08.000000001'
+'-296533308798 years -20 days -15:30:08'
 
 eval
 '1970-01-01 00:01:00.123456-00:00'::timestamp::float
@@ -854,14 +945,14 @@ eval
 9.0
 
 eval
-'2h3s4us5ns'::interval::float
+'2h3s4us'::interval::float
 ----
-7203.000004005
+7203.000004
 
 eval
-'2h3s4us5ns'::interval::float::interval
+'2h3s4us'::interval::float::interval
 ----
-'02:00:03.000004005'
+'02:00:03.000004'
 
 eval
 '1mon2d3h4s5us'::interval::float
@@ -871,17 +962,17 @@ eval
 eval
 '1mon2d3h4s5us'::interval::float::interval
 ----
-'1 mon 2 days 03:00:04.000004999'
+'1 mon 2 days 03:00:04.000005'
 
 eval
 (-2775604.000005006)::float::interval
 ----
-'-1 mons -2 days -03:00:04.000005005'
+'-1 mons -2 days -03:00:04.000005'
 
 eval
-'-1mon-2d-3h-4s-5us-6ns'::interval::float::interval
+'-1mon-2d-3h-4s-5us'::interval::float::interval
 ----
-'-1 mons -2 days -03:00:04.000005005'
+'-1 mons -2 days -03:00:04.000005'
 
 eval
 10::int::date
@@ -891,7 +982,7 @@ eval
 eval
 10::int::timestamp
 ----
-'1970-01-01 00:00:10+00:00'
+'1970-01-01 00:00:10'
 
 eval
 10::int::timestamptz
@@ -936,7 +1027,7 @@ ARRAY[1.2,2.4,3.5]
 eval
 ARRAY[19620326,19931223]::timestamp[]
 ----
-ARRAY['1970-08-16 02:05:26+00:00','1970-08-19 16:27:03+00:00']
+ARRAY['1970-08-16 02:05:26','1970-08-19 16:27:03']
 
 eval
 ARRAY[1.2,2.4,3.5]::decimal[]::float[]
@@ -957,3 +1048,87 @@ eval
 ARRAY['hello','world']::char(2)[]
 ----
 ARRAY['he','wo']
+
+eval
+ARRAY['a🐛b🏠c','def']::char(2)[]
+----
+ARRAY[e'a\U0001F41B','de']
+
+# regression for #45850
+eval
+cast(B'11011' || B'00' as bit varying(8))
+----
+B'1101100'
+
+eval
+cast(B'11011' || B'00' as bit varying(6))
+----
+B'110110'
+
+eval
+cast(B'11011' || B'00' as bit(8))
+----
+B'11011000'
+
+eval
+cast(B'11011' || B'00' as bit(6))
+----
+B'110110'
+
+eval
+'0101000000000000000000F03F000000000000F03F'::geography::geometry
+----
+'0101000020E6100000000000000000F03F000000000000F03F'
+
+eval
+'0101000000000000000000F03F000000000000F03F'::geometry::geography
+----
+'0101000020E6100000000000000000F03F000000000000F03F'
+
+# Test that decimals are correctly cast when the original value is negative.
+eval
+'-2020-10-10'::timestamp::decimal
+----
+-125887824000.000000
+
+eval
+'-2020-10-10-2020 10:10:00.11111111111111111'::timestamptz::decimal
+----
+-125887714199.888889
+
+eval
+'-10'::interval::decimal
+----
+-10.000000000
+
+eval
+'{hello,a🐛b🏠c}'::VARCHAR(2)[]
+----
+ARRAY['he',e'a\U0001F41B']
+
+# Test the same cast, but not with a literal constant (see #50132).
+eval
+('{he' || ',a🐛b🏠}')::VARCHAR(2)[]
+----
+ARRAY['he',e'a\U0001F41B']
+
+# Chars should truncate trailing space characters.
+eval
+'hello '::char(100)
+----
+'hello'
+
+eval
+'hello t'::char(100)
+----
+'hello t'
+
+eval
+'hello '::string::char(100)
+----
+'hello'
+
+eval
+'hello t'::string::char(100)
+----
+'hello t'

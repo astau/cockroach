@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 import _ from "lodash";
 import { combineReducers } from "redux";
@@ -230,6 +226,16 @@ export const settingsReducerObj = new CachedDataReducer(
 );
 export const refreshSettings = settingsReducerObj.refresh;
 
+export const sessionsReducerObj = new CachedDataReducer(
+  api.getSessions,
+  "sessions",
+  // The sessions page is a real time view, so need a fairly quick update pace.
+  moment.duration(10, "s"),
+  moment.duration(1, "m"),
+);
+export const invalidateSessions = sessionsReducerObj.invalidateData;
+export const refreshSessions = sessionsReducerObj.refresh;
+
 export const storesRequestKey = (req: api.StoresRequestMessage): string =>
   _.isEmpty(req.node_id) ? "none" : req.node_id;
 
@@ -250,12 +256,24 @@ const queriesReducerObj = new CachedDataReducer(
 );
 export const refreshStatements = queriesReducerObj.refresh;
 
+const statementDiagnosticsReportsReducerObj = new CachedDataReducer(
+  api.getStatementDiagnosticsReports,
+  "statementDiagnosticsReports",
+  moment.duration(5, "m"),
+  moment.duration(1, "m"),
+);
+export const refreshStatementDiagnosticsRequests = statementDiagnosticsReportsReducerObj.refresh;
+export const invalidateStatementDiagnosticsRequests = statementDiagnosticsReportsReducerObj.invalidateData;
+
 const dataDistributionReducerObj = new CachedDataReducer(
   api.getDataDistribution,
   "dataDistribution",
   moment.duration(1, "m"),
 );
 export const refreshDataDistribution = dataDistributionReducerObj.refresh;
+
+const metricMetadataReducerObj = new CachedDataReducer(api.getAllMetricMetadata, "metricMetadata");
+export const refreshMetricMetadata = metricMetadataReducerObj.refresh;
 
 export interface APIReducersState {
   cluster: CachedDataReducerState<api.ClusterResponseMessage>;
@@ -279,10 +297,13 @@ export interface APIReducersState {
   range: KeyedCachedDataReducerState<api.RangeResponseMessage>;
   allocatorRange: KeyedCachedDataReducerState<api.AllocatorRangeResponseMessage>;
   rangeLog: KeyedCachedDataReducerState<api.RangeLogResponseMessage>;
+  sessions: CachedDataReducerState<api.SessionsResponseMessage>;
   settings: CachedDataReducerState<api.SettingsResponseMessage>;
   stores: KeyedCachedDataReducerState<api.StoresResponseMessage>;
   statements: CachedDataReducerState<api.StatementsResponseMessage>;
   dataDistribution: CachedDataReducerState<api.DataDistributionResponseMessage>;
+  metricMetadata: CachedDataReducerState<api.MetricMetadataResponseMessage>;
+  statementDiagnosticsReports: CachedDataReducerState<api.StatementDiagnosticsReportsResponseMessage>;
 }
 
 export const apiReducersReducer = combineReducers<APIReducersState>({
@@ -308,9 +329,12 @@ export const apiReducersReducer = combineReducers<APIReducersState>({
   [allocatorRangeReducerObj.actionNamespace]: allocatorRangeReducerObj.reducer,
   [rangeLogReducerObj.actionNamespace]: rangeLogReducerObj.reducer,
   [settingsReducerObj.actionNamespace]: settingsReducerObj.reducer,
+  [sessionsReducerObj.actionNamespace]: sessionsReducerObj.reducer,
   [storesReducerObj.actionNamespace]: storesReducerObj.reducer,
   [queriesReducerObj.actionNamespace]: queriesReducerObj.reducer,
   [dataDistributionReducerObj.actionNamespace]: dataDistributionReducerObj.reducer,
+  [metricMetadataReducerObj.actionNamespace]: metricMetadataReducerObj.reducer,
+  [statementDiagnosticsReportsReducerObj.actionNamespace]: statementDiagnosticsReportsReducerObj.reducer,
 });
 
 export { CachedDataReducerState, KeyedCachedDataReducerState };

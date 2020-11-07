@@ -1,24 +1,23 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package opt
 
 import (
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 // Operator describes the type of operation that a memo expression performs.
@@ -84,13 +83,21 @@ type Expr interface {
 	String() string
 }
 
+// ScalarID is the type of the memo-unique identifier given to every scalar
+// expression.
+type ScalarID int
+
 // ScalarExpr is a scalar expression, which is an expression that returns a
 // primitive-typed value like boolean or string rather than rows and columns.
 type ScalarExpr interface {
 	Expr
 
+	// ID is a unique (within the context of a memo) ID that can be
+	// used to define a total order over ScalarExprs.
+	ID() ScalarID
+
 	// DataType is the SQL type of the expression.
-	DataType() types.T
+	DataType() *types.T
 }
 
 // MutableExpr is implemented by expressions that allow their children to be
@@ -132,6 +139,9 @@ var ComparisonOpReverseMap = map[Operator]tree.ComparisonOperator{
 	JsonExistsOp:     tree.JSONExists,
 	JsonSomeExistsOp: tree.JSONSomeExists,
 	JsonAllExistsOp:  tree.JSONAllExists,
+	OverlapsOp:       tree.Overlaps,
+	BBoxCoversOp:     tree.RegMatch,
+	BBoxIntersectsOp: tree.Overlaps,
 }
 
 // BinaryOpReverseMap maps from an optimizer operator type to a semantic tree
@@ -161,6 +171,8 @@ var BinaryOpReverseMap = map[Operator]tree.BinaryOperator{
 var UnaryOpReverseMap = map[Operator]tree.UnaryOperator{
 	UnaryMinusOp:      tree.UnaryMinus,
 	UnaryComplementOp: tree.UnaryComplement,
+	UnarySqrtOp:       tree.UnarySqrt,
+	UnaryCbrtOp:       tree.UnaryCbrt,
 }
 
 // AggregateOpReverseMap maps from an optimizer operator type to the name of an
@@ -168,11 +180,16 @@ var UnaryOpReverseMap = map[Operator]tree.UnaryOperator{
 var AggregateOpReverseMap = map[Operator]string{
 	ArrayAggOp:        "array_agg",
 	AvgOp:             "avg",
+	BitAndAggOp:       "bit_and",
+	BitOrAggOp:        "bit_or",
 	BoolAndOp:         "bool_and",
 	BoolOrOp:          "bool_or",
 	ConcatAggOp:       "concat_agg",
 	CountOp:           "count",
+	CorrOp:            "corr",
 	CountRowsOp:       "count_rows",
+	CovarPopOp:        "covar_pop",
+	CovarSampOp:       "covar_samp",
 	MaxOp:             "max",
 	MinOp:             "min",
 	SumIntOp:          "sum_int",
@@ -183,10 +200,36 @@ var AggregateOpReverseMap = map[Operator]string{
 	XorAggOp:          "xor_agg",
 	JsonAggOp:         "json_agg",
 	JsonbAggOp:        "jsonb_agg",
+	JsonObjectAggOp:   "json_object_agg",
+	JsonbObjectAggOp:  "jsonb_object_agg",
 	StringAggOp:       "string_agg",
 	ConstAggOp:        "any_not_null",
 	ConstNotNullAggOp: "any_not_null",
 	AnyNotNullAggOp:   "any_not_null",
+	PercentileDiscOp:  "percentile_disc_impl",
+	PercentileContOp:  "percentile_cont_impl",
+	VarPopOp:          "var_pop",
+	StdDevPopOp:       "stddev_pop",
+	STMakeLineOp:      "st_makeline",
+	STUnionOp:         "st_union",
+	STCollectOp:       "st_collect",
+	STExtentOp:        "st_extent",
+}
+
+// WindowOpReverseMap maps from an optimizer operator type to the name of a
+// window function.
+var WindowOpReverseMap = map[Operator]string{
+	RankOp:        "rank",
+	RowNumberOp:   "row_number",
+	DenseRankOp:   "dense_rank",
+	PercentRankOp: "percent_rank",
+	CumeDistOp:    "cume_dist",
+	NtileOp:       "ntile",
+	LagOp:         "lag",
+	LeadOp:        "lead",
+	FirstValueOp:  "first_value",
+	LastValueOp:   "last_value",
+	NthValueOp:    "nth_value",
 }
 
 // NegateOpMap maps from a comparison operator type to its negated operator
@@ -215,6 +258,21 @@ var NegateOpMap = map[Operator]Operator{
 	IsNotOp:        IsOp,
 }
 
+// ScalarOperatorTransmitsNulls returns true if the given scalar operator always
+// returns NULL when at least one of its inputs is NULL.
+func ScalarOperatorTransmitsNulls(op Operator) bool {
+	switch op {
+	case BitandOp, BitorOp, BitxorOp, PlusOp, MinusOp, MultOp, DivOp, FloorDivOp,
+		ModOp, PowOp, EqOp, NeOp, LtOp, GtOp, LeOp, GeOp, LikeOp, NotLikeOp, ILikeOp,
+		NotILikeOp, SimilarToOp, NotSimilarToOp, RegMatchOp, NotRegMatchOp, RegIMatchOp,
+		NotRegIMatchOp, ConstOp, BBoxCoversOp, BBoxIntersectsOp:
+		return true
+
+	default:
+		return false
+	}
+}
+
 // BoolOperatorRequiresNotNullArgs returns true if the operator can never
 // evaluate to true if one of its children is NULL.
 func BoolOperatorRequiresNotNullArgs(op Operator) bool {
@@ -222,49 +280,177 @@ func BoolOperatorRequiresNotNullArgs(op Operator) bool {
 	case
 		EqOp, LtOp, LeOp, GtOp, GeOp, NeOp,
 		LikeOp, NotLikeOp, ILikeOp, NotILikeOp, SimilarToOp, NotSimilarToOp,
-		RegMatchOp, NotRegMatchOp, RegIMatchOp, NotRegIMatchOp:
+		RegMatchOp, NotRegMatchOp, RegIMatchOp, NotRegIMatchOp, BBoxCoversOp,
+		BBoxIntersectsOp:
 		return true
 	}
 	return false
 }
 
-// AggregateIsOrderingSensitive returns true if the given aggregate operator is
-// non-commutative. That is, it can give different results based on the order
-// values are fed to it.
-func AggregateIsOrderingSensitive(op Operator) bool {
-	switch op {
-	case ArrayAggOp, ConcatAggOp, JsonAggOp, JsonbAggOp, StringAggOp:
-		return true
-	}
-	return false
-}
-
-// AggregateIgnoresNulls returns true if the given aggregate operator has a
-// single input, and if it always evaluates to the same result regardless of
-// how many NULL values are included in that input, in any order.
+// AggregateIgnoresNulls returns true if the given aggregate operator ignores
+// rows where its first argument evaluates to NULL. In other words, it always
+// evaluates to the same result even if those rows are filtered. For example:
+//
+//   SELECT string_agg(x, y)
+//   FROM (VALUES ('foo', ','), ('bar', ','), (NULL, ',')) t(x, y)
+//
+// In this example, the NULL row can be removed from the input, and the
+// string_agg function still returns the same result. Contrast this to the
+// array_agg function:
+//
+//   SELECT array_agg(x)
+//   FROM (VALUES ('foo'), (NULL), ('bar')) t(x)
+//
+// If the NULL row is removed here, array_agg returns {foo,bar} instead of
+// {foo,NULL,bar}.
 func AggregateIgnoresNulls(op Operator) bool {
 	switch op {
-	case AvgOp, BoolAndOp, BoolOrOp, CountOp, MaxOp, MinOp, SumIntOp, SumOp,
-		SqrDiffOp, VarianceOp, StdDevOp, XorAggOp, ConstNotNullAggOp,
-		AnyNotNullAggOp, StringAggOp:
+
+	case AnyNotNullAggOp, AvgOp, BitAndAggOp, BitOrAggOp, BoolAndOp, BoolOrOp,
+		ConstNotNullAggOp, CorrOp, CountOp, MaxOp, MinOp, SqrDiffOp, StdDevOp,
+		StringAggOp, SumOp, SumIntOp, VarianceOp, XorAggOp, PercentileDiscOp,
+		PercentileContOp, STMakeLineOp, STCollectOp, STExtentOp, STUnionOp, StdDevPopOp,
+		VarPopOp, CovarPopOp, CovarSampOp:
+		return true
+
+	case ArrayAggOp, ConcatAggOp, ConstAggOp, CountRowsOp, FirstAggOp, JsonAggOp,
+		JsonbAggOp, JsonObjectAggOp, JsonbObjectAggOp:
+		return false
+
+	default:
+		panic(errors.AssertionFailedf("unhandled op %s", log.Safe(op)))
+	}
+}
+
+// AggregateIsNullOnEmpty returns true if the given aggregate operator returns
+// NULL when the input set contains no values. This group of aggregates turns
+// out to be the inverse of AggregateIsNeverNull in practice.
+func AggregateIsNullOnEmpty(op Operator) bool {
+	switch op {
+
+	case AnyNotNullAggOp, ArrayAggOp, AvgOp, BitAndAggOp,
+		BitOrAggOp, BoolAndOp, BoolOrOp, ConcatAggOp, ConstAggOp,
+		ConstNotNullAggOp, CorrOp, FirstAggOp, JsonAggOp, JsonbAggOp,
+		MaxOp, MinOp, SqrDiffOp, StdDevOp, STMakeLineOp, StringAggOp, SumOp, SumIntOp,
+		VarianceOp, XorAggOp, PercentileDiscOp, PercentileContOp,
+		JsonObjectAggOp, JsonbObjectAggOp, StdDevPopOp, STCollectOp, STExtentOp, STUnionOp,
+		VarPopOp, CovarPopOp, CovarSampOp:
+		return true
+
+	case CountOp, CountRowsOp:
+		return false
+
+	default:
+		panic(errors.AssertionFailedf("unhandled op %s", log.Safe(op)))
+	}
+}
+
+// AggregateIsNeverNullOnNonNullInput returns true if the given aggregate
+// operator never returns NULL when the input set contains at least one non-NULL
+// value. This is true of most aggregates.
+//
+// For multi-input aggregations, returns true if the aggregate is never NULL
+// when all inputs have at least a non-NULL value (though not necessarily on the
+// same input row).
+func AggregateIsNeverNullOnNonNullInput(op Operator) bool {
+	switch op {
+
+	case AnyNotNullAggOp, ArrayAggOp, AvgOp, BitAndAggOp,
+		BitOrAggOp, BoolAndOp, BoolOrOp, ConcatAggOp, ConstAggOp,
+		ConstNotNullAggOp, CountOp, CountRowsOp, FirstAggOp,
+		JsonAggOp, JsonbAggOp, MaxOp, MinOp, SqrDiffOp, STMakeLineOp,
+		StringAggOp, SumOp, SumIntOp, XorAggOp, PercentileDiscOp, PercentileContOp,
+		JsonObjectAggOp, JsonbObjectAggOp, StdDevPopOp, STCollectOp, STExtentOp, STUnionOp,
+		VarPopOp, CovarPopOp:
+		return true
+
+	case VarianceOp, StdDevOp, CorrOp, CovarSampOp:
+		// These aggregations return NULL if they are given a single not-NULL input.
+		return false
+
+	default:
+		panic(errors.AssertionFailedf("unhandled op %s", log.Safe(op)))
+	}
+}
+
+// AggregateIsNeverNull returns true if the given aggregate operator never
+// returns NULL, even if the input is empty, or one more more inputs are NULL.
+func AggregateIsNeverNull(op Operator) bool {
+	switch op {
+	case CountOp, CountRowsOp:
 		return true
 	}
 	return false
 }
 
-// AggregateIsNullOnEmpty returns true if the given aggregate operator has a
-// single input, and if it returns NULL when the input set contains no values.
-// This group of aggregates overlaps considerably with the AggregateIgnoresNulls
-// group, with the notable exception of COUNT, which returns zero instead of
-// NULL when its input is empty.
-func AggregateIsNullOnEmpty(op Operator) bool {
-	switch op {
-	case AvgOp, BoolAndOp, BoolOrOp, MaxOp, MinOp, SumIntOp, SumOp, SqrDiffOp,
-		VarianceOp, StdDevOp, XorAggOp, ConstAggOp, ConstNotNullAggOp, ArrayAggOp,
-		ConcatAggOp, JsonAggOp, JsonbAggOp, AnyNotNullAggOp, StringAggOp:
-		return true
+// AggregatesCanMerge returns true if the given inner and outer operators can be
+// replaced with a single equivalent operator, assuming the outer operator is
+// aggregating on the inner. In other words, the inner-outer aggregate pair
+// forms a valid "decomposition" of a single aggregate. For example, the
+// following pairs of queries are equivalent:
+//
+//   SELECT sum(s) FROM (SELECT sum(y) FROM xy GROUP BY x) AS f(s);
+//   SELECT sum(y) FROM xy;
+//
+//   SELECT sum_int(c) FROM (SELECT count(y) FROM xy GROUP BY x) AS f(c);
+//   SELECT count(y) FROM xy;
+//
+// Note: some aggregates like StringAggOp are decomposable in theory, but in
+// practice can not be easily merged as in the examples above.
+func AggregatesCanMerge(inner, outer Operator) bool {
+	switch inner {
+
+	case AnyNotNullAggOp, BitAndAggOp, BitOrAggOp, BoolAndOp,
+		BoolOrOp, ConstAggOp, ConstNotNullAggOp, FirstAggOp,
+		MaxOp, MinOp, STMakeLineOp, STExtentOp, STUnionOp, SumOp, SumIntOp, XorAggOp:
+		return inner == outer
+
+	case CountOp, CountRowsOp:
+		// Only SumIntOp can be used here because SumOp outputs a decimal value,
+		// while CountOp and CountRowsOp both output int values.
+		return outer == SumIntOp
+
+	case ArrayAggOp, AvgOp, ConcatAggOp, CorrOp, JsonAggOp, JsonbAggOp,
+		JsonObjectAggOp, JsonbObjectAggOp, PercentileContOp, PercentileDiscOp,
+		SqrDiffOp, STCollectOp, StdDevOp, StringAggOp, VarianceOp, StdDevPopOp,
+		VarPopOp, CovarPopOp, CovarSampOp:
+		return false
+
+	default:
+		panic(errors.AssertionFailedf("unhandled ops: %s, %s", log.Safe(inner), log.Safe(outer)))
 	}
-	return false
+}
+
+// AggregateIgnoresDuplicates returns true if the output of the given aggregate
+// operator does not change when duplicate rows are added to the input.
+func AggregateIgnoresDuplicates(op Operator) bool {
+	switch op {
+	case AnyNotNullAggOp, BitAndAggOp, BitOrAggOp, BoolAndOp, BoolOrOp,
+		ConstAggOp, ConstNotNullAggOp, FirstAggOp, MaxOp, MinOp, STExtentOp, STUnionOp:
+		return true
+
+	case ArrayAggOp, AvgOp, ConcatAggOp, CountOp, CorrOp, CountRowsOp, SumIntOp,
+		SumOp, SqrDiffOp, VarianceOp, StdDevOp, XorAggOp, JsonAggOp, JsonbAggOp,
+		StringAggOp, PercentileDiscOp, PercentileContOp, StdDevPopOp, STMakeLineOp,
+		VarPopOp, JsonObjectAggOp, JsonbObjectAggOp, STCollectOp, CovarPopOp, CovarSampOp:
+		return false
+
+	default:
+		panic(errors.AssertionFailedf("unhandled op %s", log.Safe(op)))
+	}
+}
+
+// OpaqueMetadata is an object stored in OpaqueRelExpr and passed
+// through to the exec factory.
+type OpaqueMetadata interface {
+	ImplementsOpaqueMetadata()
+
+	// String is a short description used when printing optimizer trees and when
+	// forming error messages; it should be the SQL statement tag.
+	String() string
+
+	// Columns returns the columns that are produced by this operator.
+	Columns() colinfo.ResultColumns
 }
 
 func init() {

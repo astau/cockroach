@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package rpc
 
@@ -24,9 +20,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 	"github.com/montanaflynn/stats"
-	"github.com/pkg/errors"
 )
 
 // RemoteClockMetrics is the collection of metrics for the clock monitor.
@@ -198,7 +193,7 @@ func (r *RemoteClockMonitor) VerifyClockOffset(ctx context.Context) error {
 	//
 	// TODO(tschottdorf): disallow maxOffset == 0 but probably lots of tests to
 	// fix.
-	if maxOffset := r.clock.MaxOffset(); maxOffset != 0 && maxOffset != timeutil.ClocklessMaxOffset {
+	if maxOffset := r.clock.MaxOffset(); maxOffset != 0 {
 		now := r.clock.PhysicalTime()
 
 		healthyOffsetCount := 0
@@ -221,11 +216,11 @@ func (r *RemoteClockMonitor) VerifyClockOffset(ctx context.Context) error {
 		r.mu.Unlock()
 
 		mean, err := offsets.Mean()
-		if err != nil && err != stats.EmptyInput {
+		if err != nil && !errors.Is(err, stats.EmptyInput) {
 			return err
 		}
 		stdDev, err := offsets.StandardDeviation()
-		if err != nil && err != stats.EmptyInput {
+		if err != nil && !errors.Is(err, stats.EmptyInput) {
 			return err
 		}
 		r.metrics.ClockOffsetMeanNanos.Update(int64(mean))

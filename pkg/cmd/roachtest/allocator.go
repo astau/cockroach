@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -23,10 +18,10 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
-func registerAllocator(r *registry) {
+func registerAllocator(r *testRegistry) {
 	runAllocator := func(ctx context.Context, t *test, c *cluster, start int, maxStdDev float64) {
 		const fixturePath = `gs://cockroach-fixtures/workload/tpch/scalefactor=10/backup`
 		c.Put(ctx, cockroach, "./cockroach")
@@ -49,15 +44,15 @@ func registerAllocator(r *registry) {
 		m.Wait()
 
 		// Start the remaining nodes to kick off upreplication/rebalancing.
-		c.Start(ctx, t, c.Range(start+1, c.nodes), args)
+		c.Start(ctx, t, c.Range(start+1, c.spec.NodeCount), args)
 
 		c.Run(ctx, c.Node(1), `./workload init kv --drop`)
-		for node := 1; node <= c.nodes; node++ {
+		for node := 1; node <= c.spec.NodeCount; node++ {
 			node := node
 			// TODO(dan): Ideally, the test would fail if this queryload failed,
 			// but we can't put it in monitor as-is because the test deadlocks.
 			go func() {
-				const cmd = `./workload run kv --tolerate-errors --min-block-bytes=8 --max-block-bytes=128`
+				const cmd = `./workload run kv --tolerate-errors --min-block-bytes=8 --max-block-bytes=127`
 				l, err := t.l.ChildLogger(fmt.Sprintf(`kv-%d`, node))
 				if err != nil {
 					t.Fatal(err)
@@ -76,18 +71,28 @@ func registerAllocator(r *registry) {
 	}
 
 	r.Add(testSpec{
-		Name:  `upreplicate/1to3`,
-		Nodes: nodes(3),
+		Name:    `replicate/up/1to3`,
+		Owner:   OwnerKV,
+		Cluster: makeClusterSpec(3),
 		Run: func(ctx context.Context, t *test, c *cluster) {
 			runAllocator(ctx, t, c, 1, 10.0)
 		},
 	})
 	r.Add(testSpec{
-		Name:  `rebalance/3to5`,
-		Nodes: nodes(5),
+		Name:    `replicate/rebalance/3to5`,
+		Owner:   OwnerKV,
+		Cluster: makeClusterSpec(5),
 		Run: func(ctx context.Context, t *test, c *cluster) {
 			runAllocator(ctx, t, c, 3, 42.0)
 		},
+	})
+	r.Add(testSpec{
+		Name:       `replicate/wide`,
+		Owner:      OwnerKV,
+		Timeout:    10 * time.Minute,
+		Cluster:    makeClusterSpec(9, cpu(1)),
+		MinVersion: "v19.2.0",
+		Run:        runWideReplication,
 	})
 }
 
@@ -242,4 +247,143 @@ func waitForRebalance(ctx context.Context, l *logger, db *gosql.DB, maxStdDev fl
 			statsTimer.Reset(statsInterval)
 		}
 	}
+}
+
+func runWideReplication(ctx context.Context, t *test, c *cluster) {
+	nodes := c.spec.NodeCount
+	if nodes != 9 {
+		t.Fatalf("9-node cluster required")
+	}
+
+	args := startArgs(
+		"--env=COCKROACH_SCAN_MAX_IDLE_TIME=5ms",
+		"--args=--vmodule=replicate_queue=6",
+	)
+	c.Put(ctx, cockroach, "./cockroach")
+	c.Start(ctx, t, c.All(), args)
+
+	db := c.Conn(ctx, 1)
+	defer db.Close()
+
+	zones := func() []string {
+		rows, err := db.Query(`SELECT target FROM crdb_internal.zones`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		var results []string
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				t.Fatal(err)
+			}
+			results = append(results, name)
+		}
+		return results
+	}
+
+	run := func(stmt string) {
+		t.l.Printf("%s\n", stmt)
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	setReplication := func(width int) {
+		// Change every zone to have the same number of replicas as the number of
+		// nodes in the cluster.
+		for _, zone := range zones() {
+			run(fmt.Sprintf(`ALTER %s CONFIGURE ZONE USING num_replicas = %d`, zone, width))
+		}
+	}
+	setReplication(nodes)
+
+	countMisreplicated := func(width int) int {
+		var count int
+		if err := db.QueryRow(
+			"SELECT count(*) FROM crdb_internal.ranges WHERE array_length(replicas,1) != $1",
+			width,
+		).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		return count
+	}
+
+	waitForReplication := func(width int) {
+		for count := -1; count != 0; time.Sleep(time.Second) {
+			count = countMisreplicated(width)
+			t.l.Printf("%d mis-replicated ranges\n", count)
+		}
+	}
+
+	waitForReplication(nodes)
+
+	numRanges := func() int {
+		var count int
+		if err := db.QueryRow(`SELECT count(*) FROM crdb_internal.ranges`).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		return count
+	}()
+
+	// Stop the cluster and restart 2/3 of the nodes.
+	c.Stop(ctx)
+	tBeginDown := timeutil.Now()
+	c.Start(ctx, t, c.Range(1, 6), args)
+
+	waitForUnderReplicated := func(count int) {
+		for start := timeutil.Now(); ; time.Sleep(time.Second) {
+			query := `
+SELECT sum((metrics->>'ranges.unavailable')::DECIMAL)::INT AS ranges_unavailable,
+       sum((metrics->>'ranges.underreplicated')::DECIMAL)::INT AS ranges_underreplicated
+FROM crdb_internal.kv_store_status
+`
+			var unavailable, underReplicated int
+			if err := db.QueryRow(query).Scan(&unavailable, &underReplicated); err != nil {
+				t.Fatal(err)
+			}
+			t.l.Printf("%d unavailable, %d under-replicated ranges\n", unavailable, underReplicated)
+			if unavailable != 0 {
+				// A freshly started cluster might show unavailable ranges for a brief
+				// period of time due to the way that metric is calculated. Only
+				// complain about unavailable ranges if they persist for too long.
+				if timeutil.Since(start) >= 30*time.Second {
+					t.Fatalf("%d unavailable ranges", unavailable)
+				}
+				continue
+			}
+			if underReplicated >= count {
+				break
+			}
+		}
+	}
+
+	waitForUnderReplicated(numRanges)
+	if n := countMisreplicated(9); n != 0 {
+		t.Fatalf("expected 0 mis-replicated ranges, but found %d", n)
+	}
+
+	decom := func(id int) {
+		c.Run(ctx, c.Node(1),
+			fmt.Sprintf("./cockroach node decommission --insecure --wait=none %d", id))
+	}
+
+	// Decommission a node. The ranges should down-replicate to 7 replicas.
+	decom(9)
+	waitForReplication(7)
+
+	// Set the replication width to 5. The replicas should down-replicate, though
+	// this currently requires the time-until-store-dead threshold to pass
+	// because the allocator cannot select a replica for removal that is on a
+	// store for which it doesn't have a store descriptor.
+	run(`SET CLUSTER SETTING server.time_until_store_dead = '90s'`)
+	// Sleep until the node is dead so that when we actually wait for replication,
+	// we can expect things to move swiftly.
+	time.Sleep(90*time.Second - timeutil.Now().Sub(tBeginDown))
+
+	setReplication(5)
+	waitForReplication(5)
+
+	// Restart the down nodes to prevent the dead node detector from complaining.
+	c.Start(ctx, t, c.Range(7, 9))
 }

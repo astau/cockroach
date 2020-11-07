@@ -1,20 +1,19 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package testcat
 
-import "github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+import (
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/errors"
+)
 
 // DropTable is a partial implementation of the DROP TABLE statement.
 func (tc *Catalog) DropTable(stmt *tree.DropTable) {
@@ -25,9 +24,30 @@ func (tc *Catalog) DropTable(stmt *tree.DropTable) {
 		tc.qualifyTableName(tn)
 
 		// Ensure that table with that name exists.
-		tc.Table(tn)
+		t := tc.Table(tn)
+
+		// Clean up FKs from tables referenced by t.
+		for _, fk := range t.outboundFKs {
+			for _, ds := range tc.testSchema.dataSources {
+				if ds.ID() == fk.referencedTableID {
+					ref := ds.(*Table)
+					oldFKs := ref.inboundFKs
+					ref.inboundFKs = nil
+					for i := range oldFKs {
+						if oldFKs[i].originTableID != t.ID() {
+							ref.inboundFKs = append(ref.inboundFKs, oldFKs[i])
+						}
+					}
+					break
+				}
+			}
+		}
+
+		if len(t.inboundFKs) > 0 {
+			panic(errors.Newf("table %s is referenced by FK constraints", tn))
+		}
 
 		// Remove the table from the catalog.
-		delete(tc.dataSources, tn.FQString())
+		delete(tc.testSchema.dataSources, tn.FQString())
 	}
 }

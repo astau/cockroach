@@ -1,26 +1,29 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 import _ from "lodash";
 import React from "react";
 import classNames from "classnames";
+import * as protos from "src/js/protos";
 
 import "./summarybar.styl";
 
 import { MetricsDataProvider } from "src/views/shared/containers/metricDataProvider";
 import { MetricsDataComponentProps } from "src/views/shared/components/metricQuery";
 import { ToolTipWrapper } from "src/views/shared/components/toolTip";
+type TSResponse = protos.cockroach.ts.tspb.TimeSeriesQueryResponse;
+
+export enum SummaryMetricsAggregator {
+  FIRST = 1,
+  SUM = 2,
+}
 
 interface SummaryValueProps {
   title: React.ReactNode;
@@ -32,6 +35,7 @@ interface SummaryStatProps {
   title: React.ReactNode;
   value?: number;
   format?: (n: number) => string;
+  aggregator?: SummaryMetricsAggregator;
 }
 
 interface SummaryHeadlineStatProps extends SummaryStatProps {
@@ -54,7 +58,7 @@ function numberToString(n: number) {
   return n.toString();
 }
 
-function computeValue(value: number, format: (n: number) => string = numberToString) {
+export function formatNumberForDisplay(value: number, format: (n: number) => string = numberToString) {
   if (!_.isNumber(value)) {
     return "-";
   }
@@ -107,7 +111,7 @@ export function SummaryStat(props: SummaryStatProps & {children?: React.ReactNod
   return (
     <SummaryValue
       title={props.title}
-      value={computeValue(props.value, props.format)}
+      value={formatNumberForDisplay(props.value, props.format)}
       classModifier="number"
     >
       {props.children}
@@ -146,7 +150,7 @@ export function SummaryStatBreakdown(props: SummaryStatBreakdownProps & {childre
         { props.title }
       </span>
       <span className="summary-stat-breakdown__value">
-        { computeValue(props.value, props.format) }
+        { formatNumberForDisplay(props.value, props.format) }
       </span>
     </div>
   </div>;
@@ -156,29 +160,61 @@ export function SummaryStatBreakdown(props: SummaryStatBreakdownProps & {childre
  * SummaryMetricStat is a helpful component that creates a SummaryStat where
  * metric data is automatically derived from a metric component.
  */
-export function SummaryMetricStat(propsWithID: SummaryStatProps & { id: string } & { children?: React.ReactNode }) {
+export function SummaryMetricStat(propsWithID: SummaryStatProps & { id: string, summaryStatMessage?: string } & { children?: React.ReactNode }) {
   const { id, ...props } = propsWithID;
   return <MetricsDataProvider current id={id} >
     <SummaryMetricStatHelper {...props} />
   </MetricsDataProvider>;
 }
 
-function SummaryMetricStatHelper(props: MetricsDataComponentProps & SummaryStatProps & { children?: React.ReactNode }) {
-  const datapoints = props.data && props.data.results && props.data.results[0] && props.data.results[0].datapoints;
-  const value = datapoints && datapoints[0] && _.last(datapoints).value;
-  const {title, format} = props;
-  return <SummaryStat title={title} format={format} value={_.isNumber(value) ? value : props.value} />;
+function SummaryMetricStatHelper(props: MetricsDataComponentProps & SummaryStatProps & { summaryStatMessage?: string } & { children?: React.ReactNode}) {
+  const value = aggregateLatestValuesFromMetrics(props.data, props.aggregator);
+  const {title, format, summaryStatMessage} = props;
+  return (
+    <SummaryStat
+      title={title}
+      format={format}
+      value={_.isNumber(value) ? value : props.value}
+    >
+      {summaryStatMessage &&
+        <SummaryStatMessage message={summaryStatMessage}/>
+      }
+    </SummaryStat>
+  );
 }
 
+function aggregateLatestValuesFromMetrics(data?: TSResponse, aggregator?: SummaryMetricsAggregator) {
+  if (!data || !data.results || !data.results.length) {
+    return null;
+  }
+
+  const latestValues = data.results.map(({ datapoints }) => {
+    return datapoints && datapoints.length && _.last(datapoints).value;
+  });
+
+  if (aggregator) {
+    switch (aggregator) {
+      case SummaryMetricsAggregator.SUM:
+        return _.sum(latestValues);
+      case SummaryMetricsAggregator.FIRST:
+      default:
+        // Do nothing, which does default action (below) of
+        // returning the first metric.
+        break;
+    }
+  }
+  // Return first metric.
+  return latestValues[0];
+}
 /**
  * SummaryHeadlineStat is similar to a normal SummaryStat, but is visually laid
  * out to draw attention to the numerical statistic.
  */
 export class SummaryHeadlineStat extends React.Component<SummaryHeadlineStatProps, {}> {
   render() {
-    return <div className="summary-headline">
-      <div className="summary-headline__value">{computeValue(this.props.value, this.props.format)}</div>
-      <div className="summary-headline__title">
+    return <div className="summary-headline-stat">
+      <div className="summary-headline-stat__value">{formatNumberForDisplay(this.props.value, this.props.format)}</div>
+      <div className="summary-headline-stat__title">
         {this.props.title}
         <div className="section-heading__tooltip">
           <ToolTipWrapper text={this.props.tooltip}>

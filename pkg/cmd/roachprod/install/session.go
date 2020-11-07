@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package install
 
@@ -24,6 +19,7 @@ import (
 	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachprod/config"
+	"github.com/cockroachdb/errors"
 )
 
 type session interface {
@@ -32,39 +28,77 @@ type session interface {
 	SetStdin(r io.Reader)
 	SetStdout(w io.Writer)
 	SetStderr(w io.Writer)
+	Start(cmd string) error
 	StdinPipe() (io.WriteCloser, error)
 	StdoutPipe() (io.Reader, error)
 	StderrPipe() (io.Reader, error)
 	RequestPty() error
+	Wait() error
 	Close()
 }
 
 type remoteSession struct {
 	*exec.Cmd
-	cancel func()
+	cancel  func()
+	logfile string // captures ssh -vvv
 }
 
-func newRemoteSession(user, host string) (*remoteSession, error) {
+func newRemoteSession(user, host string, logdir string) (*remoteSession, error) {
+	// TODO(tbg): this is disabled at the time of writing. It was difficult
+	// to assign the logfiles to the roachtest and as a bonus our CI harness
+	// never actually managed to collect the files since they had wrong
+	// permissions; instead they clogged up the roachprod dir.
+	// logfile := filepath.Join(
+	//	logdir,
+	// 	fmt.Sprintf("ssh_%s_%s", host, timeutil.Now().Format(time.RFC3339)),
+	// )
+	const logfile = ""
 	args := []string{
 		user + "@" + host,
+
+		// TODO(tbg): see above.
+		//"-vvv", "-E", logfile,
+		// NB: -q suppresses -E, at least on OSX. Difficult decisions will have
+		// to be made if omitting -q leads to annoyance on stdout/stderr.
+
 		"-q",
 		"-o", "UserKnownHostsFile=/dev/null",
 		"-o", "StrictHostKeyChecking=no",
+		// Send keep alives every minute to prevent connections without activity
+		// from dropping. (It is speculative that the absence of this caused
+		// problems, though there's some indication that we need them:
+		//
+		// https://github.com/cockroachdb/cockroach/issues/35337
+		"-o", "ServerAliveInterval=60",
 	}
 	args = append(args, sshAuthArgs()...)
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(ctx, "ssh", args...)
-	return &remoteSession{cmd, cancel}, nil
+	return &remoteSession{cmd, cancel, logfile}, nil
+}
+
+func (s *remoteSession) errWithDebug(err error) error {
+	if err != nil && s.logfile != "" {
+		err = errors.Wrapf(err, "ssh verbose log retained in %s", s.logfile)
+		s.logfile = "" // prevent removal on close
+	}
+	return err
 }
 
 func (s *remoteSession) CombinedOutput(cmd string) ([]byte, error) {
 	s.Cmd.Args = append(s.Cmd.Args, cmd)
-	return s.Cmd.CombinedOutput()
+	b, err := s.Cmd.CombinedOutput()
+	return b, s.errWithDebug(err)
 }
 
 func (s *remoteSession) Run(cmd string) error {
 	s.Cmd.Args = append(s.Cmd.Args, cmd)
-	return s.Cmd.Run()
+	return s.errWithDebug(s.Cmd.Run())
+}
+
+func (s *remoteSession) Start(cmd string) error {
+	s.Cmd.Args = append(s.Cmd.Args, cmd)
+	return s.Cmd.Start()
 }
 
 func (s *remoteSession) SetStdin(r io.Reader) {
@@ -98,8 +132,15 @@ func (s *remoteSession) RequestPty() error {
 	return nil
 }
 
+func (s *remoteSession) Wait() error {
+	return s.Cmd.Wait()
+}
+
 func (s *remoteSession) Close() {
 	s.cancel()
+	if s.logfile != "" {
+		_ = os.Remove(s.logfile)
+	}
 }
 
 type localSession struct {
@@ -121,6 +162,11 @@ func (s *localSession) CombinedOutput(cmd string) ([]byte, error) {
 func (s *localSession) Run(cmd string) error {
 	s.Cmd.Args = append(s.Cmd.Args, cmd)
 	return s.Cmd.Run()
+}
+
+func (s *localSession) Start(cmd string) error {
+	s.Cmd.Args = append(s.Cmd.Args, cmd)
+	return s.Cmd.Start()
 }
 
 func (s *localSession) SetStdin(r io.Reader) {
@@ -151,6 +197,10 @@ func (s *localSession) StderrPipe() (io.Reader, error) {
 
 func (s *localSession) RequestPty() error {
 	return nil
+}
+
+func (s *localSession) Wait() error {
+	return s.Cmd.Wait()
 }
 
 func (s *localSession) Close() {

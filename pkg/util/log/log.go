@@ -1,34 +1,28 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package log
 
 import (
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/opentracing/opentracing-go"
-	"github.com/petermattis/goid"
+	"github.com/cockroachdb/errors"
 )
 
 func init() {
-	copyStandardLogTo("INFO")
+	errors.SetWarningFn(Warningf)
 }
 
 // FatalOnPanic recovers from a panic and exits the process with a
@@ -41,28 +35,6 @@ func FatalOnPanic() {
 	}
 }
 
-// SetExitFunc allows setting a function that will be called to exit the
-// process when a Fatal message is generated. The supplied bool, if true,
-// suppresses the stack trace, which is useful for test callers wishing
-// to keep the logs reasonably clean.
-//
-// Call with a nil function to undo.
-func SetExitFunc(hideStack bool, f func(int)) {
-	logging.mu.Lock()
-	defer logging.mu.Unlock()
-	logging.exitOverride.f = f
-	logging.exitOverride.hideStack = hideStack
-}
-
-// ResetExitFunc undoes any prior call to SetExitFunc.
-func ResetExitFunc() {
-	logging.mu.Lock()
-	defer logging.mu.Unlock()
-
-	logging.exitOverride.f = nil
-	logging.exitOverride.hideStack = false
-}
-
 // logDepth uses the PrintWith to format the output string and
 // formulate the context information into the machine-readable
 // dictionary for separate binary-log output.
@@ -73,7 +45,12 @@ func logDepth(ctx context.Context, depth int, sev Severity, format string, args 
 
 // Shout logs to the specified severity's log, and also to the real
 // stderr if logging is currently redirected to a file.
-func Shout(ctx context.Context, sev Severity, args ...interface{}) {
+func Shout(ctx context.Context, sev Severity, msg string) {
+	Shoutf(ctx, sev, msg)
+}
+
+// Shoutf is like Shout but uses formatting.
+func Shoutf(ctx context.Context, sev Severity, format string, args ...interface{}) {
 	if sev == Severity_FATAL {
 		// Fatal error handling later already tries to exit even if I/O should
 		// block, but crash reporting might also be in the way.
@@ -82,11 +59,16 @@ func Shout(ctx context.Context, sev Severity, args ...interface{}) {
 		})
 		defer t.Stop()
 	}
-	if stderrRedirected {
+	if !LoggingToStderr(sev) {
+		// The logging call below would not otherwise appear on stderr;
+		// however this is what the Shout() contract guarantees, so we do
+		// it here.
 		fmt.Fprintf(OrigStderr, "*\n* %s: %s\n*\n", sev.String(),
-			strings.Replace(MakeMessage(ctx, "", args), "\n", "\n* ", -1))
+			strings.Replace(
+				FormatWithContextTags(ctx, format, args...),
+				"\n", "\n* ", -1))
 	}
-	logDepth(ctx, 1, sev, "", args)
+	logDepth(ctx, 1, sev, format, args)
 }
 
 // Infof logs to the INFO log.
@@ -97,21 +79,23 @@ func Infof(ctx context.Context, format string, args ...interface{}) {
 	logDepth(ctx, 1, Severity_INFO, format, args)
 }
 
-// Info logs to the INFO log.
+// VInfof logs to the INFO log depending on whether the specified verbosity
+// level is active.
+//
 // It extracts log tags from the context and logs them along with the given
-// message. Arguments are handled in the manner of fmt.Print; a newline is
+// message. Arguments are handled in the manner of fmt.Printf; a newline is
 // appended.
-func Info(ctx context.Context, args ...interface{}) {
-	logDepth(ctx, 1, Severity_INFO, "", args)
+func VInfof(ctx context.Context, level Level, format string, args ...interface{}) {
+	if VDepth(level, 1) {
+		logDepth(ctx, 1, Severity_INFO, format, args)
+	}
 }
 
-// InfoDepth logs to the INFO log, offsetting the caller's stack frame by
-// 'depth'.
+// Info logs to the INFO log.
 // It extracts log tags from the context and logs them along with the given
-// message. Arguments are handled in the manner of fmt.Print; a newline is
-// appended.
-func InfoDepth(ctx context.Context, depth int, args ...interface{}) {
-	logDepth(ctx, depth+1, Severity_INFO, "", args)
+// message.
+func Info(ctx context.Context, msg string) {
+	logDepth(ctx, 1, Severity_INFO, msg, nil)
 }
 
 // InfofDepth logs to the INFO log, offsetting the caller's stack frame by
@@ -133,10 +117,9 @@ func Warningf(ctx context.Context, format string, args ...interface{}) {
 
 // Warning logs to the WARNING and INFO logs.
 // It extracts log tags from the context and logs them along with the given
-// message. Arguments are handled in the manner of fmt.Print; a newline is
-// appended.
-func Warning(ctx context.Context, args ...interface{}) {
-	logDepth(ctx, 1, Severity_WARNING, "", args)
+// message.
+func Warning(ctx context.Context, msg string) {
+	logDepth(ctx, 1, Severity_WARNING, msg, nil)
 }
 
 // WarningfDepth logs to the WARNING and INFO logs, offsetting the caller's
@@ -158,10 +141,9 @@ func Errorf(ctx context.Context, format string, args ...interface{}) {
 
 // Error logs to the ERROR, WARNING, and INFO logs.
 // It extracts log tags from the context and logs them along with the given
-// message. Arguments are handled in the manner of fmt.Print; a newline is
-// appended.
-func Error(ctx context.Context, args ...interface{}) {
-	logDepth(ctx, 1, Severity_ERROR, "", args)
+// message.
+func Error(ctx context.Context, msg string) {
+	logDepth(ctx, 1, Severity_ERROR, msg, nil)
 }
 
 // ErrorfDepth logs to the ERROR, WARNING, and INFO logs, offsetting the
@@ -185,10 +167,9 @@ func Fatalf(ctx context.Context, format string, args ...interface{}) {
 // Fatal logs to the INFO, WARNING, ERROR, and FATAL logs, including a stack
 // trace of all running goroutines, then calls os.Exit(255).
 // It extracts log tags from the context and logs them along with the given
-// message. Arguments are handled in the manner of fmt.Print; a newline is
-// appended.
-func Fatal(ctx context.Context, args ...interface{}) {
-	logDepth(ctx, 1, Severity_FATAL, "", args)
+// message.
+func Fatal(ctx context.Context, msg string) {
+	logDepth(ctx, 1, Severity_FATAL, msg, nil)
 }
 
 // FatalfDepth logs to the INFO, WARNING, ERROR, and FATAL logs (offsetting the
@@ -208,7 +189,7 @@ func FatalfDepth(ctx context.Context, depth int, format string, args ...interfac
 //
 // TODO(andrei): Audit uses of V() and see which ones should actually use the
 // newer ExpensiveLogEnabled().
-func V(level int32) bool {
+func V(level Level) bool {
 	return VDepth(level, 1)
 }
 
@@ -232,9 +213,9 @@ func V(level int32) bool {
 //   log.VEventf(ctx, 2, msg)
 // }
 //
-func ExpensiveLogEnabled(ctx context.Context, level int32) bool {
-	if sp := opentracing.SpanFromContext(ctx); sp != nil {
-		if tracing.IsRecording(sp) {
+func ExpensiveLogEnabled(ctx context.Context, level Level) bool {
+	if sp := tracing.SpanFromContext(ctx); sp != nil {
+		if sp.IsRecording() {
 			return true
 		}
 	}
@@ -242,29 +223,4 @@ func ExpensiveLogEnabled(ctx context.Context, level int32) bool {
 		return true
 	}
 	return false
-}
-
-// MakeEntry creates an Entry.
-func MakeEntry(s Severity, t int64, file string, line int, msg string) Entry {
-	return Entry{
-		Severity:  s,
-		Time:      t,
-		Goroutine: goid.Get(),
-		File:      file,
-		Line:      int64(line),
-		Message:   msg,
-	}
-}
-
-// Format writes the log entry to the specified writer.
-func (e Entry) Format(w io.Writer) error {
-	buf := formatLogEntry(e, nil, nil)
-	defer logging.putBuffer(buf)
-	_, err := w.Write(buf.Bytes())
-	return err
-}
-
-// SetVModule alters the vmodule logging level to the passed in value.
-func SetVModule(value string) error {
-	return logging.vmodule.Set(value)
 }

@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -21,12 +17,14 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -48,6 +46,7 @@ import (
 // plan; planning will be performed outside of the transaction.
 func TestDistSQLRunningInAbortedTxn(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	s, sqlDB, db := serverutils.StartServer(t, base.TestServerArgs{})
@@ -63,10 +62,11 @@ func TestDistSQLRunningInAbortedTxn(t *testing.T) {
 	execCfg := s.ExecutorConfig().(ExecutorConfig)
 	internalPlanner, cleanup := NewInternalPlanner(
 		"test",
-		client.NewTxn(ctx, db, s.NodeID(), client.RootTxn),
-		security.RootUser,
+		kv.NewTxn(ctx, db, s.NodeID()),
+		security.RootUserName(),
 		&MemoryMetrics{},
 		&execCfg,
+		sessiondatapb.SessionData{},
 	)
 	defer cleanup()
 	p := internalPlanner.(*planner)
@@ -75,13 +75,10 @@ func TestDistSQLRunningInAbortedTxn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := p.makePlan(ctx, Statement{Statement: stmt}); err != nil {
-		t.Fatal(err)
-	}
 
 	push := func(ctx context.Context, key roachpb.Key) error {
 		// Conflicting transaction that pushes another transaction.
-		conflictTxn := client.NewTxn(ctx, db, 0 /* gatewayNodeID */, client.RootTxn)
+		conflictTxn := kv.NewTxn(ctx, db, 0 /* gatewayNodeID */)
 		// We need to explicitly set a high priority for the push to happen.
 		if err := conflictTxn.SetUserPriority(roachpb.MaxUserPriority); err != nil {
 			return err
@@ -96,8 +93,8 @@ func TestDistSQLRunningInAbortedTxn(t *testing.T) {
 	// Make a db with a short heartbeat interval, so that the aborted txn finds
 	// out quickly.
 	ambient := log.AmbientContext{Tracer: tracing.NewTracer()}
-	tsf := kv.NewTxnCoordSenderFactory(
-		kv.TxnCoordSenderFactoryConfig{
+	tsf := kvcoord.NewTxnCoordSenderFactory(
+		kvcoord.TxnCoordSenderFactoryConfig{
 			AmbientCtx: ambient,
 			// Short heartbeat interval.
 			HeartbeatInterval: time.Millisecond,
@@ -105,15 +102,15 @@ func TestDistSQLRunningInAbortedTxn(t *testing.T) {
 			Clock:             s.Clock(),
 			Stopper:           s.Stopper(),
 		},
-		s.DistSender(),
+		s.DistSenderI().(*kvcoord.DistSender),
 	)
-	shortDB := client.NewDB(ambient, tsf, s.Clock())
+	shortDB := kv.NewDB(ambient, tsf, s.Clock(), s.Stopper())
 
 	iter := 0
 	// We'll trace to make sure the test isn't fooling itself.
 	runningCtx, getRec, cancel := tracing.ContextWithRecordingSpan(ctx, "test")
 	defer cancel()
-	err = shortDB.Txn(runningCtx, func(ctx context.Context, txn *client.Txn) error {
+	err = shortDB.Txn(runningCtx, func(ctx context.Context, txn *kv.Txn) error {
 		iter++
 		if iter == 1 {
 			// On the first iteration, abort the txn.
@@ -128,8 +125,8 @@ func TestDistSQLRunningInAbortedTxn(t *testing.T) {
 
 			// Now wait until the heartbeat loop notices that the transaction is aborted.
 			testutils.SucceedsSoon(t, func() error {
-				if txn.GetTxnCoordMeta(ctx).Txn.Status != roachpb.ABORTED {
-					return fmt.Errorf("txn not aborted yet")
+				if txn.Sender().(*kvcoord.TxnCoordSender).IsTracking() {
+					return fmt.Errorf("txn heartbeat loop running")
 				}
 				return nil
 			})
@@ -144,25 +141,31 @@ func TestDistSQLRunningInAbortedTxn(t *testing.T) {
 			rw,
 			stmt.AST.StatementType(),
 			execCfg.RangeDescriptorCache,
-			execCfg.LeaseHolderCache,
 			txn,
 			func(ts hlc.Timestamp) {
-				_ = execCfg.Clock.Update(ts)
+				execCfg.Clock.Update(ts)
 			},
 			p.ExtendedEvalContext().Tracing,
 		)
 
+		// We need to re-plan every time, since close() below makes
+		// the plan unusable across retries.
+		p.stmt = makeStatement(stmt, ClusterWideID{})
+		if err := p.makeOptimizerPlan(ctx); err != nil {
+			t.Fatal(err)
+		}
+		defer p.curPlan.close(ctx)
+
 		evalCtx := p.ExtendedEvalContext()
-		planCtx := execCfg.DistSQLPlanner.NewPlanningCtx(ctx, evalCtx, nil /* txn */)
-		// We need isLocal = false so that we executing the plan involves marshaling
+		// We need distribute = true so that executing the plan involves marshaling
 		// the root txn meta to leaf txns. Local flows can start in aborted txns
 		// because they just use the root txn.
-		planCtx.isLocal = false
-		planCtx.planner = p
+		planCtx := execCfg.DistSQLPlanner.NewPlanningCtx(ctx, evalCtx, p, nil /* txn */, true /* distribute */)
 		planCtx.stmtType = recv.stmtType
 
 		execCfg.DistSQLPlanner.PlanAndRun(
-			ctx, evalCtx, planCtx, txn, p.curPlan.plan, recv)
+			ctx, evalCtx, planCtx, txn, p.curPlan.main, recv,
+		)()
 		return rw.Err()
 	})
 	if err != nil {
@@ -173,5 +176,87 @@ func TestDistSQLRunningInAbortedTxn(t *testing.T) {
 	}
 	if tracing.FindMsgInRecording(getRec(), clientRejectedMsg) == -1 {
 		t.Fatalf("didn't find expected message in trace: %s", clientRejectedMsg)
+	}
+}
+
+// Test that the DistSQLReceiver overwrites previous errors as "better" errors
+// come along.
+func TestDistSQLReceiverErrorRanking(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// This test goes through the trouble of creating a server because it wants to
+	// create a txn. It creates the txn because it wants to test an interaction
+	// between the DistSQLReceiver and the TxnCoordSender: the DistSQLReceiver
+	// will feed retriable errors to the TxnCoordSender which will change those
+	// errors to TransactionRetryWithProtoRefreshError.
+	ctx := context.Background()
+	s, _, db := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(ctx)
+
+	txn := kv.NewTxn(ctx, db, s.NodeID())
+
+	// We're going to use a rowResultWriter to which only errors will be passed.
+	rw := newCallbackResultWriter(nil /* fn */)
+	recv := MakeDistSQLReceiver(
+		ctx,
+		rw,
+		tree.Rows, /* StatementType */
+		nil,       /* rangeCache */
+		txn,
+		func(hlc.Timestamp) {}, /* updateClock */
+		&SessionTracing{},
+	)
+
+	retryErr := roachpb.NewErrorWithTxn(
+		roachpb.NewTransactionRetryError(
+			roachpb.RETRY_SERIALIZABLE, "test err"),
+		txn.TestingCloneTxn()).GoError()
+
+	abortErr := roachpb.NewErrorWithTxn(
+		roachpb.NewTransactionAbortedError(
+			roachpb.ABORT_REASON_ABORTED_RECORD_FOUND),
+		txn.TestingCloneTxn()).GoError()
+
+	errs := []struct {
+		err    error
+		expErr string
+	}{
+		{
+			// Initial error, retriable.
+			err:    retryErr,
+			expErr: "TransactionRetryWithProtoRefreshError: TransactionRetryError",
+		},
+		{
+			// A non-retriable error overwrites a retriable one.
+			err:    fmt.Errorf("err1"),
+			expErr: "err1",
+		},
+		{
+			// Another non-retriable error doesn't overwrite the previous one.
+			err:    fmt.Errorf("err2"),
+			expErr: "err1",
+		},
+		{
+			// A TransactionAbortedError overwrites anything.
+			err:    abortErr,
+			expErr: "TransactionRetryWithProtoRefreshError: TransactionAbortedError",
+		},
+		{
+			// A non-aborted retriable error does not overried the
+			// TransactionAbortedError.
+			err:    retryErr,
+			expErr: "TransactionRetryWithProtoRefreshError: TransactionAbortedError",
+		},
+	}
+
+	for i, tc := range errs {
+		recv.Push(nil, /* row */
+			&execinfrapb.ProducerMetadata{
+				Err: tc.err,
+			})
+		if !testutils.IsError(rw.Err(), tc.expErr) {
+			t.Fatalf("%d: expected %s, got %s", i, tc.expErr, rw.Err())
+		}
 	}
 }

@@ -1,53 +1,55 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package colencoding
 
 import (
-	"github.com/cockroachdb/cockroach/pkg/sql/exec"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"time"
+
+	"github.com/cockroachdb/cockroach/pkg/col/coldata"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
 // DecodeTableValueToCol decodes a value encoded by EncodeTableValue, writing
-// the result to the idx'th position of the input exec.ColVec.
+// the result to the idx'th position of the input exec.Vec.
 // See the analog in sqlbase/column_type_encoding.go.
 func DecodeTableValueToCol(
-	vec exec.ColVec,
-	idx uint16,
+	da *rowenc.DatumAlloc,
+	vec coldata.Vec,
+	idx int,
 	typ encoding.Type,
 	dataOffset int,
-	valTyp *sqlbase.ColumnType,
+	valTyp *types.T,
 	b []byte,
 ) ([]byte, error) {
 	// NULL is special because it is a valid value for any type.
 	if typ == encoding.Null {
-		vec.SetNull(idx)
+		vec.Nulls().SetNull(idx)
 		return b[dataOffset:], nil
 	}
 	// Bool is special because the value is stored in the value tag.
-	if valTyp.SemanticType != sqlbase.ColumnType_BOOL {
+	if valTyp.Family() != types.BoolFamily {
 		b = b[dataOffset:]
 	}
-	return decodeUntaggedDatumToCol(vec, idx, valTyp, b)
+	return decodeUntaggedDatumToCol(da, vec, idx, valTyp, b)
 }
 
 // decodeUntaggedDatum is used to decode a Datum whose type is known,
 // and which doesn't have a value tag (either due to it having been
 // consumed already or not having one in the first place). It writes the result
-// to the idx'th position of the input exec.ColVec.
+// to the idx'th position of the input coldata.Vec.
 //
 // This is used to decode datums encoded using value encoding.
 //
@@ -55,47 +57,68 @@ func DecodeTableValueToCol(
 // the tag directly.
 // See the analog in sqlbase/column_type_encoding.go.
 func decodeUntaggedDatumToCol(
-	vec exec.ColVec, idx uint16, t *sqlbase.ColumnType, buf []byte,
+	da *rowenc.DatumAlloc, vec coldata.Vec, idx int, t *types.T, buf []byte,
 ) ([]byte, error) {
 	var err error
-	switch t.SemanticType {
-	case sqlbase.ColumnType_BOOL:
+	switch t.Family() {
+	case types.BoolFamily:
 		var b bool
 		// A boolean's value is encoded in its tag directly, so we don't have an
 		// "Untagged" version of this function.
 		buf, b, err = encoding.DecodeBoolValue(buf)
 		vec.Bool()[idx] = b
-	case sqlbase.ColumnType_BYTES, sqlbase.ColumnType_STRING, sqlbase.ColumnType_NAME:
+	case types.BytesFamily, types.StringFamily:
 		var data []byte
 		buf, data, err = encoding.DecodeUntaggedBytesValue(buf)
-		vec.Bytes()[idx] = data
-	case sqlbase.ColumnType_DATE, sqlbase.ColumnType_OID:
+		vec.Bytes().Set(idx, data)
+	case types.DateFamily, types.OidFamily:
 		var i int64
 		buf, i, err = encoding.DecodeUntaggedIntValue(buf)
 		vec.Int64()[idx] = i
-	case sqlbase.ColumnType_DECIMAL:
+	case types.DecimalFamily:
 		buf, err = encoding.DecodeIntoUntaggedDecimalValue(&vec.Decimal()[idx], buf)
-	case sqlbase.ColumnType_FLOAT:
+	case types.FloatFamily:
 		var f float64
 		buf, f, err = encoding.DecodeUntaggedFloatValue(buf)
 		vec.Float64()[idx] = f
-	case sqlbase.ColumnType_INT:
+	case types.IntFamily:
 		var i int64
 		buf, i, err = encoding.DecodeUntaggedIntValue(buf)
-		switch t.Width {
-		case 8:
-			vec.Int8()[idx] = int8(i)
+		switch t.Width() {
 		case 16:
 			vec.Int16()[idx] = int16(i)
 		case 32:
 			vec.Int32()[idx] = int32(i)
-		case 0, 64:
-			vec.Int64()[idx] = i
 		default:
-			return buf, errors.Errorf("unknown integer width %d", t.Width)
+			// Pre-2.1 BIT was using INT encoding with arbitrary sizes.
+			// We map these to 64-bit INT now. See #34161.
+			vec.Int64()[idx] = i
 		}
+	case types.UuidFamily:
+		var data uuid.UUID
+		buf, data, err = encoding.DecodeUntaggedUUIDValue(buf)
+		// TODO(yuzefovich): we could peek inside the encoding package to skip a
+		// couple of conversions.
+		if err != nil {
+			return buf, err
+		}
+		vec.Bytes().Set(idx, data.GetBytes())
+	case types.TimestampFamily, types.TimestampTZFamily:
+		var t time.Time
+		buf, t, err = encoding.DecodeUntaggedTimeValue(buf)
+		vec.Timestamp()[idx] = t
+	case types.IntervalFamily:
+		var d duration.Duration
+		buf, d, err = encoding.DecodeUntaggedDurationValue(buf)
+		vec.Interval()[idx] = d
+	// Types backed by tree.Datums.
 	default:
-		return buf, errors.Errorf("couldn't decode type %s", t)
+		var d tree.Datum
+		d, buf, err = rowenc.DecodeUntaggedDatum(da, t, buf)
+		if err != nil {
+			return buf, err
+		}
+		vec.Datum().Set(idx, d)
 	}
 	return buf, err
 }

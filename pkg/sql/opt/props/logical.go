@@ -1,22 +1,16 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package props
 
 import (
-	"fmt"
-
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
 )
@@ -37,18 +31,25 @@ const (
 	// field is populated.
 	InterestingOrderings
 
+	// HasHoistableSubquery is set when the Scalar.Rule.HasHoistableSubquery
+	// is populated.
+	HasHoistableSubquery
+
 	// UnfilteredCols is set when the Relational.Rule.UnfilteredCols field is
 	// populated.
 	UnfilteredCols
 
-	// HasHoistableSubquery is set when the Scalar.Rule.HasHoistableSubquery
-	// is populated.
-	HasHoistableSubquery
+	// WithUses is set when the Shared.Rule.WithUses field is populated.
+	WithUses
 )
 
 // Shared are properties that are shared by both relational and scalar
 // expressions.
 type Shared struct {
+	// Populated is set to true once the properties have been built for the
+	// operator.
+	Populated bool
+
 	// OuterCols is the set of columns that are referenced by variables within
 	// this sub-expression, but are not bound within the scope of the expression.
 	// For example:
@@ -83,76 +84,8 @@ type Shared struct {
 	// time searching subtrees that don't contain subqueries.
 	HasCorrelatedSubquery bool
 
-	// CanHaveSideEffects is true if the expression modifies state outside its
-	// own scope, or if depends upon state that may change across evaluations. An
-	// expression can have side effects if it can do any of the following:
-	//
-	//   1. Trigger a run-time error
-	//        10 / col                          -- division by zero error possible
-	//        crdb_internal.force_error('', '') -- triggers run-time error
-	//
-	//   2. Modify outside session or database state
-	//        nextval(seq)               -- modifies database sequence value
-	//        SELECT * FROM [INSERT ...] -- inserts rows into database
-	//
-	//   3. Return different results when repeatedly called with same input
-	//        ORDER BY random()      -- random can return different values
-	//        ts < clock_timestamp() -- clock_timestamp can return different vals
-	//
-	// The optimizer makes *only* the following side-effect related guarantees:
-	//
-	//   1. CASE/IF branches are only evaluated if the branch condition is true.
-	//      Therefore, the following is guaranteed to never raise a divide by
-	//      zero error, regardless of how cleverly the optimizer rewrites the
-	//      expression:
-	//
-	//        CASE WHEN divisor<>0 THEN dividend / divisor ELSE NULL END
-	//
-	//      While this example is trivial, a more complex example might have
-	//      correlated subqueries that cannot be hoisted outside the CASE
-	//      expression in the usual way, since that would trigger premature
-	//      evaluation.
-	//
-	//   2. Expressions with side effects are never treated as constant
-	//      expressions, even though they do not depend on other columns in the
-	//      query:
-	//
-	//        SELECT * FROM xy ORDER BY random()
-	//
-	//      If the random() expression were treated as a constant, then the ORDER
-	//      BY could be dropped by the optimizer, since ordering by a constant is
-	//      a no-op. Instead, the optimizer treats it like it would an expression
-	//      that depends upon a column.
-	//
-	//   3. A common table expression (CTE) with side effects will only be
-	//      evaluated one time. This will typically prevent inlining of the CTE
-	//      into the query body. For example:
-	//
-	//        WITH a AS (INSERT ... RETURNING ...) SELECT * FROM a, a
-	//
-	//      Although the "a" CTE is referenced twice, it must be evaluated only
-	//      one time (and its results cached to satisfy the second reference).
-	//
-	// As long as the optimizer provides these guarantees, it is free to rewrite,
-	// reorder, duplicate, and eliminate as if no side effects were present. As an
-	// example, the optimizer is free to eliminate the unused "nextval" column in
-	// this query:
-	//
-	//   SELECT x FROM (SELECT nextval(seq), x FROM xy)
-	//   =>
-	//   SELECT x FROM xy
-	//
-	// It's also allowed to duplicate side-effecting expressions during predicate
-	// pushdown:
-	//
-	//   SELECT * FROM xy INNER JOIN xz ON xy.x=xz.x WHERE xy.x=random()
-	//   =>
-	//   SELECT *
-	//   FROM (SELECT * FROM xy WHERE xy.x=random())
-	//   INNER JOIN (SELECT * FROM xz WHERE xz.x=random())
-	//   ON xy.x=xz.x
-	//
-	CanHaveSideEffects bool
+	// VolatilitySet contains the set of volatilities contained in the expression.
+	VolatilitySet VolatilitySet
 
 	// CanMutate is true if the subtree rooted at this expression contains at
 	// least one operator that modifies schema (like CreateTable) or writes or
@@ -162,6 +95,28 @@ type Shared struct {
 	// HasPlaceholder is true if the subtree rooted at this expression contains
 	// at least one Placeholder operator.
 	HasPlaceholder bool
+
+	// Rule props are lazily calculated and typically only apply to a single
+	// rule. See the comment above Relational.Rule for more details.
+	Rule struct {
+		// WithUses tracks information about the WithScans inside the given
+		// expression which reference WithIDs outside of that expression.
+		WithUses WithUsesMap
+	}
+}
+
+// WithUsesMap stores information about each WithScan referencing an outside
+// WithID, grouped by each WithID.
+type WithUsesMap map[opt.WithID]WithUseInfo
+
+// WithUseInfo contains information about the usage of a specific WithID.
+type WithUseInfo struct {
+	// Count is the number of WithScan operators which reference this WithID.
+	Count int
+
+	// UsedCols is the union of columns used by all WithScan operators which
+	// reference this WithID.
+	UsedCols opt.ColSet
 }
 
 // Relational properties describe the content and characteristics of relational
@@ -305,15 +260,16 @@ type Relational struct {
 		// been set.
 		InterestingOrderings opt.OrderingSet
 
-		// UnfilteredCols is the set of output columns that have values for every
-		// row in their owner table. Rows may be duplicated, but no rows can be
-		// missing. For example, an unconstrained, unlimited Scan operator can
-		// add all of its output columns to this property, but a Select operator
-		// cannot add any columns, as it may have filtered rows.
+		// UnfilteredCols is the set of all columns for which rows from their base
+		// table are guaranteed not to have been filtered. Rows may be duplicated,
+		// but no rows can be missing. Even columns which are not output columns are
+		// included as long as table rows are guaranteed not filtered. For example,
+		// an unconstrained, unlimited Scan operator can add all columns from its
+		// table to this property, but a Select operator cannot add any columns, as
+		// it may have filtered rows.
 		//
-		// UnfilteredCols is lazily populated by the SimplifyLeftJoinWithFilters
-		// and SimplifyRightJoinWithFilters rules. It is only valid once the
-		// Rule.Available.UnfilteredCols bit has been set.
+		// UnfilteredCols is lazily populated by GetJoinMultiplicityFromInputs. It
+		// is only valid once the Rule.Available.UnfilteredCols bit has been set.
 		UnfilteredCols opt.ColSet
 	}
 }
@@ -323,10 +279,6 @@ type Relational struct {
 // lazily populated on request.
 type Scalar struct {
 	Shared
-
-	// Populated is set to true once the scalar properties have been set, usually
-	// triggered by a call to the ScalarPropsExpr.ScalarProps interface.
-	Populated bool
 
 	// Constraints is the set of constraints deduced from a boolean expression.
 	// For the expression to be true, all constraints in the set must be
@@ -409,83 +361,4 @@ func (s *Scalar) IsAvailable(p AvailableRuleProps) bool {
 // mark them as populated on this scalar properties instance.
 func (s *Scalar) SetAvailable(p AvailableRuleProps) {
 	s.Rule.Available |= p
-}
-
-// Verify runs consistency checks against the shared properties, in order to
-// ensure that they conform to several invariants:
-//
-//   1. If HasCorrelatedSubquery is true, then HasSubquery must be true as well.
-//
-func (s *Shared) Verify() {
-	if s.HasCorrelatedSubquery && !s.HasSubquery {
-		panic("HasSubquery cannot be false if HasCorrelatedSubquery is true")
-	}
-}
-
-// Verify runs consistency checks against the relational properties, in order to
-// ensure that they conform to several invariants:
-//
-//   1. Functional dependencies are internally consistent.
-//   2. Not null columns are a subset of output columns.
-//   3. Outer columns do not intersect output columns.
-//   4. If functional dependencies indicate that the relation can have at most
-//      one row, then the cardinality reflects that as well.
-//
-func (r *Relational) Verify() {
-	r.Shared.Verify()
-	r.FuncDeps.Verify()
-
-	if !r.NotNullCols.SubsetOf(r.OutputCols) {
-		panic(fmt.Sprintf("not null cols %s not a subset of output cols %s",
-			r.NotNullCols, r.OutputCols))
-	}
-	if r.OuterCols.Intersects(r.OutputCols) {
-		panic(fmt.Sprintf("outer cols %s intersect output cols %s",
-			r.OuterCols, r.OutputCols))
-	}
-	if r.FuncDeps.HasMax1Row() {
-		if r.Cardinality.Max > 1 {
-			panic(fmt.Sprintf(
-				"max cardinality must be <= 1 if FDs have max 1 row: %s", r.Cardinality))
-		}
-	}
-}
-
-// VerifyAgainst checks that the two properties don't contradict each other.
-// Used for testing (e.g. to cross-check derived properties from expressions in
-// the same group).
-func (r *Relational) VerifyAgainst(other *Relational) {
-	if !r.OutputCols.Equals(other.OutputCols) {
-		panic(fmt.Sprintf("output cols mismatch: %s vs %s", r.OutputCols, other.OutputCols))
-	}
-
-	// NotNullCols, FuncDeps are best effort, so they might differ.
-
-	if r.Cardinality.Max < other.Cardinality.Min ||
-		r.Cardinality.Min > other.Cardinality.Max {
-		panic(fmt.Sprintf("cardinality mismatch: %s vs %s", r.Cardinality, other.Cardinality))
-	}
-
-	// TODO(radu): these checks might be overzealous - conceivably a
-	// subexpression with outer columns/side-effects/placeholders could be
-	// elided.
-	if !r.OuterCols.Equals(other.OuterCols) {
-		panic(fmt.Sprintf("outer cols mismatch: %s vs %s", r.OuterCols, other.OuterCols))
-	}
-	if r.CanHaveSideEffects != other.CanHaveSideEffects {
-		panic(fmt.Sprintf("can-have-side-effects mismatch"))
-	}
-	if r.HasPlaceholder != other.HasPlaceholder {
-		panic(fmt.Sprintf("has-placeholder mismatch"))
-	}
-}
-
-// Verify runs consistency checks against the relational properties, in order to
-// ensure that they conform to several invariants:
-//
-//   1. Functional dependencies are internally consistent.
-//
-func (s *Scalar) Verify() {
-	s.Shared.Verify()
-	s.FuncDeps.Verify()
 }

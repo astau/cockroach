@@ -12,7 +12,6 @@ import (
 	"bytes"
 	"context"
 	gosql "database/sql"
-	"errors"
 	"fmt"
 	"math/rand"
 	"strings"
@@ -20,6 +19,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
+	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
+	"github.com/cockroachdb/errors"
 	"github.com/spf13/pflag"
 )
 
@@ -184,12 +185,12 @@ func (m *roachmart) Tables() []workload.Table {
 		InitialRows: workload.Tuples(
 			m.orders,
 			func(rowIdx int) []interface{} {
-				user := users.InitialRows.Batch(rowIdx % m.users)[0]
+				user := users.InitialRows.BatchRows(rowIdx % m.users)[0]
 				zone, email := user[0], user[1]
 				return []interface{}{
-					zone,   // user_zone
-					email,  // user_email
-					rowIdx, // id
+					zone,                         // user_zone
+					email,                        // user_email
+					rowIdx,                       // id
 					[]string{`f`, `t`}[rowIdx%2], // fulfilled
 				}
 			},
@@ -200,7 +201,7 @@ func (m *roachmart) Tables() []workload.Table {
 
 // Ops implements the Opser interface.
 func (m *roachmart) Ops(
-	urls []string, reg *workload.HistogramRegistry,
+	ctx context.Context, urls []string, reg *histogram.Registry,
 ) (workload.QueryLoad, error) {
 	sqlDatabase, err := workload.SanitizeUrls(m, m.connFlags.DBOverride, urls)
 	if err != nil {
@@ -228,7 +229,7 @@ func (m *roachmart) Ops(
 			// our locality requirements.
 			var zone, email interface{}
 			for i := rng.Int(); ; i++ {
-				user := usersTable.InitialRows.Batch(i % m.users)[0]
+				user := usersTable.InitialRows.BatchRows(i % m.users)[0]
 				zone, email = user[0], user[1]
 				userLocal := zone == m.localZone
 				if userLocal == wantLocal {

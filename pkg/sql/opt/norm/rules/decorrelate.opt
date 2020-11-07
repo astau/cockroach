@@ -25,7 +25,6 @@
 # Citations: [3]
 # =============================================================================
 
-
 # DecorrelateJoin maps an apply join into the corresponding join without an
 # apply if the right side of the join is not correlated with the left side.
 # This allows the optimizer to consider additional physical join operators that
@@ -39,11 +38,12 @@
 [DecorrelateJoin, Normalize]
 (JoinApply
     $left:*
-    $right:* & ^(IsCorrelated $right $left)
+    $right:* & ^(IsCorrelated $right (OutputCols $left))
     $on:*
+    $private:*
 )
 =>
-(ConstructNonApplyJoin (OpName) $left $right $on)
+(ConstructNonApplyJoin (OpName) $left $right $on $private)
 
 # DecorrelateProjectSet pulls an input relation outside of a ProjectSet if the
 # input is not correlated with any of the functions in the ProjectSet. The
@@ -61,11 +61,9 @@
 =>
 (InnerJoin
     $input
-    (ProjectSet
-        (ConstructNoColsRow)
-        $zip
-    )
+    (ProjectSet (ConstructNoColsRow) $zip)
     []
+    (EmptyJoinPrivate)
 )
 
 # TryDecorrelateSelect "pushes down" the join apply into the select operator,
@@ -82,18 +80,17 @@
 #
 # Citations: [3] (see identity #3)
 [TryDecorrelateSelect, Normalize]
-(InnerJoin | InnerJoinApply | LeftJoin | LeftJoinApply |
- SemiJoin | SemiJoinApply | AntiJoin | AntiJoinApply
+(InnerJoin | InnerJoinApply | LeftJoin | LeftJoinApply | SemiJoin
+        | SemiJoinApply | AntiJoin | AntiJoinApply
     $left:*
-    $right:* & (HasOuterCols $right) & (Select $input:* $filters:*)
+    $right:* &
+        (HasOuterCols $right) &
+        (Select $input:* $filters:*)
     $on:*
+    $private:*
 )
 =>
-((OpName)
-    $left
-    $input
-    (ConcatFilters $on $filters)
-)
+((OpName) $left $input (ConcatFilters $on $filters) $private)
 
 # TryDecorrelateProject "pushes down" a Join into a Project operator, in an
 # attempt to eliminate any correlation between the projection list and the left
@@ -109,15 +106,12 @@
         (HasOuterCols $right) &
         (Project $input:* $projections:* $passthrough:*)
     $on:*
+    $private:*
 )
 =>
 (Select
     (Project
-        ((OpName)
-            $left
-            $input
-            []
-        )
+        ((OpName) $left $input [] $private)
         $projections
         (UnionCols (OutputCols $left) $passthrough)
     )
@@ -135,12 +129,17 @@
     $right:(Project
         (Select
             $selectInput:*
-            $filters:* & ^(FiltersBoundBy $filters (OutputCols $selectInput))
+            $filters:* &
+                ^(FiltersBoundBy
+                    $filters
+                    (OutputCols $selectInput)
+                )
         )
         $projections:*
         $passthrough:*
     )
     $on:*
+    $private:*
 )
 =>
 (Project
@@ -152,6 +151,7 @@
             (UnionCols $passthrough (OutputCols $selectInput))
         )
         (ConcatFilters $on $filters)
+        $private
     )
     []
     (OutputCols2 $left $right)
@@ -170,12 +170,18 @@
         $join:(InnerJoin | InnerJoinApply
             $innerLeft:*
             $innerRight:*
-            $innerOn:* & ^(FiltersBoundBy $innerOn (OutputCols2 $innerLeft $innerRight))
+            $innerOn:* &
+                ^(FiltersBoundBy
+                    $innerOn
+                    (OutputCols2 $innerLeft $innerRight)
+                )
+            $innerPrivate:*
         )
         $projections:*
         $passthrough:*
     )
     $on:*
+    $private:*
 )
 =>
 (Project
@@ -186,11 +192,13 @@
                 $innerLeft
                 $innerRight
                 []
+                $innerPrivate
             )
             $projections
             (UnionCols $passthrough (OutputCols $join))
         )
         (ConcatFilters $on $innerOn)
+        $private
     )
     []
     (OutputCols2 $left $right)
@@ -203,27 +211,30 @@
 #
 # TODO(andyk): Consider adding case for outer cols in $left.
 [TryDecorrelateInnerJoin, Normalize]
-(InnerJoin | InnerJoinApply | LeftJoin | LeftJoinApply |
- SemiJoin | SemiJoinApply | AntiJoin | AntiJoinApply
+(InnerJoin | InnerJoinApply | LeftJoin | LeftJoinApply | SemiJoin
+        | SemiJoinApply | AntiJoin | AntiJoinApply
     $left:*
     $right:* &
         (HasOuterCols $right) &
         (InnerJoin | InnerJoinApply
             $innerLeft:*
             $innerRight:*
-            $innerOn:* & ^(FiltersBoundBy $innerOn (OutputCols2 $innerLeft $innerRight))
+            $innerOn:* &
+                ^(FiltersBoundBy
+                    $innerOn
+                    (OutputCols2 $innerLeft $innerRight)
+                )
+            $innerPrivate:*
         )
     $on:*
+    $private:*
 )
 =>
 ((OpName)
     $left
-    ((OpName $right)
-        $innerLeft
-        $innerRight
-        []
-    )
+    ((OpName $right) $innerLeft $innerRight [] $innerPrivate)
     (ConcatFilters $on $innerOn)
+    $private
 )
 
 # TryDecorrelateInnerLeftJoin tries to decorrelate a LeftJoin operator nested
@@ -242,18 +253,17 @@
             $innerLeft:*
             $innerRight:*
             $innerOn:*
+            $innerPrivate:*
         )
     $on:* & (FiltersBoundBy $on (OutputCols2 $left $innerLeft))
+    $private:*
 )
 =>
 (LeftJoinApply
-    ((OpName)
-        $left
-        $innerLeft
-        $on
-    )
+    ((OpName) $left $innerLeft $on $innerPrivate)
     $innerRight
     $innerOn
+    $private
 )
 
 # TryDecorrelateGroupBy "pushes down" a Join into a GroupBy operator, in an
@@ -286,7 +296,9 @@
 # instead of CONST_AGG.
 #
 # An ordinality column only needs to be synthesized if "left" does not already
-# have a strict key.
+# have a strict key. We wrap the output in a Project operator to ensure that
+# the original output columns are preserved and the ordinality column is not
+# inadvertently added as a new output column.
 #
 # CONST_AGG is an internal aggregation function used when all rows in the
 # grouping set have the same value on the column.
@@ -304,22 +316,33 @@
         ) &
         (IsUnorderedGrouping $groupingPrivate)
     $on:*
+    $private:*
 )
 =>
-(Select
-    ((OpName $right)
-        (InnerJoinApply
-            $newLeft:(EnsureKey $left)
-            $input
-            []
+(Project
+    # Needed to project away any columns added by EnsureKey.
+    (Select
+        ((OpName $right)
+            (InnerJoinApply
+                $newLeft:(EnsureKey $left)
+                $input
+                []
+                $private
+            )
+            (AppendAggCols
+                $aggregations
+                ConstAgg
+                (NonKeyCols $newLeft)
+            )
+            (AddColsToGrouping
+                $groupingPrivate
+                (KeyCols $newLeft)
+            )
         )
-        (AppendAggCols
-            $aggregations
-            ConstAgg (NonKeyCols $newLeft)
-        )
-        (AddColsToGrouping $groupingPrivate (KeyCols $newLeft))
+        $on
     )
-    $on
+    []
+    (OutputCols2 $left $right)
 )
 
 # TryDecorrelateScalarGroupBy "pushes down" a Join into a ScalarGroupBy
@@ -421,37 +444,52 @@
         ) &
         (AggsCanBeDecorrelated $aggregations)
     $on:*
+    $private:*
 )
 =>
 (Select
-    # TranslateNonIgnoreAggs is where the actual discriminating CASE
-    # expressions are introduced.
-    (TranslateNonIgnoreAggs
-        (GroupBy
-            (LeftJoinApply
-                $leftWithKey:(EnsureKey $left)
-                # canaryCol might be 0 if no canary is necessary, in which case
-                # this function does nothing.
-                $rightWithCanary:(EnsureCanary
-                    $input
-                    $canaryCol:(EnsureCanaryCol $input $aggregations)
+    (Project
+        # Needed to project away any columns added by EnsureKey.
+        # TranslateNonIgnoreAggs is where the actual discriminating CASE
+        # expressions are introduced.
+        (TranslateNonIgnoreAggs
+            (GroupBy
+                (LeftJoinApply
+                    $leftWithKey:(EnsureKey $left)
+                    # canaryCol might be 0 if no canary is necessary, in which case
+                    # this function does nothing.
+                    $rightWithCanary:(EnsureCanary
+                        $input
+                        $canaryCol:(EnsureCanaryCol
+                            $input
+                            $aggregations
+                        )
+                    )
+                    []
+                    $private
                 )
-                []
-            )
-            (AppendAggCols2
-                $translatedAggs:(EnsureAggsCanIgnoreNulls
-                    $rightWithCanary
-                    $aggregations
+                (AppendAggCols2
+                    $translatedAggs:(EnsureAggsCanIgnoreNulls
+                        $rightWithCanary
+                        $aggregations
+                    )
+                    ConstAgg
+                    (NonKeyCols $leftWithKey)
+                    AnyNotNullAgg
+                    (CanaryColSet $canaryCol)
                 )
-                ConstAgg (NonKeyCols $leftWithKey)
-                AnyNotNullAgg (CanaryColSet $canaryCol)
+                (MakeGrouping
+                    (KeyCols $leftWithKey)
+                    (ExtractGroupingOrdering $groupingPrivate)
+                )
             )
-            (MakeOrderedGrouping (KeyCols $leftWithKey) (ExtractGroupingOrdering $groupingPrivate))
+            $translatedAggs
+            $rightWithCanary
+            $aggregations
+            $canaryCol
         )
-        $translatedAggs
-        $rightWithCanary
-        $aggregations
-        $canaryCol
+        []
+        (OutputCols2 $left $right)
     )
     $on
 )
@@ -467,19 +505,28 @@
     $left:*
     $right:* &
         (HasOuterCols $right) &
-        (CanHaveZeroRows $right) & # Let EliminateExistsGroupBy match instead.
+        (CanHaveZeroRows $right) &
+
+        # Let EliminateExistsGroupBy match instead.
         (GroupBy | DistinctOn | Project | ProjectSet)
     $on:*
+    $private:*
 )
 =>
-(GroupBy
-    (InnerJoinApply
-        $newLeft:(EnsureKey $left)
-        $right
-        $on
+(Project
+    # Needed to project away any columns added by EnsureKey.
+    (GroupBy
+        (InnerJoinApply
+            $newLeft:(EnsureKey $left)
+            $right
+            $on
+            $private
+        )
+        (MakeAggCols ConstAgg (NonKeyCols $newLeft))
+        (MakeGrouping (KeyCols $newLeft) (EmptyOrdering))
     )
-    (MakeAggCols ConstAgg (NonKeyCols $newLeft))
-    (MakeGrouping (KeyCols $newLeft))
+    []
+    (OutputCols2 $left $right)
 )
 
 # TryDecorrelateLimitOne "pushes down" a Join into a Limit 1 operator, in an
@@ -503,19 +550,23 @@
         (HasOuterCols $right) &
         (Limit $input:* (Const 1) $ordering:*)
     $on:*
+    $private:*
 )
 =>
-(DistinctOn
-    ((OpName)
-        $newLeft:(EnsureKey $left)
-        $input
-        $on
+(Project
+    # Needed to project away any columns added by EnsureKey.
+    (DistinctOn
+        ((OpName) $newLeft:(EnsureKey $left) $input $on $private)
+        (MakeAggCols2
+            ConstAgg
+            (NonKeyCols $newLeft)
+            FirstAgg
+            (OutputCols $input)
+        )
+        (MakeGrouping (KeyCols $newLeft) $ordering)
     )
-    (MakeAggCols2
-        ConstAgg (NonKeyCols $newLeft)
-        FirstAgg (OutputCols $input)
-    )
-    (MakeOrderedGrouping (KeyCols $newLeft) $ordering)
+    []
+    (OutputCols2 $left $right)
 )
 
 # TryDecorrelateProjectSet "pushes down" an InnerJoinApply operator into a
@@ -526,23 +577,172 @@
 [TryDecorrelateProjectSet, Normalize]
 (InnerJoinApply
     $left:*
-    (ProjectSet
-        $input:*
-        $zip:*
-    )
+    (ProjectSet $input:* $zip:*)
     $on:*
+    $private:*
 )
 =>
 (Select
-    (ProjectSet
-        (InnerJoinApply
-            $left
-            $input
-            []
-        )
-        $zip
-    )
+    (ProjectSet (InnerJoinApply $left $input [] $private) $zip)
     $on
+)
+
+# TryDecorrelateWindow "pushes down" a Join into a Window operator, in an
+# attempt to keep "digging" down to find and eliminate unnecessary correlation.
+# The eventual hope is to trigger the DecorrelateJoin rule to turn a JoinApply
+# operator into a non-apply Join operator. This rule is very similar to
+# TryDecorrelateGroupBy.
+#
+# This rule adds the output columns of the left side of the join to the Window
+# operator's partition cols. This effectively means that each row of the left
+# side of the join is windowed independently, assuming the left side has a key
+# (and if it doesn't, we can give it one via EnsureKey).
+#
+# SELECT
+#     left.k, left.x, right.x, rank
+# FROM
+#   left
+#   INNER JOIN LATERAL (
+#     SELECT rank() OVER () AS rank, right.x FROM (SELECT * FROM right WHERE left.k = right.k)
+#   )
+# =>
+# SELECT
+#   left.k, left.x, right.x, rank() OVER (PARTITION BY left.k) AS rank
+# FROM
+#   left INNER JOIN right ON left.k = right.k
+#
+# Sketch of why this rule works (assume A has a key):
+#
+# Recall from [3] that the definition of Apply (for cross joins) is:
+#
+#  (InnerJoinApply A E true) = (Union_{r ∈ A} {r} × E(r))
+#
+# Where E is a relational expression mapping rows r ∈ A to relational result
+# sets.
+#
+# Starting with (InnerJoinApply A (Window B partcols) on), where P is the set of
+# partition columns and p is the join predicate.
+#
+#  = (Select (InnerJoinApply A (Window B partcols) true) on)
+#
+# By the inverse of MergeSelectInnerJoin.
+#
+#  = (Select
+#      (Union_{r ∈ A} {r} × (Window B partcols)(r))
+#      on
+#    )
+#
+# By the definition of Apply.
+#
+#  = (Select
+#      (Union_{r ∈ A} {r} × (Window B(r) partcols))
+#      on
+#    )
+#
+# By the fact that by construction, window functions only refer to
+# variable references in their input.
+#
+#  = (Select
+#      (Union_{r ∈ A} (Window {r} × B(r) partcols))
+#      on
+#    )
+#
+# Because the Window only looks at columns from B(r).
+#
+#  = (Select
+#      (Window
+#        (Union_{r ∈ A} {r} × B(r))
+#        (Union partcols (KeyCols A))
+#      )
+#      on
+#    )
+#
+# Roughly, since A has a key, partitioning (Union_{r ∈ A} r × B(r)) by the key
+# of A results in exactly one partition for each row in A, and so partitioning
+# higher up has the same effect as performing the window function for each row.
+#
+#  = (Select
+#      (Window
+#        (InnerJoinApply A B true)
+#        (Union partcols (OutputCols A))
+#      )
+#      on
+#    )
+#
+# Again by the definition of Apply.
+[TryDecorrelateWindow, Normalize]
+(InnerJoinApply | InnerJoin
+    $left:*
+    $right:(Window $input:* $windows:* $private:*) &
+        (HasOuterCols $right)
+    $on:*
+    $joinPrivate:*
+)
+=>
+(Project
+    # Needed to project away any columns added by EnsureKey.
+    (Select
+        (Window
+            ((OpName)
+                $newLeft:(EnsureKey $left)
+                $input
+                []
+                $joinPrivate
+            )
+            $windows
+            (AddColsToPartition $private (KeyCols $newLeft))
+        )
+        $on
+    )
+    []
+    (OutputCols2 $left $right)
+)
+
+# TryDecorrelateMax1Row "pushes down" a Join into a Max1Row operator, in an
+# attempt to keep "digging" down to find and eliminate unnecessary correlation.
+# The eventual hope is to trigger the DecorrelateJoin rule to turn a JoinApply
+# operator into a non-apply Join operator.
+#
+# The Max1Row operator is mapped into an EnsureDistinctOn operator that wraps
+# the join and raises an error if it detects duplicates in the column(s) that
+# made up the key of the join's left input. A duplicate value in those key
+# column(s) indicates that more than one row from the right input matched that
+# value. Or in other words, it indicates that the Max1Row's subquery input would
+# have returned more than one row corresponding to that value. Therefore, the
+# two formulations are equivalent.
+#
+# TryDecorrelateMax1Row only matches when the join's "on" condition is true.
+# This is because pushing a non-true filter through the EnsureDistinctOn would
+# result in different error behavior. Since there are currently no situations
+# where the join's "on" condition is anything other than true, and since these
+# cases therefore cannot be tested, TryDecorrelateMax1Row only matches when the
+# "on" condition is true. If this changes, TryDecorrelateMax1Row should hoist
+# the non-true "on" conditions above the EnsureDistinctOn operator.
+[TryDecorrelateMax1Row, Normalize]
+(InnerJoin | InnerJoinApply | LeftJoin | LeftJoinApply
+    $left:*
+    $right:* &
+        (HasOuterCols $right) &
+        (Max1Row $input:* $errorText:*)
+    []
+    $private:*
+)
+=>
+(Project
+    (EnsureDistinctOn
+        ((OpName) $newLeft:(EnsureKey $left) $input [] $private)
+        (MakeAggCols
+            ConstAgg
+            (UnionCols (NonKeyCols $newLeft) (OutputCols $input))
+        )
+        (MakeErrorOnDupGrouping
+            (KeyCols $newLeft)
+            (EmptyOrdering)
+            $errorText
+        )
+    )
+    []
+    (OutputCols2 $left $right)
 )
 
 # HoistSelectExists extracts existential subqueries from Select filters,
@@ -567,11 +767,7 @@
 )
 =>
 (Select
-    (SemiJoinApply
-        $input
-        $subquery
-        []
-    )
+    (SemiJoinApply $input $subquery [] (EmptyJoinPrivate))
     (RemoveFiltersItem $filters $item)
 )
 
@@ -593,11 +789,7 @@
 )
 =>
 (Select
-    (AntiJoinApply
-        $input
-        $subquery
-        []
-    )
+    (AntiJoinApply $input $subquery [] (EmptyJoinPrivate))
     (RemoveFiltersItem $filters $item)
 )
 
@@ -629,7 +821,11 @@
 [HoistProjectSubquery, Normalize, LowPriority]
 (Project
     $input:*
-    $projections:[ ... $item:* & (HasHoistableSubquery $item) ... ]
+    $projections:[
+        ...
+        $item:* & (HasHoistableSubquery $item)
+        ...
+    ]
     $passthrough:*
 )
 =>
@@ -637,17 +833,19 @@
 
 # HoistJoinSubquery extracts subqueries from a join filter and joins them with
 # the join's right input. This and other subquery hoisting patterns create a
-# single, top-level relational query with no nesting.
+# single, top-level relational query with no nesting. This rule only applies to
+# join types which have a legal apply variant.
 #
 # This rule is marked as low priority for the same reason as HoistSelectExists.
 [HoistJoinSubquery, Normalize, LowPriority]
-(Join
+(InnerJoin | LeftJoin | SemiJoin | AntiJoin
     $left:*
     $right:*
     $on:[ ... $item:* & (HasHoistableSubquery $item) ... ]
+    $private:*
 )
 =>
-(HoistJoinSubquery (OpName) $left $right $on)
+(HoistJoinSubquery (OpName) $left $right $on $private)
 
 # HoistValuesSubquery extracts subqueries from row tuples and joins them with
 # the Values operator. This and other subquery hoisting patterns create a
@@ -657,10 +855,10 @@
 [HoistValuesSubquery, Normalize, LowPriority]
 (Values
     $rows:[ ... $item:* & (HasHoistableSubquery $item) ... ]
-    $cols:*
+    $private:*
 )
 =>
-(HoistValuesSubquery $rows $cols)
+(HoistValuesSubquery $rows $private)
 
 # HoistProjectSetSubquery extracts subqueries from zipped functions and joins
 # them with the ProjectSet operator's input. This and other subquery hoisting
@@ -675,7 +873,6 @@
 =>
 (HoistProjectSetSubquery $input $zip)
 
-
 # NormalizeSelectAnyFilter rewrites an Any expression that is a top-level
 # conjunct in Select filters, turning it into an Exists expression. Any can be
 # rewritten as Exists in this context because a NULL return value is treated as
@@ -688,7 +885,13 @@
 [NormalizeSelectAnyFilter, Normalize]
 (Select
     $input:*
-    $filters:[ ... $item:(FiltersItem (Any $anyInput:* $scalar:* $anyPrivate:*)) ... ]
+    $filters:[
+        ...
+        $item:(FiltersItem
+            (Any $anyInput:* $scalar:* $anyPrivate:*)
+        )
+        ...
+    ]
 )
 =>
 (Select
@@ -699,7 +902,15 @@
         (Exists
             (Select
                 $anyInput
-                [ (FiltersItem (ConstructAnyCondition $anyInput $scalar $anyPrivate)) ]
+                [
+                    (FiltersItem
+                        (ConstructAnyCondition
+                            $anyInput
+                            $scalar
+                            $anyPrivate
+                        )
+                    )
+                ]
             )
             $anyPrivate
         )
@@ -712,7 +923,14 @@
 (Join
     $left:*
     $right:*
-    $on:[ ... $item:(FiltersItem (Any $anyInput:* $scalar:* $anyPrivate:*)) ... ]
+    $on:[
+        ...
+        $item:(FiltersItem
+            (Any $anyInput:* $scalar:* $anyPrivate:*)
+        )
+        ...
+    ]
+    $private:*
 )
 =>
 ((OpName)
@@ -724,11 +942,20 @@
         (Exists
             (Select
                 $anyInput
-                [ (FiltersItem (ConstructAnyCondition $anyInput $scalar $anyPrivate)) ]
+                [
+                    (FiltersItem
+                        (ConstructAnyCondition
+                            $anyInput
+                            $scalar
+                            $anyPrivate
+                        )
+                    )
+                ]
             )
             $anyPrivate
         )
     )
+    $private
 )
 
 # NormalizeSelectNotAnyFilter rewrites a Not Any expression that is a top-level
@@ -743,7 +970,13 @@
 [NormalizeSelectNotAnyFilter, Normalize]
 (Select
     $input:*
-    $filters:[ ... $item:(FiltersItem (Not (Any $anyInput:* $scalar:* $anyPrivate:*))) ... ]
+    $filters:[
+        ...
+        $item:(FiltersItem
+            (Not (Any $anyInput:* $scalar:* $anyPrivate:*))
+        )
+        ...
+    ]
 )
 =>
 (Select
@@ -758,7 +991,11 @@
                     [
                         (FiltersItem
                             (IsNot
-                                (ConstructAnyCondition $anyInput $scalar $anyPrivate)
+                                (ConstructAnyCondition
+                                    $anyInput
+                                    $scalar
+                                    $anyPrivate
+                                )
                                 (False)
                             )
                         )
@@ -777,7 +1014,14 @@
 (Join
     $left:*
     $right:*
-    $on:[ ... $item:(FiltersItem (Not (Any $anyInput:* $scalar:* $anyPrivate:*))) ... ]
+    $on:[
+        ...
+        $item:(FiltersItem
+            (Not (Any $anyInput:* $scalar:* $anyPrivate:*))
+        )
+        ...
+    ]
+    $private:*
 )
 =>
 ((OpName)
@@ -793,7 +1037,11 @@
                     [
                         (FiltersItem
                             (IsNot
-                                (ConstructAnyCondition $anyInput $scalar $anyPrivate)
+                                (ConstructAnyCondition
+                                    $anyInput
+                                    $scalar
+                                    $anyPrivate
+                                )
                                 (False)
                             )
                         )
@@ -803,4 +1051,5 @@
             )
         )
     )
+    $private
 )

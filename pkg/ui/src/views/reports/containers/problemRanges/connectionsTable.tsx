@@ -1,21 +1,17 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 import _ from "lodash";
 import classNames from "classnames";
 import React from "react";
-import { Link } from "react-router";
+import { Link } from "react-router-dom";
 
 import * as protos from "src/js/protos";
 import { CachedDataReducerState } from "src/redux/cachedDataReducer";
@@ -53,6 +49,10 @@ const connectionTableColumns: ConnectionTableColumn[] = [
     extract: (problem) => problem.underreplicated_range_ids.length,
   },
   {
+    title: "Overreplicated",
+    extract: (problem) => problem.overreplicated_range_ids.length,
+  },
+  {
     title: "Quiescent equals ticking",
     extract: (problem) => problem.quiescent_equals_ticking_range_ids.length,
   },
@@ -68,6 +68,7 @@ const connectionTableColumns: ConnectionTableColumn[] = [
         problem.no_lease_range_ids.length +
         problem.raft_leader_not_lease_holder_range_ids.length +
         problem.underreplicated_range_ids.length +
+        problem.overreplicated_range_ids.length +
         problem.quiescent_equals_ticking_range_ids.length +
         problem.raft_log_too_large_range_ids.length;
     },
@@ -90,7 +91,7 @@ export default function ConnectionsTable(props: ConnectionsTableProps) {
     .value();
   return (
     <div>
-      <h2>Connections (via Node {data.node_id})</h2>
+      <h2 className="base-heading">Connections (via Node {data.node_id})</h2>
       <table className="connections-table">
         <tbody>
           <tr className="connections-table__row connections-table__row--header">

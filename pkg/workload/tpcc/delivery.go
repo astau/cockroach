@@ -1,17 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tpcc
 
@@ -19,14 +14,14 @@ import (
 	"context"
 	gosql "database/sql"
 	"fmt"
-	"math/rand"
 	"strings"
 	"sync/atomic"
 
 	"github.com/cockroachdb/cockroach-go/crdb"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
+	"golang.org/x/exp/rand"
 )
 
 // 2.7 The Delivery Transaction
@@ -86,7 +81,7 @@ func createDelivery(
 func (del *delivery) run(ctx context.Context, wID int) (interface{}, error) {
 	atomic.AddUint64(&del.config.auditor.deliveryTransactions, 1)
 
-	rng := rand.New(rand.NewSource(timeutil.Now().UnixNano()))
+	rng := rand.New(rand.NewSource(uint64(timeutil.Now().UnixNano())))
 
 	oCarrierID := rng.Intn(10) + 1
 	olDeliveryD := timeutil.Now()
@@ -105,7 +100,7 @@ func (del *delivery) run(ctx context.Context, wID int) (interface{}, error) {
 				var oID int
 				if err := del.selectNewOrder.QueryRowTx(ctx, tx, wID, dID).Scan(&oID); err != nil {
 					// If no matching order is found, the delivery of this order is skipped.
-					if err != gosql.ErrNoRows {
+					if !errors.Is(err, gosql.ErrNoRows) {
 						atomic.AddUint64(&del.config.auditor.skippedDelivieries, 1)
 						return err
 					}

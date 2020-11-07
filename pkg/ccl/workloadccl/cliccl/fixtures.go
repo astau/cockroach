@@ -1,17 +1,10 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Licensed as a CockroachDB Enterprise file under the Cockroach Community
+// License (the "License"); you may not use this file except in compliance with
+// the License. You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
 
 package cliccl
 
@@ -23,10 +16,13 @@ import (
 
 	"cloud.google.com/go/storage"
 	"github.com/cockroachdb/cockroach/pkg/ccl/workloadccl"
+	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
 	workloadcli "github.com/cockroachdb/cockroach/pkg/workload/cli"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/workload/workloadsql"
+	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"google.golang.org/api/option"
@@ -50,7 +46,8 @@ func config() workloadccl.FixtureConfig {
 	if len(*gcsBillingProjectOverride) > 0 {
 		config.BillingProject = *gcsBillingProjectOverride
 	}
-	config.CSVServerURL = *fixturesMakeCSVServerURL
+	config.CSVServerURL = *fixturesMakeImportCSVServerURL
+	config.TableStats = *fixturesMakeTableStats
 	return config
 }
 
@@ -65,7 +62,7 @@ var fixturesListCmd = workloadcli.SetCmdDefaults(&cobra.Command{
 })
 var fixturesMakeCmd = workloadcli.SetCmdDefaults(&cobra.Command{
 	Use:   `make`,
-	Short: `regenerate and store a fixture on GCS`,
+	Short: `IMPORT a fixture and then store a BACKUP of it on GCS`,
 })
 var fixturesLoadCmd = workloadcli.SetCmdDefaults(&cobra.Command{
 	Use:   `load`,
@@ -80,7 +77,10 @@ var fixturesURLCmd = workloadcli.SetCmdDefaults(&cobra.Command{
 	Short: `generate the GCS URL for a fixture`,
 })
 
-var fixturesMakeCSVServerURL = fixturesMakeCmd.PersistentFlags().String(
+var fixturesLoadImportShared = pflag.NewFlagSet(`load/import`, pflag.ContinueOnError)
+var fixturesMakeImportShared = pflag.NewFlagSet(`load/import`, pflag.ContinueOnError)
+
+var fixturesMakeImportCSVServerURL = fixturesMakeImportShared.String(
 	`csv-server`, ``,
 	`Skip saving CSVs to cloud storage, instead get them from a 'csv-server' running at this url`)
 
@@ -88,10 +88,23 @@ var fixturesMakeOnlyTable = fixturesMakeCmd.PersistentFlags().String(
 	`only-tables`, ``,
 	`Only load the tables with the given comma-separated names`)
 
-var fixturesLoadImportShared = pflag.NewFlagSet(`load/import`, pflag.ContinueOnError)
+var fixturesMakeFilesPerNode = fixturesMakeCmd.PersistentFlags().Int(
+	`files-per-node`, 1,
+	`number of file URLs to generate per node when using csv-server`)
+
+var fixturesMakeTableStats = fixturesMakeCmd.PersistentFlags().Bool(
+	`table-stats`, true,
+	`generate full table statistics for all tables`)
+
+var fixturesImportFilesPerNode = fixturesImportCmd.PersistentFlags().Int(
+	`files-per-node`, 1,
+	`number of file URLs to generate per node`)
 
 var fixturesRunChecks = fixturesLoadImportShared.Bool(
 	`checks`, true, `Run validity checks on the loaded fixture`)
+
+var fixturesImportInjectStats = fixturesImportCmd.PersistentFlags().Bool(
+	`inject-stats`, true, `Inject pre-calculated statistics if they are available`)
 
 var gcsBucketOverride, gcsPrefixOverride, gcsBillingProjectOverride *string
 
@@ -115,14 +128,14 @@ const storageError = `failed to create google cloud client ` +
 // caller is responsible for closing it.
 func getStorage(ctx context.Context) (*storage.Client, error) {
 	// TODO(dan): Right now, we don't need all the complexity of
-	// storageccl.ExportStorage, but if we start supporting more than just GCS,
+	// cloud.ExternalStorage, but if we start supporting more than just GCS,
 	// this should probably be switched to it.
 	g, err := storage.NewClient(ctx, option.WithScopes(storage.ScopeReadWrite))
 	return g, errors.Wrap(err, storageError)
 }
 
 func init() {
-	workloadcli.AddSubCmd(func() *cobra.Command {
+	workloadcli.AddSubCmd(func(userFacing bool) *cobra.Command {
 		for _, meta := range workload.Registered() {
 			gen := meta.New()
 			var genFlags *pflag.FlagSet
@@ -144,6 +157,7 @@ func init() {
 				Args: cobra.RangeArgs(0, 1),
 			})
 			genMakeCmd.Flags().AddFlagSet(genFlags)
+			genMakeCmd.Flags().AddFlagSet(fixturesMakeImportShared)
 			genMakeCmd.Run = workloadcli.CmdHelper(gen, fixturesMake)
 			fixturesMakeCmd.AddCommand(genMakeCmd)
 
@@ -162,6 +176,7 @@ func init() {
 			})
 			genImportCmd.Flags().AddFlagSet(genFlags)
 			genImportCmd.Flags().AddFlagSet(fixturesLoadImportShared)
+			genImportCmd.Flags().AddFlagSet(fixturesMakeImportShared)
 			genImportCmd.Run = workloadcli.CmdHelper(gen, fixturesImport)
 			fixturesImportCmd.AddCommand(genImportCmd)
 
@@ -244,7 +259,8 @@ func fixturesMake(gen workload.Generator, urls []string, _ string) error {
 			filter: filter,
 		}
 	}
-	fixture, err := workloadccl.MakeFixture(ctx, sqlDB, gcs, config(), gen)
+	filesPerNode := *fixturesMakeFilesPerNode
+	fixture, err := workloadccl.MakeFixture(ctx, sqlDB, gcs, config(), gen, filesPerNode)
 	if err != nil {
 		return err
 	}
@@ -252,6 +268,29 @@ func fixturesMake(gen workload.Generator, urls []string, _ string) error {
 		log.Infof(ctx, `stored backup %s`, table.BackupURI)
 	}
 	return nil
+}
+
+// restoreDataLoader is an InitialDataLoader implementation that loads data with
+// RESTORE.
+type restoreDataLoader struct {
+	fixture  workloadccl.Fixture
+	database string
+}
+
+// InitialDataLoad implements the InitialDataLoader interface.
+func (l restoreDataLoader) InitialDataLoad(
+	ctx context.Context, db *gosql.DB, gen workload.Generator,
+) (int64, error) {
+	log.Infof(ctx, "starting restore of %d tables", len(gen.Tables()))
+	start := timeutil.Now()
+	bytes, err := workloadccl.RestoreFixture(ctx, db, l.fixture, l.database, true /* injectStats */)
+	if err != nil {
+		return 0, errors.Wrap(err, `restoring fixture`)
+	}
+	elapsed := timeutil.Since(start)
+	log.Infof(ctx, "restored %s bytes in %d tables (took %s, %s)",
+		humanizeutil.IBytes(bytes), len(gen.Tables()), elapsed, humanizeutil.DataRate(bytes, elapsed))
+	return bytes, nil
 }
 
 func fixturesLoad(gen workload.Generator, urls []string, dbName string) error {
@@ -274,13 +313,15 @@ func fixturesLoad(gen workload.Generator, urls []string, dbName string) error {
 	if err != nil {
 		return errors.Wrap(err, `finding fixture`)
 	}
-	if err := workloadccl.RestoreFixture(ctx, sqlDB, fixture, dbName); err != nil {
-		return errors.Wrap(err, `restoring fixture`)
+
+	l := restoreDataLoader{fixture: fixture, database: dbName}
+	if _, err := workloadsql.Setup(ctx, sqlDB, gen, l); err != nil {
+		return err
 	}
 
 	if hooks, ok := gen.(workload.Hookser); *fixturesRunChecks && ok {
 		if consistencyCheckFn := hooks.Hooks().CheckConsistency; consistencyCheckFn != nil {
-			log.Info(ctx, "fixture is restored; now running consistency checks (ctrl-c to abort)")
+			log.Info(ctx, "fixture is imported; now running consistency checks (ctrl-c to abort)")
 			if err := consistencyCheckFn(ctx, sqlDB); err != nil {
 				return err
 			}
@@ -300,13 +341,18 @@ func fixturesImport(gen workload.Generator, urls []string, dbName string) error 
 		return err
 	}
 
-	if err := workloadccl.ImportFixture(ctx, sqlDB, gen, dbName); err != nil {
-		return errors.Wrap(err, `importing fixture`)
+	l := workloadccl.ImportDataLoader{
+		FilesPerNode: *fixturesImportFilesPerNode,
+		InjectStats:  *fixturesImportInjectStats,
+		CSVServer:    *fixturesMakeImportCSVServerURL,
+	}
+	if _, err := workloadsql.Setup(ctx, sqlDB, gen, l); err != nil {
+		return err
 	}
 
 	if hooks, ok := gen.(workload.Hookser); *fixturesRunChecks && ok {
 		if consistencyCheckFn := hooks.Hooks().CheckConsistency; consistencyCheckFn != nil {
-			log.Info(ctx, "fixture is imported; now running consistency checks (ctrl-c to abort)")
+			log.Info(ctx, "fixture is restored; now running consistency checks (ctrl-c to abort)")
 			if err := consistencyCheckFn(ctx, sqlDB); err != nil {
 				return err
 			}

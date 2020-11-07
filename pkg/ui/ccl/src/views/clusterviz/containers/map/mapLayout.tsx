@@ -1,8 +1,8 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Cockroach Community Licence (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Licensed as a CockroachDB Enterprise file under the Cockroach Community
+// License (the "License"); you may not use this file except in compliance with
+// the License. You may obtain a copy of the License at
 //
 //     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
 
@@ -163,11 +163,13 @@ export class MapLayout extends React.Component<MapLayoutProps, MapLayoutState> {
     this.rezoomToLocalities(this.state.zoomTransform);
   }
 
-  componentWillReceiveProps(props: MapLayoutProps) {
-    const zoomTransform = this.state.zoomTransform.withViewportSize(props.viewportSize);
-    this.setState({
-      zoomTransform,
-    });
+  componentDidUpdate() {
+    const zoomTransform = this.state.zoomTransform.withViewportSize(this.props.viewportSize);
+    if (!_.isEqual(this.state.zoomTransform, zoomTransform)) {
+      this.setState({
+        zoomTransform,
+      });
+    }
     this.rezoomToLocalities(zoomTransform);
   }
 

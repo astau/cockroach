@@ -1,18 +1,12 @@
-/**
-Copyright 2015 The Cockroach Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-implied. See the License for the specific language governing
-permissions and limitations under the License.
-*/
+// Copyright 2019 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 @require '~styl/base/palette.styl'
 @require '~styl/base/layout-vars.styl'
@@ -35,22 +29,7 @@ $subnav-background  = $background-color
 
 .page-config
   padding-left 24px
-  // Stick to the top.
-  position sticky
-  position -webkit-sticky
-  top 0
-  // We want 10px of spacing above and below this div when
-  // it's fixed during scrolling, but not when the page
-  // is scrolled to the top. This combination of padding
-  // and negative margins achieves that.
-  padding-bottom 10px
-  padding-top 10px
-  margin-bottom -10px
-  margin-top -10px
-
-  z-index $z-index-page-config
   background-color $background-color
-  max-width 1350px
 
   &__list
     display flex
@@ -87,7 +66,7 @@ $subnav-background  = $background-color
 .section
   flex 0 0 auto
   padding 12px 24px
-  max-width 1350px
+  max-width $max-window-width
   clearfix()
 
   &--heading
@@ -100,7 +79,7 @@ $subnav-background  = $background-color
 .parent-link a
   color $link-color
   font-size 14px
-  font-family Lato-Regular
+  font-family $font-family--base
   font-weight bold
   text-transform uppercase
   text-decoration none
@@ -148,7 +127,7 @@ $subnav-background  = $background-color
   &__tooltip
     color $tooltip-color
     display inline-block
-    font-family Lato-Regular
+    font-family $font-family--base
     font-size 14px
     font-weight normal
     letter-spacing 0

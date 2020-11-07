@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package testutils
 
@@ -23,11 +19,11 @@ import (
 // embedded certs and the default node user. The default node user has both
 // server and client certificates.
 func NewNodeTestBaseContext() *base.Config {
-	return NewTestBaseContext(security.NodeUser)
+	return NewTestBaseContext(security.NodeUserName())
 }
 
 // NewTestBaseContext creates a secure base context for user.
-func NewTestBaseContext(user string) *base.Config {
+func NewTestBaseContext(user security.SQLUsername) *base.Config {
 	cfg := &base.Config{
 		Insecure: false,
 		User:     user,

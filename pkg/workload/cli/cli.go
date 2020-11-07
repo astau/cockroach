@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package cli
 
@@ -19,6 +14,7 @@ import (
 	"os"
 
 	"github.com/cockroachdb/cockroach/pkg/workload"
+	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
 )
 
@@ -30,33 +26,32 @@ func WorkloadCmd(userFacing bool) *cobra.Command {
 		Short: `generators for data and query loads`,
 	})
 	for _, subCmdFn := range subCmdFns {
-		rootCmd.AddCommand(subCmdFn())
+		rootCmd.AddCommand(subCmdFn(userFacing))
 	}
 	if userFacing {
-		whitelist := map[string]struct{}{
+		allowlist := map[string]struct{}{
 			`workload`: {},
 			`init`:     {},
 			`run`:      {},
 		}
 		for _, m := range workload.Registered() {
-			whitelist[m.Name] = struct{}{}
+			allowlist[m.Name] = struct{}{}
 		}
-		var addExperimental func(c *cobra.Command)
-		addExperimental = func(c *cobra.Command) {
-			c.Short = `[experimental] ` + c.Short
-			if _, ok := whitelist[c.Name()]; !ok {
+		var hideNonPublic func(c *cobra.Command)
+		hideNonPublic = func(c *cobra.Command) {
+			if _, ok := allowlist[c.Name()]; !ok {
 				c.Hidden = true
 			}
 			for _, sub := range c.Commands() {
-				addExperimental(sub)
+				hideNonPublic(sub)
 			}
 		}
-		addExperimental(rootCmd)
+		hideNonPublic(rootCmd)
 	}
 	return rootCmd
 }
 
-var subCmdFns []func() *cobra.Command
+var subCmdFns []func(userFacing bool) *cobra.Command
 
 // AddSubCmd adds a sub-command closure to the workload cli.
 //
@@ -67,7 +62,7 @@ var subCmdFns []func() *cobra.Command
 // now sometimes done in the outermost possible place (main.go) and so its init
 // runs last. Instead, we return a closure that is called in the main function,
 // which is guaranteed to run after all inits.
-func AddSubCmd(fn func() *cobra.Command) {
+func AddSubCmd(fn func(userFacing bool) *cobra.Command) {
 	subCmdFns = append(subCmdFns, fn)
 }
 
@@ -78,7 +73,11 @@ func HandleErrs(
 	return func(cmd *cobra.Command, args []string) {
 		err := f(cmd, args)
 		if err != nil {
+			hint := errors.FlattenHints(err)
 			cmd.Println("Error:", err.Error())
+			if hint != "" {
+				cmd.Println("Hint:", hint)
+			}
 			os.Exit(1)
 		}
 	}

@@ -1,24 +1,18 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package server_test
 
 import (
 	"context"
-	gosql "database/sql"
 	"fmt"
-	"net/url"
 	"testing"
 	"time"
 
@@ -29,7 +23,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 const strKey = "testing.str"
@@ -67,12 +62,13 @@ var enumA = settings.RegisterEnumSetting(enumKey, "desc", "foo", map[int64]strin
 
 func TestSettingsRefresh(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// Set up some additional cluster settings to play around with. Note that we
 	// need to do this before starting the server, or there will be data races.
 	st := cluster.MakeTestingClusterSettings()
 	s, rawDB, _ := serverutils.StartServer(t, base.TestServerArgs{Settings: st})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	db := sqlutils.MakeSQLRunner(rawDB)
 
@@ -192,11 +188,12 @@ func TestSettingsRefresh(t *testing.T) {
 
 func TestSettingsSetAndShow(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	// Set up some additional cluster settings to play around with. Note that we
 	// need to do this before starting the server, or there will be data races.
 	st := cluster.MakeTestingClusterSettings()
 	s, rawDB, _ := serverutils.StartServer(t, base.TestServerArgs{Settings: st})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	db := sqlutils.MakeSQLRunner(rawDB)
 
@@ -241,7 +238,7 @@ func TestSettingsSetAndShow(t *testing.T) {
 	if expected, actual := int64(2), enumA.Get(&st.SV); expected != actual {
 		t.Fatalf("expected %v, got %v", expected, actual)
 	}
-	if expected, actual := "2", db.QueryStr(t, fmt.Sprintf(showQ, enumKey))[0][0]; expected != actual {
+	if expected, actual := "bar", db.QueryStr(t, fmt.Sprintf(showQ, enumKey))[0][0]; expected != actual {
 		t.Fatalf("expected %v, got %v", expected, actual)
 	}
 
@@ -249,7 +246,7 @@ func TestSettingsSetAndShow(t *testing.T) {
 	if expected, actual := int64(1), enumA.Get(&st.SV); expected != actual {
 		t.Fatalf("expected %v, got %v", expected, actual)
 	}
-	if expected, actual := "1", db.QueryStr(t, fmt.Sprintf(showQ, enumKey))[0][0]; expected != actual {
+	if expected, actual := "foo", db.QueryStr(t, fmt.Sprintf(showQ, enumKey))[0][0]; expected != actual {
 		t.Fatalf("expected %v, got %v", expected, actual)
 	}
 
@@ -259,47 +256,18 @@ func TestSettingsSetAndShow(t *testing.T) {
 	)
 
 	db.ExpectErr(t, `invalid integer value '7' for enum setting`, fmt.Sprintf(setQ, enumKey, "7"))
-
-	db.Exec(t, `CREATE USER testuser`)
-	pgURL, cleanupFunc := sqlutils.PGUrl(t, s.ServingAddr(), t.Name(), url.User("testuser"))
-	defer cleanupFunc()
-	testuser, err := gosql.Open("postgres", pgURL.String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer testuser.Close()
-
-	if _, err := testuser.Exec(`SET CLUSTER SETTING foo = 'bar'`); !testutils.IsError(err,
-		`only superusers are allowed to SET CLUSTER SETTING`,
-	) {
-		t.Fatal(err)
-	}
-	if _, err := testuser.Exec(`SHOW CLUSTER SETTING foo`); !testutils.IsError(err,
-		`only superusers are allowed to SHOW CLUSTER SETTINGS`,
-	) {
-		t.Fatal(err)
-	}
-	if _, err := testuser.Exec(`SHOW ALL CLUSTER SETTINGS`); !testutils.IsError(err,
-		`only superusers are allowed to SHOW CLUSTER SETTINGS`,
-	) {
-		t.Fatal(err)
-	}
-	if _, err := testuser.Exec(`SELECT * FROM crdb_internal.cluster_settings`); !testutils.IsError(err,
-		`only superusers are allowed to read crdb_internal.cluster_settings`,
-	) {
-		t.Fatal(err)
-	}
 }
 
 func TestSettingsShowAll(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// Set up some additional cluster settings to play around with. Note that we
 	// need to do this before starting the server, or there will be data races.
 	st := cluster.MakeTestingClusterSettings()
 
 	s, rawDB, _ := serverutils.StartServer(t, base.TestServerArgs{Settings: st})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	db := sqlutils.MakeSQLRunner(rawDB)
 
@@ -307,8 +275,9 @@ func TestSettingsShowAll(t *testing.T) {
 	if len(rows) < 2 {
 		t.Fatalf("show all returned too few rows (%d)", len(rows))
 	}
-	if len(rows[0]) != 4 {
-		t.Fatalf("show all must return 4 columns, found %d", len(rows[0]))
+	const expColumns = 5
+	if len(rows[0]) != expColumns {
+		t.Fatalf("show all must return %d columns, found %d", expColumns, len(rows[0]))
 	}
 	hasIntKey := false
 	hasStrKey := false

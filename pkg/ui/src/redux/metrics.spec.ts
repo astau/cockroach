@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 import { assert } from "chai";
 import _ from "lodash";
@@ -18,8 +14,7 @@ import Long from "long";
 import { expectSaga, testSaga } from "redux-saga-test-plan";
 import * as matchers from "redux-saga-test-plan/matchers";
 
-import { delay } from "redux-saga";
-import { call, put } from "redux-saga/effects";
+import { call, put, delay } from "redux-saga/effects";
 import { queryTimeSeries, TimeSeriesQueryRequestMessage } from "src/util/api";
 import * as protos from "src/js/protos";
 
@@ -240,11 +235,11 @@ describe("metrics reducer", function() {
             assert.deepEqual(
               effects.call,
               [
-                call(delay, 0),
+                delay(0),
                 call(metrics.batchAndSendRequests, [requestAction.payload, requestAction.payload, requestAction.payload]),
-                call(delay, 0),
+                delay(0),
                 call(metrics.batchAndSendRequests, [requestAction.payload]),
-                call(delay, 0),
+                delay(0),
                 call(metrics.batchAndSendRequests, [requestAction.payload, requestAction.payload]),
               ],
             );

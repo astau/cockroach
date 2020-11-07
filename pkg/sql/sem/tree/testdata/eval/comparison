@@ -26,6 +26,26 @@ eval
 false
 
 eval
+1 > -1
+----
+true
+
+eval
+1 <= -1
+----
+false
+
+eval
+-1 >= 1
+----
+false
+
+eval
+-1 < 1
+----
+true
+
+eval
 0 >= 1
 ----
 false
@@ -106,6 +126,11 @@ eval
 false
 
 eval
+1.1 = 1.1
+----
+true
+
+eval
 1.1 != 1.2
 ----
 true
@@ -131,32 +156,37 @@ eval
 false
 
 eval
-1.1::decimal = 1.2::decimal
+1.1::float = 1.2::float
 ----
 false
 
 eval
-1.1::decimal != 1.2::decimal
+1.1::float = 1.1::float
 ----
 true
 
 eval
-1.1::decimal < 1.2::decimal
+1.1::float != 1.2::float
 ----
 true
 
 eval
-1.1::decimal <= 1.2::decimal
+1.1::float < 1.2::float
 ----
 true
 
 eval
-1.1::decimal > 1.2::decimal
+1.1::float <= 1.2::float
+----
+true
+
+eval
+1.1::float > 1.2::float
 ----
 false
 
 eval
-1.1::decimal >= 1.2::decimal
+1.1::float >= 1.2::float
 ----
 false
 
@@ -242,6 +272,71 @@ false
 
 eval
 '12:00:00'::time >= '12:00:01'::time
+----
+false
+
+eval
+'12:00:00'::time = '12:00:00+0'::timetz
+----
+true
+
+eval
+'12:00:00'::time != '12:00:00+0'::timetz
+----
+false
+
+eval
+'12:00:00'::time < '11:00:00-1'::timetz
+----
+true
+
+eval
+'12:00:00'::time >= '11:00:00-1'::timetz
+----
+false
+
+eval
+'12:00:00'::time > '13:00:00+1'::timetz
+----
+true
+
+eval
+'12:00:00'::time <= '13:00:00+1'::timetz
+----
+false
+
+eval
+'12:00:00-07'::timetz = '12:00:00-08'::timetz
+----
+false
+
+eval
+'12:00:00+09'::timetz = '12:00:00+09'::timetz
+----
+true
+
+eval
+'12:00:00+01'::timetz != '12:00:00-01'::timetz
+----
+true
+
+eval
+'12:00:00+01'::timetz < '12:00:00-01'::timetz
+----
+true
+
+eval
+'12:00:00+01'::timetz <= '12:00:00-01'::timetz
+----
+true
+
+eval
+'12:00:00+10'::timetz > '12:00:00+09'::timetz
+----
+false
+
+eval
+'12:00:00+10'::timetz >= '12:00:00+09'::timetz
 ----
 false
 
@@ -623,6 +718,36 @@ NULL <= '12:00:00'::time
 NULL
 
 eval
+'12:00:00+01'::timetz = NULL
+----
+NULL
+
+eval
+'12:00:00+01'::timetz < NULL
+----
+NULL
+
+eval
+'12:00:00+01'::timetz <= NULL
+----
+NULL
+
+eval
+NULL = '12:00:00+01'::timetz
+----
+NULL
+
+eval
+NULL < '12:00:00+01'::timetz
+----
+NULL
+
+eval
+NULL <= '12:00:00+01'::timetz
+----
+NULL
+
+eval
 '2015-10-01'::timestamp = NULL
 ----
 NULL
@@ -726,3 +851,84 @@ eval
 NULL <= NULL
 ----
 NULL
+
+eval
+NULL < ARRAY[1]
+----
+NULL
+
+eval
+NULL <= ARRAY[1]
+----
+NULL
+
+eval
+ARRAY[1] < NULL
+----
+NULL
+
+eval
+ARRAY[1] <= NULL
+----
+NULL
+
+eval
+ARRAY[1] < ARRAY[2]
+----
+true
+
+eval
+ARRAY[2] < ARRAY[2, 3]
+----
+true
+
+eval
+ARRAY[2] <= ARRAY[2]
+----
+true
+
+eval
+ARRAY[]:::INT[] < ARRAY[1]
+----
+true
+
+eval
+ARRAY[1, 2, 3] < ARRAY[1, 2]
+----
+false
+
+eval
+ARRAY[1, 2, 3] < ARRAY[1, 1]
+----
+false
+
+eval
+ARRAY[2, 2, 2, 4] < ARRAY[2, 2, 2, 5]
+----
+true
+
+eval
+ARRAY[1, 2, 3] = ARRAY[1, 2, 3]
+----
+true
+
+eval
+ARRAY[NULL]:::INT[] <= ARRAY[NULL]:::INT[]
+----
+true
+
+eval
+ARRAY[NULL, 1] >= ARRAY[NULL, 1]
+----
+true
+
+eval
+ARRAY[NULL, 1, NULL] > ARRAY[NULL, 2, NULL]
+----
+false
+
+# This differs from postgres -- crdb nulls come first.
+eval
+ARRAY[NULL, NULL]:::INT[] < ARRAY[NULL, 1]
+----
+true

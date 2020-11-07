@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package pgdate
 
@@ -19,7 +15,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 )
 
 // The functions in this file are used by fieldExtract.Extract().
@@ -148,7 +144,7 @@ func fieldSetterRelativeDate(fe *fieldExtract, s string) error {
 		offset = 1
 	}
 
-	year, month, day := fe.now.AddDate(0, 0, offset).Date()
+	year, month, day := fe.now().AddDate(0, 0, offset).Date()
 
 	if err := fe.Set(fieldYear, year); err != nil {
 		return err
@@ -162,7 +158,7 @@ func fieldSetterRelativeDate(fe *fieldExtract, s string) error {
 // fieldSetterUTC unconditionally sets the timezone to UTC and
 // removes the TZ fields from the wanted list.
 func fieldSetterUTC(fe *fieldExtract, _ string) error {
-	fe.now = fe.now.In(time.UTC)
+	fe.location = time.UTC
 	fe.wanted = fe.wanted.ClearAll(tzFields)
 	return nil
 }
@@ -170,5 +166,5 @@ func fieldSetterUTC(fe *fieldExtract, _ string) error {
 // fieldSetterUnsupportedAbbreviation always returns an error, but
 // captures the abbreviation in telemetry.
 func fieldSetterUnsupportedAbbreviation(_ *fieldExtract, s string) error {
-	return pgerror.UnimplementedWithIssueDetailError(31710, s, "timestamp abbreviations not supported")
+	return unimplemented.NewWithIssueDetail(31710, s, "timestamp abbreviations not supported")
 }

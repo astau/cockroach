@@ -1,27 +1,26 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
+
+	crdblog "github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
 
 // The flags used by the internal loggers.
@@ -40,6 +39,8 @@ type loggerOption interface {
 }
 
 type logPrefix string
+
+var _ logPrefix // silence unused lint
 
 func (p logPrefix) apply(cfg *loggerConfig) {
 	cfg.prefix = string(p)
@@ -84,6 +85,11 @@ type logger struct {
 	// They can be used directly by clients when a writer is required (e.g. when
 	// piping output from a subcommand).
 	stdout, stderr io.Writer
+
+	mu struct {
+		syncutil.Mutex
+		closed bool
+	}
 }
 
 // newLogger constructs a new logger object. Not intended for direct
@@ -164,10 +170,25 @@ func rootLogger(path string, teeOpt teeOptType) (*logger, error) {
 	return cfg.newLogger(path)
 }
 
+// close closes the logger. It is idempotent.
 func (l *logger) close() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.mu.closed {
+		return
+	}
+	l.mu.closed = true
 	if l.file != nil {
 		l.file.Close()
+		l.file = nil
 	}
+}
+
+// closed returns true if close() was previously called.
+func (l *logger) closed() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.mu.closed
 }
 
 // ChildLogger constructs a new logger which logs to the specified file. The
@@ -212,18 +233,47 @@ func (l *logger) ChildLogger(name string, opts ...loggerOption) (*logger, error)
 	return cfg.newLogger(path)
 }
 
+// PrintfCtx prints a message to the logger's stdout. The context's log tags, if
+// any, will be prepended to the message. A newline is appended if the last
+// character is not already a newline.
+func (l *logger) PrintfCtx(ctx context.Context, f string, args ...interface{}) {
+	l.PrintfCtxDepth(ctx, 2 /* depth */, f, args...)
+}
+
+// Printf is like PrintfCtx, except it doesn't take a ctx and thus no log tags
+// can be passed.
 func (l *logger) Printf(f string, args ...interface{}) {
-	if err := l.stdoutL.Output(2 /* calldepth */, fmt.Sprintf(f, args...)); err != nil {
+	l.PrintfCtxDepth(context.Background(), 2 /* depth */, f, args...)
+}
+
+// PrintfCtxDepth is like PrintfCtx, except that it allows the caller to control
+// which stack frame is reported as the file:line in the message. depth=1 is
+// equivalent to PrintfCtx. E.g. pass 2 to ignore the caller's frame.
+func (l *logger) PrintfCtxDepth(ctx context.Context, depth int, f string, args ...interface{}) {
+	msg := crdblog.FormatWithContextTags(ctx, f, args...)
+	if err := l.stdoutL.Output(depth+1, msg); err != nil {
 		// Changing our interface to return an Error from a logging method seems too
-		// onerous. Let's just crash.
-		panic(err)
+		// onerous. Let's yell to the default logger and if that fails, oh well.
+		_ = log.Output(depth+1, fmt.Sprintf("failed to log message: %v: %s", err, msg))
 	}
 }
 
-func (l *logger) Errorf(f string, args ...interface{}) {
-	if err := l.stderrL.Output(2 /* calldepth */, fmt.Sprintf(f, args...)); err != nil {
+// ErrorfCtx is like PrintfCtx, except the logger outputs to its stderr.
+func (l *logger) ErrorfCtx(ctx context.Context, f string, args ...interface{}) {
+	l.ErrorfCtxDepth(ctx, 2 /* depth */, f, args...)
+}
+
+func (l *logger) ErrorfCtxDepth(ctx context.Context, depth int, f string, args ...interface{}) {
+	msg := crdblog.FormatWithContextTags(ctx, f, args...)
+	if err := l.stderrL.Output(depth+1, msg); err != nil {
 		// Changing our interface to return an Error from a logging method seems too
-		// onerous. Let's just crash.
-		panic(err)
+		// onerous. Let's yell to the default logger and if that fails, oh well.
+		_ = log.Output(depth+1, fmt.Sprintf("failed to log error: %v: %s", err, msg))
 	}
+}
+
+// Errorf is like ErrorfCtx, except it doesn't take a ctx and thus no log tags
+// can be passed.
+func (l *logger) Errorf(f string, args ...interface{}) {
+	l.ErrorfCtxDepth(context.Background(), 2 /* depth */, f, args...)
 }

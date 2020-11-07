@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package uuid
 
@@ -21,7 +17,7 @@ import (
 	"math/rand"
 
 	"github.com/cockroachdb/cockroach/pkg/util/uint128"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // Short returns the first eight characters of the output of String().
@@ -47,9 +43,19 @@ func (u UUID) Equal(t UUID) bool {
 	return u == t
 }
 
-// GetBytes returns the UUID as a byte slice.
+// GetBytes returns the UUID as a byte slice. It incurs an allocation if
+// the return value escapes.
 func (u UUID) GetBytes() []byte {
 	return u.bytes()
+}
+
+// GetBytesMut returns the UUID as a mutable byte slice. Unlike GetBytes,
+// it does not necessarily incur an allocation if the return value escapes.
+// Instead, the return value escaping will cause the method's receiver (and
+// any struct that it is a part of) to escape. Use only if GetBytes is causing
+// an allocation and the UUID is already on the heap.
+func (u *UUID) GetBytesMut() []byte {
+	return u.bytesMut()
 }
 
 // ToUint128 returns the UUID as a Uint128.

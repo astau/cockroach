@@ -1,24 +1,19 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tree
 
 import (
-	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
+	"github.com/cockroachdb/errors"
 )
 
 type normalizableExpr interface {
@@ -92,7 +87,7 @@ func (expr *UnaryExpr) normalize(v *NormalizeVisitor) TypedExpr {
 	switch expr.Operator {
 	case UnaryMinus:
 		// -0 -> 0 (except for float which has negative zero)
-		if val.ResolvedType() != types.Float && v.isNumericZero(val) {
+		if val.ResolvedType().Family() != types.FloatFamily && v.isNumericZero(val) {
 			return val
 		}
 		switch b := val.(type) {
@@ -123,7 +118,7 @@ func (expr *BinaryExpr) normalize(v *NormalizeVisitor) TypedExpr {
 	right := expr.TypedRight()
 	expectedType := expr.ResolvedType()
 
-	if !expr.fn.NullableArgs && (left == DNull || right == DNull) {
+	if !expr.Fn.NullableArgs && (left == DNull || right == DNull) {
 		return DNull
 	}
 
@@ -132,25 +127,25 @@ func (expr *BinaryExpr) normalize(v *NormalizeVisitor) TypedExpr {
 	switch expr.Operator {
 	case Plus:
 		if v.isNumericZero(right) {
-			final, v.err = ReType(left, expectedType)
+			final = ReType(left, expectedType)
 			break
 		}
 		if v.isNumericZero(left) {
-			final, v.err = ReType(right, expectedType)
+			final = ReType(right, expectedType)
 			break
 		}
 	case Minus:
-		if v.isNumericZero(right) {
-			final, v.err = ReType(left, expectedType)
+		if types.IsAdditiveType(left.ResolvedType()) && v.isNumericZero(right) {
+			final = ReType(left, expectedType)
 			break
 		}
 	case Mult:
 		if v.isNumericOne(right) {
-			final, v.err = ReType(left, expectedType)
+			final = ReType(left, expectedType)
 			break
 		}
 		if v.isNumericOne(left) {
-			final, v.err = ReType(right, expectedType)
+			final = ReType(right, expectedType)
 			break
 		}
 		// We can't simplify multiplication by zero to zero,
@@ -158,7 +153,7 @@ func (expr *BinaryExpr) normalize(v *NormalizeVisitor) TypedExpr {
 		// the result must be NULL.
 	case Div, FloorDiv:
 		if v.isNumericOne(right) {
-			final, v.err = ReType(left, expectedType)
+			final = ReType(left, expectedType)
 			break
 		}
 	}
@@ -353,7 +348,7 @@ func (expr *ComparisonExpr) normalize(v *NormalizeVisitor) TypedExpr {
 				expr.Left = left.Left
 				expr.Right = newRightExpr
 				expr.memoizeFn()
-				if !isVar(v.ctx, expr.Left) {
+				if !isVar(v.ctx, expr.Left, true /*allowConstPlaceholders*/) {
 					// Continue as long as the left side of the comparison is not a
 					// variable.
 					continue
@@ -407,7 +402,7 @@ func (expr *ComparisonExpr) normalize(v *NormalizeVisitor) TypedExpr {
 				expr.Left = left.Right
 				expr.Right = newRightExpr
 				expr.memoizeFn()
-				if !isVar(v.ctx, expr.Left) {
+				if !isVar(v.ctx, expr.Left, true /*allowConstPlaceholders*/) {
 					// Continue as long as the left side of the comparison is not a
 					// variable.
 					continue
@@ -419,7 +414,7 @@ func (expr *ComparisonExpr) normalize(v *NormalizeVisitor) TypedExpr {
 				// x->y=z to x @> {y:z} which can be used to build spans for inverted index
 				// lookups.
 
-				if left.TypedRight().ResolvedType() != types.String {
+				if left.TypedRight().ResolvedType().Family() != types.StringFamily {
 					break
 				}
 
@@ -456,7 +451,7 @@ func (expr *ComparisonExpr) normalize(v *NormalizeVisitor) TypedExpr {
 					break
 				}
 
-				typedJ, err := dj.TypeCheck(nil, types.JSON)
+				typedJ, err := dj.TypeCheck(v.ctx.Context, nil, types.Jsonb)
 				if err != nil {
 					break
 				}
@@ -591,8 +586,14 @@ func (expr *AnnotateTypeExpr) normalize(v *NormalizeVisitor) TypedExpr {
 }
 
 func (expr *RangeCond) normalize(v *NormalizeVisitor) TypedExpr {
-	left, from, to := expr.TypedLeft(), expr.TypedFrom(), expr.TypedTo()
-	if left == DNull || (from == DNull && to == DNull) {
+	leftFrom, from := expr.TypedLeftFrom(), expr.TypedFrom()
+	leftTo, to := expr.TypedLeftTo(), expr.TypedTo()
+	// The visitor hasn't walked down into leftTo; do it now.
+	if leftTo, v.err = v.ctx.NormalizeExpr(leftTo); v.err != nil {
+		return expr
+	}
+
+	if (leftFrom == DNull || from == DNull) && (leftTo == DNull || to == DNull) {
 		return DNull
 	}
 
@@ -610,7 +611,7 @@ func (expr *RangeCond) normalize(v *NormalizeVisitor) TypedExpr {
 		if from == DNull {
 			newLeft = DNull
 		} else {
-			newLeft = NewTypedComparisonExpr(leftCmp, left, from).normalize(v)
+			newLeft = NewTypedComparisonExpr(leftCmp, leftFrom, from).normalize(v)
 			if v.err != nil {
 				return expr
 			}
@@ -618,7 +619,7 @@ func (expr *RangeCond) normalize(v *NormalizeVisitor) TypedExpr {
 		if to == DNull {
 			newRight = DNull
 		} else {
-			newRight = NewTypedComparisonExpr(rightCmp, left, to).normalize(v)
+			newRight = NewTypedComparisonExpr(rightCmp, leftTo, to).normalize(v)
 			if v.err != nil {
 				return expr
 			}
@@ -745,12 +746,7 @@ func (v *NormalizeVisitor) VisitPost(expr Expr) Expr {
 		if value == DNull {
 			// We don't want to return an expression that has a different type; cast
 			// the NULL if necessary.
-			var newExpr TypedExpr
-			newExpr, v.err = ReType(DNull, expr.(TypedExpr).ResolvedType())
-			if v.err != nil {
-				return expr
-			}
-			return newExpr
+			return ReType(DNull, expr.(TypedExpr).ResolvedType())
 		}
 		return value
 	}
@@ -807,7 +803,7 @@ func invertComparisonOp(op ComparisonOperator) (ComparisonOperator, error) {
 	case LT:
 		return GT, nil
 	default:
-		return op, pgerror.NewAssertionErrorf("unable to invert: %s", op)
+		return op, errors.AssertionFailedf("unable to invert: %s", op)
 	}
 }
 
@@ -820,20 +816,35 @@ var _ Visitor = &isConstVisitor{}
 
 func (v *isConstVisitor) VisitPre(expr Expr) (recurse bool, newExpr Expr) {
 	if v.isConst {
-		if isVar(v.ctx, expr) {
+		if !operatorIsImmutable(expr) || isVar(v.ctx, expr, true /*allowConstPlaceholders*/) {
 			v.isConst = false
 			return false, expr
 		}
-
-		switch t := expr.(type) {
-		case *FuncExpr:
-			if t.IsImpure() {
-				v.isConst = false
-				return false, expr
-			}
-		}
 	}
 	return true, expr
+}
+
+func operatorIsImmutable(expr Expr) bool {
+	switch t := expr.(type) {
+	case *FuncExpr:
+		return t.fnProps.Class == NormalClass && t.fn.Volatility <= VolatilityImmutable
+
+	case *CastExpr:
+		volatility, ok := LookupCastVolatility(t.Expr.(TypedExpr).ResolvedType(), t.typ)
+		return ok && volatility <= VolatilityImmutable
+
+	case *UnaryExpr:
+		return t.fn.Volatility <= VolatilityImmutable
+
+	case *BinaryExpr:
+		return t.Fn.Volatility <= VolatilityImmutable
+
+	case *ComparisonExpr:
+		return t.Fn.Volatility <= VolatilityImmutable
+
+	default:
+		return true
+	}
 }
 
 func (*isConstVisitor) VisitPost(expr Expr) Expr { return expr }
@@ -846,7 +857,7 @@ func (v *isConstVisitor) run(expr Expr) bool {
 
 // IsConst returns whether the expression is constant. A constant expression
 // does not contain variables, as defined by ContainsVars, nor impure functions.
-func IsConst(evalCtx *EvalContext, expr Expr) bool {
+func IsConst(evalCtx *EvalContext, expr TypedExpr) bool {
 	v := isConstVisitor{ctx: evalCtx}
 	return v.run(expr)
 }
@@ -879,7 +890,7 @@ func (v *fastIsConstVisitor) VisitPre(expr Expr) (recurse bool, newExpr Expr) {
 			// NormalizeVisitor may have wrapped a NULL.
 			return true, expr
 		}
-		if _, ok := expr.(Datum); !ok || isVar(v.ctx, expr) {
+		if _, ok := expr.(Datum); !ok || isVar(v.ctx, expr, true /*allowConstPlaceholders*/) {
 			// If the child expression is not a const Datum, the parent expression is
 			// not constant. Note that all constant literals have already been
 			// normalized to Datum in TypeCheck.
@@ -889,20 +900,12 @@ func (v *fastIsConstVisitor) VisitPre(expr Expr) (recurse bool, newExpr Expr) {
 	}
 	v.visited = true
 
-	// If the parent expression is a variable or impure function, we know that it
-	// is not constant.
+	// If the parent expression is a variable or non-immutable operator, we know
+	// that it is not constant.
 
-	if isVar(v.ctx, expr) {
+	if !operatorIsImmutable(expr) || isVar(v.ctx, expr, true /*allowConstPlaceholders*/) {
 		v.isConst = false
 		return false, expr
-	}
-
-	switch t := expr.(type) {
-	case *FuncExpr:
-		if t.IsImpure() {
-			v.isConst = false
-			return false, expr
-		}
 	}
 
 	return true, expr
@@ -918,26 +921,38 @@ func (v *fastIsConstVisitor) run(expr Expr) bool {
 }
 
 // isVar returns true if the expression's value can vary during plan
-// execution.
-func isVar(evalCtx *EvalContext, expr Expr) bool {
+// execution. The parameter allowConstPlaceholders should be true
+// in the common case of scalar expressions that will be evaluated
+// in the context of the execution of a prepared query, where the
+// placeholder will have the same value for every row processed.
+// It is set to false for scalar expressions that are not
+// evaluated as part of query execution, eg. DEFAULT expressions.
+func isVar(evalCtx *EvalContext, expr Expr, allowConstPlaceholders bool) bool {
 	switch expr.(type) {
 	case VariableExpr:
 		return true
 	case *Placeholder:
-		return evalCtx != nil && (!evalCtx.HasPlaceholders() || evalCtx.Placeholders.IsUnresolvedPlaceholder(expr))
+		if allowConstPlaceholders {
+			if evalCtx == nil || !evalCtx.HasPlaceholders() {
+				// The placeholder cannot be resolved -- it is variable.
+				return true
+			}
+			return evalCtx.Placeholders.IsUnresolvedPlaceholder(expr)
+		}
+		// Placeholders considered always variable.
+		return true
 	}
 	return false
 }
 
 type containsVarsVisitor struct {
-	evalCtx      *EvalContext
 	containsVars bool
 }
 
 var _ Visitor = &containsVarsVisitor{}
 
 func (v *containsVarsVisitor) VisitPre(expr Expr) (recurse bool, newExpr Expr) {
-	if !v.containsVars && isVar(v.evalCtx, expr) {
+	if !v.containsVars && isVar(nil, expr, false /*allowConstPlaceholders*/) {
 		v.containsVars = true
 	}
 	if v.containsVars {
@@ -950,8 +965,8 @@ func (*containsVarsVisitor) VisitPost(expr Expr) Expr { return expr }
 
 // ContainsVars returns true if the expression contains any variables.
 // (variables = sub-expressions, placeholders, indexed vars, etc.)
-func ContainsVars(evalCtx *EvalContext, expr Expr) bool {
-	v := containsVarsVisitor{evalCtx: evalCtx, containsVars: false}
+func ContainsVars(expr Expr) bool {
+	v := containsVarsVisitor{containsVars: false}
 	WalkExprConst(&v, expr)
 	return v.containsVars
 }
@@ -960,20 +975,17 @@ func ContainsVars(evalCtx *EvalContext, expr Expr) bool {
 var DecimalOne DDecimal
 
 func init() {
-	DecimalOne.SetFinite(1, 0)
+	DecimalOne.SetInt64(1)
 }
 
-// ReType ensures that the given numeric expression evaluates
+// ReType ensures that the given expression evaluates
 // to the requested type, inserting a cast if necessary.
-func ReType(expr TypedExpr, wantedType types.T) (TypedExpr, error) {
-	if expr.ResolvedType().Equivalent(wantedType) {
-		return expr, nil
+func ReType(expr TypedExpr, wantedType *types.T) TypedExpr {
+	resolvedType := expr.ResolvedType()
+	if wantedType.Family() == types.AnyFamily || resolvedType.Identical(wantedType) {
+		return expr
 	}
-	reqType, err := coltypes.DatumTypeToColumnType(wantedType)
-	if err != nil {
-		return nil, err
-	}
-	res := &CastExpr{Expr: expr, Type: reqType}
+	res := &CastExpr{Expr: expr, Type: wantedType}
 	res.typ = wantedType
-	return res, nil
+	return res
 }

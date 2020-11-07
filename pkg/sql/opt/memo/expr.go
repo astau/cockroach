@@ -1,26 +1,30 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package memo
 
 import (
+	"context"
 	"fmt"
+	"math/bits"
+	"sort"
+	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 // RelExpr is implemented by all operators tagged as Relational. Relational
@@ -94,14 +98,13 @@ type RelExpr interface {
 }
 
 // ScalarPropsExpr is implemented by scalar expressions which cache scalar
-// properties, like FiltersExpr and ProjectionsExpr. The scalar properties are
-// lazily populated only when requested by walking the expression subtree.
+// properties, like FiltersExpr and ProjectionsExpr. These expressions are also
+// tagged with the ScalarProps tag.
 type ScalarPropsExpr interface {
 	opt.ScalarExpr
 
 	// ScalarProps returns the scalar properties associated with the expression.
-	// These can be lazily calculated using the given memo as context.
-	ScalarProps(mem *Memo) *props.Scalar
+	ScalarProps() *props.Scalar
 }
 
 // TrueSingleton is a global instance of TrueExpr, to avoid allocations.
@@ -114,6 +117,23 @@ var FalseSingleton = &FalseExpr{}
 // common case), to avoid allocations.
 var NullSingleton = &NullExpr{Typ: types.Unknown}
 
+// TODO(justin): perhaps these should be auto-generated.
+
+// RankSingleton is the global instance of RankExpr.
+var RankSingleton = &RankExpr{}
+
+// RowNumberSingleton is the global instance of RowNumber.
+var RowNumberSingleton = &RowNumberExpr{}
+
+// DenseRankSingleton is the global instance of DenseRankExpr.
+var DenseRankSingleton = &DenseRankExpr{}
+
+// PercentRankSingleton is the global instance of PercentRankExpr.
+var PercentRankSingleton = &PercentRankExpr{}
+
+// CumeDistSingleton is the global instance of CumeDistExpr.
+var CumeDistSingleton = &CumeDistExpr{}
+
 // CountRowsSingleton maintains a global instance of CountRowsExpr, to avoid
 // allocations.
 var CountRowsSingleton = &CountRowsExpr{}
@@ -125,16 +145,9 @@ var CountRowsSingleton = &CountRowsExpr{}
 //
 var TrueFilter = FiltersExpr{}
 
-// FalseFilter is a global instance of a FiltersExpr that contains a single
-// False expression, used in contradiction situations:
-//
-//   SELECT * FROM a WHERE 1=0
-//
-var FalseFilter = FiltersExpr{{Condition: FalseSingleton}}
-
 // EmptyTuple is a global instance of a TupleExpr that contains no elements.
 // While this cannot be created in SQL, it can be the created by normalizations.
-var EmptyTuple = &TupleExpr{Typ: types.TTuple{}}
+var EmptyTuple = &TupleExpr{Typ: types.EmptyTuple}
 
 // ScalarListWithEmptyTuple is a global instance of a ScalarListExpr containing
 // a TupleExpr that contains no elements. It's used when constructing an empty
@@ -146,7 +159,11 @@ var ScalarListWithEmptyTuple = ScalarListExpr{EmptyTuple}
 
 // EmptyGroupingPrivate is a global instance of a GroupingPrivate that has no
 // grouping columns and no ordering.
-var EmptyGroupingPrivate = GroupingPrivate{}
+var EmptyGroupingPrivate = &GroupingPrivate{}
+
+// EmptyJoinPrivate is a global instance of a JoinPrivate that has no fields
+// set.
+var EmptyJoinPrivate = &JoinPrivate{}
 
 // LastGroupMember returns the last member in the same memo group of the given
 // relational expression.
@@ -178,9 +195,73 @@ func (n FiltersExpr) IsFalse() bool {
 func (n FiltersExpr) OuterCols(mem *Memo) opt.ColSet {
 	var colSet opt.ColSet
 	for i := range n {
-		colSet.UnionWith(n[i].ScalarProps(mem).OuterCols)
+		colSet.UnionWith(n[i].ScalarProps().OuterCols)
 	}
 	return colSet
+}
+
+// Sort sorts the FilterItems in n by the IDs of the expression.
+func (n *FiltersExpr) Sort() {
+	sort.Slice(*n, func(i, j int) bool {
+		return (*n)[i].Condition.(opt.ScalarExpr).ID() < (*n)[j].Condition.(opt.ScalarExpr).ID()
+	})
+}
+
+// Deduplicate removes all the duplicate filters from n.
+func (n *FiltersExpr) Deduplicate() {
+	dedup := (*n)[:0]
+
+	// Only add it if it hasn't already been added.
+	for i, filter := range *n {
+		found := false
+		for j := i - 1; j >= 0; j-- {
+			previouslySeenFilter := (*n)[j]
+			if previouslySeenFilter.Condition == filter.Condition {
+				found = true
+				break
+			}
+		}
+		if !found {
+			dedup = append(dedup, filter)
+		}
+	}
+
+	*n = dedup
+}
+
+// RemoveFiltersItem returns a new list that is a copy of the given list, except
+// that it does not contain the given FiltersItem. If the list contains the item
+// multiple times, then only the first instance is removed. If the list does not
+// contain the item, then the method panics.
+func (n FiltersExpr) RemoveFiltersItem(search *FiltersItem) FiltersExpr {
+	newFilters := make(FiltersExpr, len(n)-1)
+	for i := range n {
+		if search == &n[i] {
+			copy(newFilters, n[:i])
+			copy(newFilters[i:], n[i+1:])
+			return newFilters
+		}
+	}
+	panic(errors.AssertionFailedf("item to remove is not in the list: %v", search))
+}
+
+// RemoveCommonFilters removes the filters found in other from n.
+func (n *FiltersExpr) RemoveCommonFilters(other FiltersExpr) {
+	// TODO(ridwanmsharif): Faster intersection using a map
+	common := (*n)[:0]
+	for _, filter := range *n {
+		found := false
+		for _, otherFilter := range other {
+			if filter.Condition == otherFilter.Condition {
+				found = true
+				break
+			}
+		}
+		if !found {
+			common = append(common, filter)
+		}
+	}
+	*n = common
 }
 
 // OutputCols returns the set of columns constructed by the Aggregations
@@ -188,17 +269,17 @@ func (n FiltersExpr) OuterCols(mem *Memo) opt.ColSet {
 func (n AggregationsExpr) OutputCols() opt.ColSet {
 	var colSet opt.ColSet
 	for i := range n {
-		colSet.Add(int(n[i].Col))
+		colSet.Add(n[i].Col)
 	}
 	return colSet
 }
 
 // OuterCols returns the set of outer columns needed by any of the zip
 // expressions.
-func (n ZipExpr) OuterCols(mem *Memo) opt.ColSet {
+func (n ZipExpr) OuterCols() opt.ColSet {
 	var colSet opt.ColSet
 	for i := range n {
-		colSet.UnionWith(n[i].ScalarProps(mem).OuterCols)
+		colSet.UnionWith(n[i].ScalarProps().OuterCols)
 	}
 	return colSet
 }
@@ -208,7 +289,7 @@ func (n ZipExpr) OutputCols() opt.ColSet {
 	var colSet opt.ColSet
 	for i := range n {
 		for _, col := range n[i].Cols {
-			colSet.Add(int(col))
+			colSet.Add(col)
 		}
 	}
 	return colSet
@@ -267,6 +348,7 @@ type ScanFlags struct {
 	// ForceIndex forces the use of a specific index (specified in Index).
 	// ForceIndex and NoIndexJoin cannot both be set at the same time.
 	ForceIndex bool
+	Direction  tree.Direction
 	Index      int
 }
 
@@ -275,63 +357,609 @@ func (sf *ScanFlags) Empty() bool {
 	return !sf.NoIndexJoin && !sf.ForceIndex
 }
 
-// MapToInputIDs maps from the ID of a target table column to the ID(s) of the
-// corresponding input column(s) that provides the value for it:
+// JoinFlags stores restrictions on the join execution method, derived from
+// hints for a join specified in the query (see tree.JoinTableExpr).  It is a
+// bitfield where each bit indicates if a certain type of join is disallowed or
+// preferred.
 //
-//   Insert: a = InsertCols
-//   Update: a = UpdateCols/FetchCols
-//   Upsert: a = UpdateCols/FetchCols, b = InsertCols
-//   Delete: a = FetchCols
+// The zero value indicates that any join is allowed and there are no special
+// preferences.
+type JoinFlags uint8
+
+// Each flag indicates if a certain type of join is disallowed.
+const (
+	// DisallowHashJoinStoreLeft corresponds to a hash join where the left side is
+	// stored into the hashtable. Note that execution can override the stored side
+	// if it finds that the other side is smaller (up to a certain size).
+	DisallowHashJoinStoreLeft JoinFlags = (1 << iota)
+
+	// DisallowHashJoinStoreRight corresponds to a hash join where the right side
+	// is stored into the hashtable. Note that execution can override the stored
+	// side if it finds that the other side is smaller (up to a certain size).
+	DisallowHashJoinStoreRight
+
+	// DisallowMergeJoin corresponds to a merge join.
+	DisallowMergeJoin
+
+	// DisallowLookupJoinIntoLeft corresponds to a lookup join where the lookup
+	// table is on the left side.
+	DisallowLookupJoinIntoLeft
+
+	// DisallowLookupJoinIntoRight corresponds to a lookup join where the lookup
+	// table is on the right side.
+	DisallowLookupJoinIntoRight
+
+	// PreferLookupJoinIntoLeft reduces the cost of a lookup join where the lookup
+	// table is on the left side.
+	PreferLookupJoinIntoLeft
+
+	// PreferLookupJoinIntoRight reduces the cost of a lookup join where the
+	// lookup table is on the right side.
+	PreferLookupJoinIntoRight
+)
+
+const (
+	disallowAll JoinFlags = (DisallowHashJoinStoreLeft |
+		DisallowHashJoinStoreRight |
+		DisallowMergeJoin |
+		DisallowLookupJoinIntoLeft |
+		DisallowLookupJoinIntoRight)
+
+	// AllowOnlyHashJoinStoreRight has all "disallow" flags set except
+	// DisallowHashJoinStoreRight.
+	AllowOnlyHashJoinStoreRight JoinFlags = disallowAll ^ DisallowHashJoinStoreRight
+
+	// AllowOnlyLookupJoinIntoRight has all "disallow" flags set except
+	// DisallowLookupJoinIntoRight.
+	AllowOnlyLookupJoinIntoRight JoinFlags = disallowAll ^ DisallowLookupJoinIntoRight
+
+	// AllowOnlyMergeJoin has all "disallow" flags set except DisallowMergeJoin.
+	AllowOnlyMergeJoin JoinFlags = disallowAll ^ DisallowMergeJoin
+)
+
+var joinFlagStr = map[JoinFlags]string{
+	DisallowHashJoinStoreLeft:   "hash join (store left side)",
+	DisallowHashJoinStoreRight:  "hash join (store right side)",
+	DisallowMergeJoin:           "merge join",
+	DisallowLookupJoinIntoLeft:  "lookup join (into left side)",
+	DisallowLookupJoinIntoRight: "lookup join (into right side)",
+
+	PreferLookupJoinIntoLeft:  "lookup join (into left side)",
+	PreferLookupJoinIntoRight: "lookup join (into right side)",
+}
+
+// Empty returns true if this is the default value (where all join types are
+// allowed).
+func (jf JoinFlags) Empty() bool {
+	return jf == 0
+}
+
+// Has returns true if the given flag is set.
+func (jf JoinFlags) Has(flag JoinFlags) bool {
+	return jf&flag != 0
+}
+
+func (jf JoinFlags) String() string {
+	if jf.Empty() {
+		return "no flags"
+	}
+
+	prefer := jf & (PreferLookupJoinIntoLeft | PreferLookupJoinIntoRight)
+	disallow := jf ^ prefer
+
+	// Special cases with prettier results for common cases.
+	var b strings.Builder
+	switch disallow {
+	case AllowOnlyHashJoinStoreRight:
+		b.WriteString("force hash join (store right side)")
+	case AllowOnlyLookupJoinIntoRight:
+		b.WriteString("force lookup join (into right side)")
+	case AllowOnlyMergeJoin:
+		b.WriteString("force merge join")
+
+	default:
+		for disallow != 0 {
+			flag := JoinFlags(1 << uint8(bits.TrailingZeros8(uint8(disallow))))
+			if b.Len() == 0 {
+				b.WriteString("disallow ")
+			} else {
+				b.WriteString(" and ")
+			}
+			b.WriteString(joinFlagStr[flag])
+			disallow ^= flag
+		}
+	}
+
+	for prefer != 0 {
+		flag := JoinFlags(1 << uint8(bits.TrailingZeros8(uint8(prefer))))
+		if b.Len() > 0 {
+			b.WriteString("; ")
+		}
+		b.WriteString("prefer ")
+		b.WriteString(joinFlagStr[flag])
+		prefer ^= flag
+	}
+	return b.String()
+}
+
+func (ij *InnerJoinExpr) initUnexportedFields(mem *Memo) {
+	initJoinMultiplicity(ij)
+}
+
+func (lj *LeftJoinExpr) initUnexportedFields(mem *Memo) {
+	initJoinMultiplicity(lj)
+}
+
+func (fj *FullJoinExpr) initUnexportedFields(mem *Memo) {
+	initJoinMultiplicity(fj)
+}
+
+func (sj *SemiJoinExpr) initUnexportedFields(mem *Memo) {
+	initJoinMultiplicity(sj)
+}
+
+func (lj *LookupJoinExpr) initUnexportedFields(mem *Memo) {
+	// lookupProps are initialized as necessary by the logical props builder.
+}
+
+func (gj *InvertedJoinExpr) initUnexportedFields(mem *Memo) {
+	// lookupProps are initialized as necessary by the logical props builder.
+}
+
+func (zj *ZigzagJoinExpr) initUnexportedFields(mem *Memo) {
+	// leftProps and rightProps are initialized as necessary by the logical props
+	// builder.
+}
+
+// joinWithMultiplicity allows join operators for which JoinMultiplicity is
+// supported (currently InnerJoin, LeftJoin, and FullJoin) to be treated
+// polymorphically.
+type joinWithMultiplicity interface {
+	setMultiplicity(props.JoinMultiplicity)
+	getMultiplicity() props.JoinMultiplicity
+}
+
+var _ joinWithMultiplicity = &InnerJoinExpr{}
+var _ joinWithMultiplicity = &LeftJoinExpr{}
+var _ joinWithMultiplicity = &FullJoinExpr{}
+var _ joinWithMultiplicity = &SemiJoinExpr{}
+
+func (ij *InnerJoinExpr) setMultiplicity(multiplicity props.JoinMultiplicity) {
+	ij.multiplicity = multiplicity
+}
+
+func (ij *InnerJoinExpr) getMultiplicity() props.JoinMultiplicity {
+	return ij.multiplicity
+}
+
+func (lj *LeftJoinExpr) setMultiplicity(multiplicity props.JoinMultiplicity) {
+	lj.multiplicity = multiplicity
+}
+
+func (lj *LeftJoinExpr) getMultiplicity() props.JoinMultiplicity {
+	return lj.multiplicity
+}
+
+func (fj *FullJoinExpr) setMultiplicity(multiplicity props.JoinMultiplicity) {
+	fj.multiplicity = multiplicity
+}
+
+func (fj *FullJoinExpr) getMultiplicity() props.JoinMultiplicity {
+	return fj.multiplicity
+}
+
+func (sj *SemiJoinExpr) setMultiplicity(multiplicity props.JoinMultiplicity) {
+	sj.multiplicity = multiplicity
+}
+
+func (sj *SemiJoinExpr) getMultiplicity() props.JoinMultiplicity {
+	return sj.multiplicity
+}
+
+// WindowFrame denotes the definition of a window frame for an individual
+// window function, excluding the OFFSET expressions, if present.
+type WindowFrame struct {
+	Mode           tree.WindowFrameMode
+	StartBoundType tree.WindowFrameBoundType
+	EndBoundType   tree.WindowFrameBoundType
+	FrameExclusion tree.WindowFrameExclusion
+}
+
+// HasOffset returns true if the WindowFrame contains a specific offset.
+func (f *WindowFrame) HasOffset() bool {
+	return f.StartBoundType.IsOffset() || f.EndBoundType.IsOffset()
+}
+
+func (f *WindowFrame) String() string {
+	var bld strings.Builder
+	switch f.Mode {
+	case tree.GROUPS:
+		fmt.Fprintf(&bld, "groups")
+	case tree.ROWS:
+		fmt.Fprintf(&bld, "rows")
+	case tree.RANGE:
+		fmt.Fprintf(&bld, "range")
+	}
+
+	frameBoundName := func(b tree.WindowFrameBoundType) string {
+		switch b {
+		case tree.UnboundedFollowing, tree.UnboundedPreceding:
+			return "unbounded"
+		case tree.CurrentRow:
+			return "current-row"
+		case tree.OffsetFollowing, tree.OffsetPreceding:
+			return "offset"
+		}
+		panic(errors.AssertionFailedf("unexpected bound"))
+	}
+	fmt.Fprintf(&bld, " from %s to %s",
+		frameBoundName(f.StartBoundType),
+		frameBoundName(f.EndBoundType),
+	)
+	switch f.FrameExclusion {
+	case tree.ExcludeCurrentRow:
+		bld.WriteString(" exclude current row")
+	case tree.ExcludeGroup:
+		bld.WriteString(" exclude group")
+	case tree.ExcludeTies:
+		bld.WriteString(" exclude ties")
+	}
+	return bld.String()
+}
+
+// IsCanonical returns true if the ScanPrivate indicates an original unaltered
+// primary index Scan operator (i.e. unconstrained and not limited).
+func (s *ScanPrivate) IsCanonical() bool {
+	return s.Index == cat.PrimaryIndex &&
+		s.Constraint == nil &&
+		s.HardLimit == 0
+}
+
+// IsUnfiltered returns true if the ScanPrivate will produce all rows in the
+// table.
+func (s *ScanPrivate) IsUnfiltered(md *opt.Metadata) bool {
+	return (s.Constraint == nil || s.Constraint.IsUnconstrained()) &&
+		s.InvertedConstraint == nil &&
+		s.HardLimit == 0 &&
+		!s.UsesPartialIndex(md)
+}
+
+// IsLocking returns true if the ScanPrivate is configured to use a row-level
+// locking mode. This can be the case either because the Scan is in the scope of
+// a SELECT .. FOR [KEY] UPDATE/SHARE clause or because the Scan was configured
+// as part of the row retrieval of a DELETE or UPDATE statement.
+func (s *ScanPrivate) IsLocking() bool {
+	return s.Locking != nil
+}
+
+// UsesPartialIndex returns true if the ScanPrivate indicates a scan over a
+// partial index.
+func (s *ScanPrivate) UsesPartialIndex(md *opt.Metadata) bool {
+	if s.Index == cat.PrimaryIndex {
+		// Primary index is always non-partial; skip making the catalog calls.
+		return false
+	}
+	_, isPartialIndex := md.Table(s.Table).Index(s.Index).Predicate()
+	return isPartialIndex
+}
+
+// PartialIndexPredicate returns the FiltersExpr representing the predicate of
+// the partial index that the scan uses. If the scan does not use a partial
+// index or if a partial index predicate was not built for this index, this
+// function panics. UsesPartialIndex should be called first to determine if the
+// scan operates over a partial index.
+func (s *ScanPrivate) PartialIndexPredicate(md *opt.Metadata) FiltersExpr {
+	tabMeta := md.TableMeta(s.Table)
+	p, ok := tabMeta.PartialIndexPredicates[s.Index]
+	if !ok {
+		// A partial index predicate expression was not built for the
+		// partial index.
+		panic(errors.AssertionFailedf("partial index predicate not found for %s", tabMeta.Table.Index(s.Index).Name()))
+	}
+	return *p.(*FiltersExpr)
+}
+
+// UsesPartialIndex returns true if the the LookupJoinPrivate looks-up via a
+// partial index.
+func (lj *LookupJoinPrivate) UsesPartialIndex(md *opt.Metadata) bool {
+	_, isPartialIndex := md.Table(lj.Table).Index(lj.Index).Predicate()
+	return isPartialIndex
+}
+
+// NeedResults returns true if the mutation operator can return the rows that
+// were mutated.
+func (m *MutationPrivate) NeedResults() bool {
+	return m.ReturnCols != nil
+}
+
+// IsColumnOutput returns true if the i-th ordinal column should be part of the
+// mutation's output columns.
+func (m *MutationPrivate) IsColumnOutput(i int) bool {
+	return i < len(m.ReturnCols) && m.ReturnCols[i] != 0
+}
+
+// MapToInputID maps from the ID of a returned column to the ID of the
+// corresponding input column that provides the value for it. If there is no
+// matching input column ID, MapToInputID returns 0.
 //
-// For the UpdateCols/FetchCols case, use the corresponding UpdateCol if it is
-// non-zero (meaning that column will be updated), else use the FetchCol (which
-// holds the existing value of the column).
-func (m *MutationPrivate) MapToInputIDs(tabColID opt.ColumnID) (a, b opt.ColumnID) {
+// NOTE: This can only be called if the mutation operator returns rows.
+func (m *MutationPrivate) MapToInputID(tabColID opt.ColumnID) opt.ColumnID {
+	if m.ReturnCols == nil {
+		panic(errors.AssertionFailedf("MapToInputID cannot be called if ReturnCols is not defined"))
+	}
 	ord := m.Table.ColumnOrdinal(tabColID)
-	if m.FetchCols != nil {
-		if m.UpdateCols != nil && m.UpdateCols[ord] != 0 {
-			a = m.UpdateCols[ord]
-		} else {
-			a = m.FetchCols[ord]
-		}
-	}
-	if m.InsertCols != nil {
-		if a == 0 {
-			a = m.InsertCols[ord]
-		} else {
-			b = m.InsertCols[ord]
-		}
-	}
-	return a, b
+	return m.ReturnCols[ord]
 }
 
 // MapToInputCols maps the given set of table columns to a corresponding set of
-// input columns using the MapToInputID function. This method should not be
-// called for Upsert ops, since the mapping is ambiguous.
+// input columns using the MapToInputID function.
 func (m *MutationPrivate) MapToInputCols(tabCols opt.ColSet) opt.ColSet {
 	var inCols opt.ColSet
-	tabCols.ForEach(func(t int) {
-		a, b := m.MapToInputIDs(opt.ColumnID(t))
-		if b != 0 {
-			panic("MapToInputCols cannot be called for Upsert case")
+	tabCols.ForEach(func(t opt.ColumnID) {
+		id := m.MapToInputID(t)
+		if id == 0 {
+			panic(errors.AssertionFailedf("could not find input column for %d", log.Safe(t)))
 		}
-		inCols.Add(int(a))
+		inCols.Add(id)
 	})
 	return inCols
 }
 
 // AddEquivTableCols adds an FD to the given set that declares an equivalence
-// between each table column and its corresponding input column. This method
-// should not be called for Upsert ops, since the mapping is ambiguous.
+// between each table column and its corresponding input column.
 func (m *MutationPrivate) AddEquivTableCols(md *opt.Metadata, fdset *props.FuncDepSet) {
 	for i, n := 0, md.Table(m.Table).ColumnCount(); i < n; i++ {
 		t := m.Table.ColumnID(i)
-		a, b := m.MapToInputIDs(t)
-		if b != 0 {
-			panic("AddEquivTableCols cannot be called for Upsert case")
-		}
-		if a != 0 {
-			fdset.AddEquivalency(t, a)
+		id := m.MapToInputID(t)
+		if id != 0 {
+			fdset.AddEquivalency(t, id)
 		}
 	}
+}
+
+// WithBindingID is used by factory.Replace as a uniform way to get the with ID.
+func (m *MutationPrivate) WithBindingID() opt.WithID {
+	return m.WithID
+}
+
+// WithBindingID is used by factory.Replace as a uniform way to get the with ID.
+func (w *WithExpr) WithBindingID() opt.WithID {
+	return w.ID
+}
+
+// WithBindingID is used by factory.Replace as a uniform way to get the with ID.
+func (r *RecursiveCTEExpr) WithBindingID() opt.WithID {
+	return r.WithID
+}
+
+// initUnexportedFields is called when a project expression is created.
+func (prj *ProjectExpr) initUnexportedFields(mem *Memo) {
+	inputProps := prj.Input.Relational()
+	// Determine the not-null columns.
+	prj.notNullCols = inputProps.NotNullCols.Copy()
+	for i := range prj.Projections {
+		item := &prj.Projections[i]
+		if ExprIsNeverNull(item.Element, inputProps.NotNullCols) {
+			prj.notNullCols.Add(item.Col)
+		}
+	}
+
+	// Determine the "internal" functional dependencies (for the union of input
+	// columns and synthesized columns).
+	prj.internalFuncDeps.CopyFrom(&inputProps.FuncDeps)
+	for i := range prj.Projections {
+		item := &prj.Projections[i]
+		if v, ok := item.Element.(*VariableExpr); ok && inputProps.OutputCols.Contains(v.Col) {
+			// Handle any column that is a direct reference to an input column. The
+			// optimizer sometimes constructs these in order to generate different
+			// column IDs; they can also show up after constant-folding e.g. an ORDER
+			// BY expression.
+			prj.internalFuncDeps.AddEquivalency(v.Col, item.Col)
+			continue
+		}
+
+		if !item.scalar.VolatilitySet.HasVolatile() {
+			from := item.scalar.OuterCols.Intersection(inputProps.OutputCols)
+
+			// We want to set up the FD: from --> colID.
+			// This does not necessarily hold for "composite" types like decimals or
+			// collated strings. For example if d is a decimal, d::TEXT can have
+			// different values for equal values of d, like 1 and 1.0.
+			if !CanBeCompositeSensitive(mem.Metadata(), item.Element) {
+				prj.internalFuncDeps.AddSynthesizedCol(from, item.Col)
+			}
+		}
+	}
+	prj.internalFuncDeps.MakeNotNull(prj.notNullCols)
+}
+
+// InternalFDs returns the functional dependencies for the set of all input
+// columns plus the synthesized columns.
+func (prj *ProjectExpr) InternalFDs() *props.FuncDepSet {
+	return &prj.internalFuncDeps
+}
+
+// ExprIsNeverNull makes a best-effort attempt to prove that the provided
+// scalar is always non-NULL, given the set of outer columns that are known
+// to be not null. This is particularly useful with check constraints.
+// Check constraints are satisfied when the condition evaluates to NULL,
+// whereas filters are not. For example consider the following check constraint:
+//
+// CHECK (col IN (1, 2, NULL))
+//
+// Any row evaluating this check constraint with any value for the column will
+// satisfy this check constraint, as they would evaluate to true (in the case
+// of 1 or 2) or NULL (in the case of everything else).
+func ExprIsNeverNull(e opt.ScalarExpr, notNullCols opt.ColSet) bool {
+	switch t := e.(type) {
+	case *VariableExpr:
+		return notNullCols.Contains(t.Col)
+
+	case *TrueExpr, *FalseExpr, *ConstExpr, *IsExpr, *IsNotExpr, *IsTupleNullExpr, *IsTupleNotNullExpr:
+		return true
+
+	case *NullExpr:
+		return false
+
+	case *TupleExpr:
+		// TODO(ridwanmsharif): Make this less conservative and instead update how
+		// IN and NOT IN behave w.r.t tuples and how IndirectionExpr works with arrays.
+		// Currently, the semantics of this function on Tuples are different
+		// as it returns whether a NULL evaluation is possible given the composition of
+		// the tuple. Changing this will require some additional logic in the IN cases.
+		for i := range t.Elems {
+			if !ExprIsNeverNull(t.Elems[i], notNullCols) {
+				return false
+			}
+		}
+		return true
+
+	case *InExpr, *NotInExpr:
+		// TODO(ridwanmsharif): If a tuple is found in either side, determine if the
+		// expression is nullable based on the composition of the tuples.
+		return ExprIsNeverNull(t.Child(0).(opt.ScalarExpr), notNullCols) &&
+			ExprIsNeverNull(t.Child(1).(opt.ScalarExpr), notNullCols)
+
+	case *ArrayExpr:
+		for i := range t.Elems {
+			if !ExprIsNeverNull(t.Elems[i], notNullCols) {
+				return false
+			}
+		}
+		return true
+
+	case *CaseExpr:
+		for i := range t.Whens {
+			if !ExprIsNeverNull(t.Whens[i], notNullCols) {
+				return false
+			}
+		}
+		return ExprIsNeverNull(t.Input, notNullCols) && ExprIsNeverNull(t.OrElse, notNullCols)
+
+	case *CastExpr, *NotExpr, *RangeExpr:
+		return ExprIsNeverNull(t.Child(0).(opt.ScalarExpr), notNullCols)
+
+	case *AndExpr, *OrExpr, *GeExpr, *GtExpr, *NeExpr, *EqExpr, *LeExpr, *LtExpr, *LikeExpr,
+		*NotLikeExpr, *ILikeExpr, *NotILikeExpr, *SimilarToExpr, *NotSimilarToExpr, *RegMatchExpr,
+		*NotRegMatchExpr, *RegIMatchExpr, *NotRegIMatchExpr, *ContainsExpr, *JsonExistsExpr,
+		*JsonAllExistsExpr, *JsonSomeExistsExpr, *AnyScalarExpr, *BitandExpr, *BitorExpr, *BitxorExpr,
+		*PlusExpr, *MinusExpr, *MultExpr, *DivExpr, *FloorDivExpr, *ModExpr, *PowExpr, *ConcatExpr,
+		*LShiftExpr, *RShiftExpr, *WhenExpr:
+		return ExprIsNeverNull(t.Child(0).(opt.ScalarExpr), notNullCols) &&
+			ExprIsNeverNull(t.Child(1).(opt.ScalarExpr), notNullCols)
+
+	default:
+		return false
+	}
+}
+
+// OutputColumnIsAlwaysNull returns true if the expression produces only NULL
+// values for the given column. Used to elide foreign key checks.
+//
+// This could be a logical property but we only care about simple cases (NULLs
+// in Projections and Values).
+func OutputColumnIsAlwaysNull(e RelExpr, col opt.ColumnID) bool {
+	isNullScalar := func(scalar opt.ScalarExpr) bool {
+		switch scalar.Op() {
+		case opt.NullOp:
+			return true
+		case opt.CastOp:
+			// Normally this cast should have been folded, but we want this to work
+			// in "build" opttester mode (disabled normalization rules).
+			return scalar.Child(0).Op() == opt.NullOp
+		default:
+			return false
+		}
+	}
+
+	switch e.Op() {
+	case opt.ProjectOp:
+		p := e.(*ProjectExpr)
+		if p.Passthrough.Contains(col) {
+			return OutputColumnIsAlwaysNull(p.Input, col)
+		}
+		for i := range p.Projections {
+			if p.Projections[i].Col == col {
+				return isNullScalar(p.Projections[i].Element)
+			}
+		}
+
+	case opt.ValuesOp:
+		v := e.(*ValuesExpr)
+		colOrdinal, ok := v.Cols.Find(col)
+		if !ok {
+			return false
+		}
+		for i := range v.Rows {
+			if !isNullScalar(v.Rows[i].(*TupleExpr).Elems[colOrdinal]) {
+				return false
+			}
+		}
+		return true
+	}
+
+	return false
+}
+
+// FKCascades stores metadata necessary for building cascading queries.
+type FKCascades []FKCascade
+
+// FKCascade stores metadata necessary for building a cascading query.
+// Cascading queries are built as needed, after the original query is executed.
+type FKCascade struct {
+	// FKName is the name of the FK constraint.
+	FKName string
+
+	// Builder is an object that can be used as the "optbuilder" for the cascading
+	// query.
+	Builder CascadeBuilder
+
+	// WithID identifies the buffer for the mutation input in the original
+	// expression tree. 0 if the cascade does not require input.
+	WithID opt.WithID
+
+	// OldValues are column IDs from the mutation input that correspond to the
+	// old values of the modified rows. The list maps 1-to-1 to foreign key
+	// columns. Empty if the cascade does not require input.
+	OldValues opt.ColList
+
+	// NewValues are column IDs from the mutation input that correspond to the
+	// new values of the modified rows. The list maps 1-to-1 to foreign key columns.
+	// It is empty if the mutation is a deletion. Empty if the cascade does not
+	// require input.
+	NewValues opt.ColList
+}
+
+// CascadeBuilder is an interface used to construct a cascading query for a
+// specific FK relation. For example: if we are deleting rows from a parent
+// table, after deleting the rows from the parent table this interface will be
+// used to build the corresponding deletion in the child table.
+type CascadeBuilder interface {
+	// Build constructs a cascading query that mutates the child table. The input
+	// is scanned using WithScan with the given WithID; oldValues and newValues
+	// columns correspond 1-to-1 to foreign key columns. For deletes, newValues is
+	// empty.
+	//
+	// The query does not need to be built in the same memo as the original query;
+	// the only requirement is that the mutation input columns
+	// (oldValues/newValues) are valid in the metadata.
+	//
+	// The method does not mutate any captured state; it is ok to call Build
+	// concurrently (e.g. if the plan it originates from is cached and reused).
+	//
+	// Some cascades (delete fast path) don't require an input binding. In that
+	// case binding is 0, bindingProps is nil, and oldValues/newValues are empty.
+	//
+	// Note: factory is always *norm.Factory; it is an interface{} only to avoid
+	// circular package dependencies.
+	Build(
+		ctx context.Context,
+		semaCtx *tree.SemaContext,
+		evalCtx *tree.EvalContext,
+		catalog cat.Catalog,
+		factory interface{},
+		binding opt.WithID,
+		bindingProps *props.Relational,
+		oldValues, newValues opt.ColList,
+	) (RelExpr, error)
 }

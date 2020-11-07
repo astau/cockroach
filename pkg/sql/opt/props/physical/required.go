@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package physical
 
@@ -33,7 +29,7 @@ import (
 // Required properties are derived top-to-bottom - there is a required physical
 // property on the root, and each expression can require physical properties on
 // one or more of its operands. When an expression is optimized, it is always
-// with respect to a particular set of required physical properties.  The goal
+// with respect to a particular set of required physical properties. The goal
 // is to find the lowest cost expression that provides those properties while
 // still remaining logically equivalent.
 type Required struct {
@@ -47,6 +43,15 @@ type Required struct {
 	// descending order. If Ordering is not defined, then no particular ordering
 	// is required or provided.
 	Ordering OrderingChoice
+
+	// LimitHint specifies a "soft limit" to the number of result rows that may
+	// be required of the expression. If requested, an expression will still need
+	// to return all result rows, but it can be optimized based on the assumption
+	// that only the hinted number of rows will be needed.
+	// A LimitHint of 0 indicates "no limit". The LimitHint is an intermediate
+	// float64 representation, and can be converted to an integer number of rows
+	// using math.Ceil.
+	LimitHint float64
 }
 
 // MinRequired are the default physical properties that require nothing and
@@ -56,51 +61,51 @@ var MinRequired = &Required{}
 // Defined is true if any physical property is defined. If none is defined, then
 // this is an instance of MinRequired.
 func (p *Required) Defined() bool {
-	return !p.Presentation.Any() || !p.Ordering.Any()
+	return !p.Presentation.Any() || !p.Ordering.Any() || p.LimitHint != 0
 }
 
 // ColSet returns the set of columns used by any of the physical properties.
 func (p *Required) ColSet() opt.ColSet {
 	colSet := p.Ordering.ColSet()
 	for _, col := range p.Presentation {
-		colSet.Add(int(col.ID))
+		colSet.Add(col.ID)
 	}
 	return colSet
 }
 
 func (p *Required) String() string {
-	hasProjection := !p.Presentation.Any()
-	hasOrdering := !p.Ordering.Any()
+	var buf bytes.Buffer
+	output := func(name string, fn func(*bytes.Buffer)) {
+		if buf.Len() != 0 {
+			buf.WriteByte(' ')
+		}
+		buf.WriteByte('[')
+		buf.WriteString(name)
+		buf.WriteString(": ")
+		fn(&buf)
+		buf.WriteByte(']')
+	}
+
+	if !p.Presentation.Any() {
+		output("presentation", p.Presentation.format)
+	}
+	if !p.Ordering.Any() {
+		output("ordering", p.Ordering.Format)
+	}
+	if p.LimitHint != 0 {
+		output("limit hint", func(buf *bytes.Buffer) { fmt.Fprintf(buf, "%.2f", p.LimitHint) })
+	}
 
 	// Handle empty properties case.
-	if !hasProjection && !hasOrdering {
+	if buf.Len() == 0 {
 		return "[]"
 	}
-
-	var buf bytes.Buffer
-
-	if hasProjection {
-		buf.WriteString("[presentation: ")
-		p.Presentation.format(&buf)
-		buf.WriteByte(']')
-
-		if hasOrdering {
-			buf.WriteString(" ")
-		}
-	}
-
-	if hasOrdering {
-		buf.WriteString("[ordering: ")
-		p.Ordering.Format(&buf)
-		buf.WriteByte(']')
-	}
-
 	return buf.String()
 }
 
 // Equals returns true if the two physical properties are identical.
 func (p *Required) Equals(rhs *Required) bool {
-	return p.Presentation.Equals(rhs.Presentation) && p.Ordering.Equals(&rhs.Ordering)
+	return p.Presentation.Equals(rhs.Presentation) && p.Ordering.Equals(&rhs.Ordering) && p.LimitHint == rhs.LimitHint
 }
 
 // Presentation specifies the naming, membership (including duplicates), and
@@ -119,6 +124,10 @@ func (p Presentation) Any() bool {
 // Equals returns true iff this presentation exactly matches the given
 // presentation.
 func (p Presentation) Equals(rhs Presentation) bool {
+	// The 0 column presentation is not the same as the nil presentation.
+	if p.Any() != rhs.Any() {
+		return false
+	}
 	if len(p) != len(rhs) {
 		return false
 	}

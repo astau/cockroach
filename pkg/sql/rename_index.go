@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -18,18 +14,21 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 )
 
-var errEmptyIndexName = pgerror.NewError(pgerror.CodeSyntaxError, "empty index name")
+var errEmptyIndexName = pgerror.New(pgcode.Syntax, "empty index name")
 
 type renameIndexNode struct {
 	n         *tree.RenameIndex
-	tableDesc *sqlbase.MutableTableDescriptor
-	idx       sqlbase.IndexDescriptor
+	tableDesc *tabledesc.Mutable
+	idx       *descpb.IndexDescriptor
 }
 
 // RenameIndex renames the index.
@@ -37,9 +36,13 @@ type renameIndexNode struct {
 //   notes: postgres requires CREATE on the table.
 //          mysql requires ALTER, CREATE, INSERT on the table.
 func (p *planner) RenameIndex(ctx context.Context, n *tree.RenameIndex) (planNode, error) {
-	_, tableDesc, err := expandMutableIndexName(ctx, p, n.Index, true /* requireTable */)
+	_, tableDesc, err := expandMutableIndexName(ctx, p, n.Index, !n.IfExists /* requireTable */)
 	if err != nil {
 		return nil, err
+	}
+	if tableDesc == nil {
+		// IfExists specified and table did not exist -- noop.
+		return newZeroNode(nil /* columns */), nil
 	}
 
 	idx, _, err := tableDesc.FindIndexByName(string(n.Index.Index))
@@ -59,6 +62,11 @@ func (p *planner) RenameIndex(ctx context.Context, n *tree.RenameIndex) (planNod
 	return &renameIndexNode{n: n, idx: idx, tableDesc: tableDesc}, nil
 }
 
+// ReadingOwnWrites implements the planNodeReadingOwnWrites interface.
+// This is because RENAME DATABASE performs multiple KV operations on descriptors
+// and expects to see its own writes.
+func (n *renameIndexNode) ReadingOwnWrites() {}
+
 func (n *renameIndexNode) startExec(params runParams) error {
 	p := params.p
 	ctx := params.ctx
@@ -69,8 +77,9 @@ func (n *renameIndexNode) startExec(params runParams) error {
 		if tableRef.IndexID != idx.ID {
 			continue
 		}
-		return p.dependentViewRenameError(
-			ctx, "index", n.n.Index.Index.String(), tableDesc.ParentID, tableRef.ID)
+		return p.dependentViewError(
+			ctx, "index", n.n.Index.Index.String(), tableDesc.ParentID, tableRef.ID, "rename",
+		)
 	}
 
 	if n.n.NewName == "" {
@@ -90,11 +99,14 @@ func (n *renameIndexNode) startExec(params runParams) error {
 		return err
 	}
 
-	if err := tableDesc.Validate(ctx, p.txn, p.EvalContext().Settings); err != nil {
+	if err := tableDesc.Validate(
+		ctx, catalogkv.NewOneLevelUncachedDescGetter(p.txn, p.ExecCfg().Codec),
+	); err != nil {
 		return err
 	}
 
-	return p.writeSchemaChange(ctx, tableDesc, sqlbase.InvalidMutationID)
+	return p.writeSchemaChange(
+		ctx, tableDesc, descpb.InvalidMutationID, tree.AsStringWithFQNames(n.n, params.Ann()))
 }
 
 func (n *renameIndexNode) Next(runParams) (bool, error) { return false, nil }

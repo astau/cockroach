@@ -1,22 +1,21 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package memo
 
 import (
 	"bytes"
+	"context"
 	"fmt"
+	"sort"
+	"strings"
 	"unicode"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
@@ -24,14 +23,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/treeprinter"
+	"github.com/cockroachdb/errors"
 )
 
-// ExprFmtInterceptor is a callback that can be set to a custom formatting
-// function. If the function returns true, the normal formatting code is
-// bypassed.
-var ExprFmtInterceptor func(f *ExprFmtCtx, tp treeprinter.Node, nd opt.Expr) bool
+// ScalarFmtInterceptor is a callback that can be set to a custom formatting
+// function. If the function returns a non-empty string, the normal formatting
+// code is bypassed.
+var ScalarFmtInterceptor func(f *ExprFmtCtx, expr opt.ScalarExpr) string
 
 // ExprFmtFlags controls which properties of the expression are shown in
 // formatted output.
@@ -42,7 +42,7 @@ const (
 	ExprFmtShowAll ExprFmtFlags = 0
 
 	// ExprFmtHideMiscProps does not show outer columns, row cardinality, provided
-	// orderings, or side effects in the output.
+	// orderings, side effects, or error text in the output.
 	ExprFmtHideMiscProps ExprFmtFlags = 1 << (iota - 1)
 
 	// ExprFmtHideConstraints does not show inferred constraints in the output.
@@ -68,7 +68,23 @@ const (
 	// them with the SQL expression (if possible).
 	ExprFmtHideScalars
 
-	// ExprFmtHideAll shows only the most basic properties of the expression.
+	// ExprFmtHidePhysProps hides all required physical properties, except for
+	// Presentation (see ExprFmtHideColumns).
+	ExprFmtHidePhysProps
+
+	// ExprFmtHideTypes hides type information from columns and scalar
+	// expressions.
+	ExprFmtHideTypes
+
+	// ExprFmtHideNotNull hides the !null specifier from columns.
+	ExprFmtHideNotNull
+
+	// ExprFmtHideColumns removes column information.
+	ExprFmtHideColumns
+
+	// ExprFmtHideAll shows only the basic structure of the expression.
+	// Note: this flag should be used judiciously, as its meaning changes whenever
+	// we add more flags.
 	ExprFmtHideAll ExprFmtFlags = (1 << iota) - 1
 )
 
@@ -79,12 +95,12 @@ func (f ExprFmtFlags) HasFlags(subset ExprFmtFlags) bool {
 
 // FormatExpr returns a string representation of the given expression, formatted
 // according to the specified flags.
-func FormatExpr(e opt.Expr, flags ExprFmtFlags) string {
-	var mem *Memo
-	if nd, ok := e.(RelExpr); ok {
-		mem = nd.Memo()
+func FormatExpr(e opt.Expr, flags ExprFmtFlags, mem *Memo, catalog cat.Catalog) string {
+	if catalog == nil {
+		// Automatically hide qualifications if we have no catalog.
+		flags |= ExprFmtHideQualifications
 	}
-	f := MakeExprFmtCtx(flags, mem)
+	f := MakeExprFmtCtx(flags, mem, catalog)
 	f.FormatExpr(e)
 	return f.Buffer.String()
 }
@@ -100,17 +116,32 @@ type ExprFmtCtx struct {
 
 	// Memo must contain any expression that is formatted.
 	Memo *Memo
+
+	// Catalog must be set unless the ExprFmtHideQualifications flag is set.
+	Catalog cat.Catalog
+
+	// nameGen is used to generate a unique name for each relational
+	// subexpression when Memo.saveTablesPrefix is non-empty. These names
+	// correspond to the tables that would be saved if the query were run
+	// with the session variable `save_tables_prefix` set to the same value.
+	nameGen *ExprNameGenerator
 }
 
 // MakeExprFmtCtx creates an expression formatting context from a new buffer.
-func MakeExprFmtCtx(flags ExprFmtFlags, mem *Memo) ExprFmtCtx {
-	return ExprFmtCtx{Buffer: &bytes.Buffer{}, Flags: flags, Memo: mem}
+func MakeExprFmtCtx(flags ExprFmtFlags, mem *Memo, catalog cat.Catalog) ExprFmtCtx {
+	return MakeExprFmtCtxBuffer(&bytes.Buffer{}, flags, mem, catalog)
 }
 
 // MakeExprFmtCtxBuffer creates an expression formatting context from an
 // existing buffer.
-func MakeExprFmtCtxBuffer(buf *bytes.Buffer, flags ExprFmtFlags, mem *Memo) ExprFmtCtx {
-	return ExprFmtCtx{Buffer: buf, Flags: flags, Memo: mem}
+func MakeExprFmtCtxBuffer(
+	buf *bytes.Buffer, flags ExprFmtFlags, mem *Memo, catalog cat.Catalog,
+) ExprFmtCtx {
+	var nameGen *ExprNameGenerator
+	if mem != nil && mem.saveTablesPrefix != "" {
+		nameGen = NewExprNameGenerator(mem.saveTablesPrefix)
+	}
+	return ExprFmtCtx{Buffer: buf, Flags: flags, Memo: mem, Catalog: catalog, nameGen: nameGen}
 }
 
 // HasFlags tests whether the given flags are all set.
@@ -127,11 +158,11 @@ func (f *ExprFmtCtx) FormatExpr(e opt.Expr) {
 	f.Buffer.WriteString(tp.String())
 }
 
-func (f *ExprFmtCtx) formatExpr(e opt.Expr, tp treeprinter.Node) {
-	if ExprFmtInterceptor != nil && ExprFmtInterceptor(f, tp, e) {
-		return
-	}
+func (f *ExprFmtCtx) space() {
+	f.Buffer.WriteByte(' ')
+}
 
+func (f *ExprFmtCtx) formatExpr(e opt.Expr, tp treeprinter.Node) {
 	scalar, ok := e.(opt.ScalarExpr)
 	if ok {
 		f.formatScalar(scalar, tp)
@@ -161,21 +192,68 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 		FormatPrivate(f, e.Private(), required)
 		f.Buffer.WriteByte(')')
 
+	case *InvertedJoinExpr:
+		fmt.Fprintf(f.Buffer, "%v (inverted", t.JoinType)
+		FormatPrivate(f, e.Private(), required)
+		f.Buffer.WriteByte(')')
+
 	case *ZigzagJoinExpr:
 		fmt.Fprintf(f.Buffer, "%v (zigzag", opt.InnerJoinOp)
 		FormatPrivate(f, e.Private(), required)
 		f.Buffer.WriteByte(')')
 
-	case *ScanExpr, *VirtualScanExpr, *IndexJoinExpr, *ShowTraceForSessionExpr,
-		*InsertExpr, *UpdateExpr, *UpsertExpr, *DeleteExpr:
+	case *ScanExpr, *IndexJoinExpr, *ShowTraceForSessionExpr,
+		*InsertExpr, *UpdateExpr, *UpsertExpr, *DeleteExpr, *SequenceSelectExpr,
+		*WindowExpr, *OpaqueRelExpr, *OpaqueMutationExpr, *OpaqueDDLExpr,
+		*AlterTableSplitExpr, *AlterTableUnsplitExpr, *AlterTableUnsplitAllExpr,
+		*AlterTableRelocateExpr, *ControlJobsExpr, *CancelQueriesExpr,
+		*CancelSessionsExpr, *CreateViewExpr, *ExportExpr:
 		fmt.Fprintf(f.Buffer, "%v", e.Op())
 		FormatPrivate(f, e.Private(), required)
 
+	case *SortExpr:
+		if t.InputOrdering.Any() {
+			fmt.Fprintf(f.Buffer, "%v", e.Op())
+		} else {
+			fmt.Fprintf(f.Buffer, "%v (segmented)", e.Op())
+		}
+
+	case *WithExpr:
+		fmt.Fprintf(f.Buffer, "%v &%d", e.Op(), t.ID)
+		if t.Name != "" {
+			fmt.Fprintf(f.Buffer, " (%s)", t.Name)
+		}
+
+	case *WithScanExpr:
+		fmt.Fprintf(f.Buffer, "%v &%d", e.Op(), t.With)
+		if t.Name != "" {
+			fmt.Fprintf(f.Buffer, " (%s)", t.Name)
+		}
+
 	default:
 		fmt.Fprintf(f.Buffer, "%v", e.Op())
+		if opt.IsJoinNonApplyOp(t) {
+			// All join ops that weren't handled above execute as a hash join.
+			if leftEqCols, _ := ExtractJoinEqualityColumns(
+				e.Child(0).(RelExpr).Relational().OutputCols,
+				e.Child(1).(RelExpr).Relational().OutputCols,
+				*e.Child(2).(*FiltersExpr),
+			); len(leftEqCols) == 0 {
+				// The case where there are no equality columns is executed as a
+				// degenerate case of hash join; let's be explicit about that.
+				f.Buffer.WriteString(" (cross)")
+			} else {
+				f.Buffer.WriteString(" (hash)")
+			}
+		}
 	}
 
 	tp = tp.Child(f.Buffer.String())
+
+	if f.nameGen != nil {
+		name := f.nameGen.GenerateName(e.Op())
+		tp.Childf("save-table-name: %s", name)
+	}
 
 	var colList opt.ColList
 	// Special handling to improve the columns display for certain ops.
@@ -191,8 +269,8 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 		}
 
 		// Add pass-through columns.
-		t.Passthrough.ForEach(func(i int) {
-			colList = append(colList, opt.ColumnID(i))
+		t.Passthrough.ForEach(func(i opt.ColumnID) {
+			colList = append(colList, i)
 		})
 
 	case *ValuesExpr:
@@ -212,36 +290,103 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 	switch t := e.(type) {
 	// Special-case handling for GroupBy private; print grouping columns
 	// and internal ordering in addition to full set of columns.
-	case *GroupByExpr, *ScalarGroupByExpr, *DistinctOnExpr:
+	case *GroupByExpr, *ScalarGroupByExpr, *DistinctOnExpr, *EnsureDistinctOnExpr,
+		*UpsertDistinctOnExpr, *EnsureUpsertDistinctOnExpr:
 		private := e.Private().(*GroupingPrivate)
-		if !private.GroupingCols.Empty() {
+		if !f.HasFlags(ExprFmtHideColumns) && !private.GroupingCols.Empty() {
 			f.formatColList(e, tp, "grouping columns:", opt.ColSetToList(private.GroupingCols))
 		}
-		if !private.Ordering.Any() {
+		if !f.HasFlags(ExprFmtHidePhysProps) && !private.Ordering.Any() {
 			tp.Childf("internal-ordering: %s", private.Ordering)
+		}
+		if !f.HasFlags(ExprFmtHideMiscProps) && private.ErrorOnDup != "" {
+			tp.Childf("error: \"%s\"", private.ErrorOnDup)
 		}
 
 	case *LimitExpr:
-		if !t.Ordering.Any() {
+		if !f.HasFlags(ExprFmtHidePhysProps) && !t.Ordering.Any() {
 			tp.Childf("internal-ordering: %s", t.Ordering)
 		}
 
 	case *OffsetExpr:
-		if !t.Ordering.Any() {
+		if !f.HasFlags(ExprFmtHidePhysProps) && !t.Ordering.Any() {
 			tp.Childf("internal-ordering: %s", t.Ordering)
+		}
+
+	case *Max1RowExpr:
+		if !f.HasFlags(ExprFmtHideMiscProps) {
+			tp.Childf("error: \"%s\"", t.ErrorText)
 		}
 
 	// Special-case handling for set operators to show the left and right
 	// input columns that correspond to the output columns.
 	case *UnionExpr, *IntersectExpr, *ExceptExpr,
 		*UnionAllExpr, *IntersectAllExpr, *ExceptAllExpr:
-		private := e.Private().(*SetPrivate)
-		f.formatColList(e, tp, "left columns:", private.LeftCols)
-		f.formatColList(e, tp, "right columns:", private.RightCols)
+		if !f.HasFlags(ExprFmtHideColumns) {
+			private := e.Private().(*SetPrivate)
+			f.formatColList(e, tp, "left columns:", private.LeftCols)
+			f.formatColList(e, tp, "right columns:", private.RightCols)
+		}
 
 	case *ScanExpr:
-		if t.Constraint != nil {
-			tp.Childf("constraint: %s", t.Constraint)
+		if t.IsCanonical() {
+			// For the canonical scan, show the expressions attached to the TableMeta.
+			tab := md.TableMeta(t.Table)
+			if tab.Constraints != nil {
+				c := tp.Childf("check constraint expressions")
+				for i := 0; i < tab.Constraints.ChildCount(); i++ {
+					f.formatExpr(tab.Constraints.Child(i), c)
+				}
+			}
+			if len(tab.ComputedCols) > 0 {
+				c := tp.Childf("computed column expressions")
+				cols := make(opt.ColList, 0, len(tab.ComputedCols))
+				for col := range tab.ComputedCols {
+					cols = append(cols, col)
+				}
+				sort.Slice(cols, func(i, j int) bool {
+					return cols[i] < cols[j]
+				})
+				for _, col := range cols {
+					f.Buffer.Reset()
+					f.formatExpr(tab.ComputedCols[col], c.Child(f.ColumnString(col)))
+				}
+			}
+			if tab.PartialIndexPredicates != nil {
+				c := tp.Child("partial index predicates")
+				indexOrds := make([]cat.IndexOrdinal, 0, len(tab.PartialIndexPredicates))
+				for ord := range tab.PartialIndexPredicates {
+					indexOrds = append(indexOrds, ord)
+				}
+				sort.Ints(indexOrds)
+				for _, ord := range indexOrds {
+					name := string(tab.Table.Index(ord).Name())
+					f.Buffer.Reset()
+					f.formatScalarWithLabel(name, tab.PartialIndexPredicates[ord], c)
+				}
+			}
+		}
+		if c := t.Constraint; c != nil {
+			if c.IsContradiction() {
+				tp.Childf("constraint: contradiction")
+			} else if c.Spans.Count() == 1 {
+				tp.Childf("constraint: %s: %s", c.Columns.String(), c.Spans.Get(0).String())
+			} else {
+				n := tp.Childf("constraint: %s", c.Columns.String())
+				for i := 0; i < c.Spans.Count(); i++ {
+					n.Child(c.Spans.Get(i).String())
+				}
+			}
+		}
+		if ic := t.InvertedConstraint; ic != nil {
+			idx := md.Table(t.Table).Index(t.Index)
+			var b strings.Builder
+			for i := idx.NonInvertedPrefixColumnCount(); i < idx.KeyColumnCount(); i++ {
+				b.WriteRune('/')
+				b.WriteString(fmt.Sprintf("%d", t.Table.ColumnID(idx.Column(i).Ordinal())))
+			}
+			n := tp.Childf("inverted constraint: %s", b.String())
+			ic.Format(n, "spans")
 		}
 		if t.HardLimit.IsSet() {
 			tp.Childf("limit: %s", t.HardLimit)
@@ -251,71 +396,251 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 				tp.Childf("flags: no-index-join")
 			} else if t.Flags.ForceIndex {
 				idx := md.Table(t.Table).Index(t.Flags.Index)
-				tp.Childf("flags: force-index=%s", idx.Name())
+				dir := ""
+				switch t.Flags.Direction {
+				case tree.DefaultDirection:
+				case tree.Ascending:
+					dir = ",fwd"
+				case tree.Descending:
+					dir = ",rev"
+				}
+				tp.Childf("flags: force-index=%s%s", idx.Name(), dir)
 			}
+		}
+		if t.Locking != nil {
+			strength := ""
+			switch t.Locking.Strength {
+			case tree.ForNone:
+			case tree.ForKeyShare:
+				strength = "for-key-share"
+			case tree.ForShare:
+				strength = "for-share"
+			case tree.ForNoKeyUpdate:
+				strength = "for-no-key-update"
+			case tree.ForUpdate:
+				strength = "for-update"
+			default:
+				panic(errors.AssertionFailedf("unexpected strength"))
+			}
+			wait := ""
+			switch t.Locking.WaitPolicy {
+			case tree.LockWaitBlock:
+			case tree.LockWaitSkip:
+				wait = ",skip-locked"
+			case tree.LockWaitError:
+				wait = ",nowait"
+			default:
+				panic(errors.AssertionFailedf("unexpected wait policy"))
+			}
+			tp.Childf("locking: %s%s", strength, wait)
+		}
+
+	case *InvertedFilterExpr:
+		var b strings.Builder
+		b.WriteRune('/')
+		b.WriteString(fmt.Sprintf("%d", t.InvertedColumn))
+		n := tp.Childf("inverted expression: %s", b.String())
+		t.InvertedExpression.Format(n, false /* includeSpansToRead */)
+		if t.PreFiltererState != nil {
+			n := tp.Childf("pre-filterer expression")
+			f.formatExpr(t.PreFiltererState.Expr, n)
 		}
 
 	case *LookupJoinExpr:
-		idxCols := make(opt.ColList, len(t.KeyCols))
-		idx := md.Table(t.Table).Index(t.Index)
-		for i := range idxCols {
-			idxCols[i] = t.Table.ColumnID(idx.Column(i).Ordinal)
+		if !t.Flags.Empty() {
+			tp.Childf("flags: %s", t.Flags.String())
 		}
-		tp.Childf("key columns: %v = %v", t.KeyCols, idxCols)
+		if !f.HasFlags(ExprFmtHideColumns) {
+			idxCols := make(opt.ColList, len(t.KeyCols))
+			idx := md.Table(t.Table).Index(t.Index)
+			for i := range idxCols {
+				idxCols[i] = t.Table.ColumnID(idx.Column(i).Ordinal())
+			}
+			tp.Childf("key columns: %v = %v", t.KeyCols, idxCols)
+		}
+		if t.LookupColsAreTableKey {
+			tp.Childf("lookup columns are key")
+		}
+
+	case *InvertedJoinExpr:
+		if !t.Flags.Empty() {
+			tp.Childf("flags: %s", t.Flags.String())
+		}
+		n := tp.Child("inverted-expr")
+		f.formatExpr(t.InvertedExpr, n)
 
 	case *ZigzagJoinExpr:
-		tp.Childf("eq columns: %v = %v", t.LeftEqCols, t.RightEqCols)
-		leftVals := make([]tree.Datum, len(t.LeftFixedCols))
-		rightVals := make([]tree.Datum, len(t.RightFixedCols))
-		// FixedVals is always going to be a ScalarListExpr, containing tuples,
-		// containing one ScalarListExpr, containing ConstExprs.
-		for i := range t.LeftFixedCols {
-			leftVals[i] = t.FixedVals[0].Child(0).Child(i).(*ConstExpr).Value
+		if !f.HasFlags(ExprFmtHideColumns) {
+			tp.Childf("eq columns: %v = %v", t.LeftEqCols, t.RightEqCols)
+			leftVals := make([]tree.Datum, len(t.LeftFixedCols))
+			rightVals := make([]tree.Datum, len(t.RightFixedCols))
+			// FixedVals is always going to be a ScalarListExpr, containing tuples,
+			// containing one ScalarListExpr, containing ConstExprs.
+			for i := range t.LeftFixedCols {
+				leftVals[i] = ExtractConstDatum(t.FixedVals[0].Child(0).Child(i))
+			}
+			for i := range t.RightFixedCols {
+				rightVals[i] = ExtractConstDatum(t.FixedVals[1].Child(0).Child(i))
+			}
+			tp.Childf("left fixed columns: %v = %v", t.LeftFixedCols, leftVals)
+			tp.Childf("right fixed columns: %v = %v", t.RightFixedCols, rightVals)
 		}
-		for i := range t.RightFixedCols {
-			rightVals[i] = t.FixedVals[1].Child(0).Child(i).(*ConstExpr).Value
-		}
-		tp.Childf("left fixed columns: %v = %v", t.LeftFixedCols, leftVals)
-		tp.Childf("right fixed columns: %v = %v", t.RightFixedCols, rightVals)
 
 	case *MergeJoinExpr:
-		tp.Childf("left ordering: %s", t.LeftEq)
-		tp.Childf("right ordering: %s", t.RightEq)
+		if !t.Flags.Empty() {
+			tp.Childf("flags: %s", t.Flags.String())
+		}
+		if !f.HasFlags(ExprFmtHidePhysProps) {
+			tp.Childf("left ordering: %s", t.LeftEq)
+			tp.Childf("right ordering: %s", t.RightEq)
+		}
 
 	case *InsertExpr:
-		if len(colList) == 0 {
-			tp.Child("columns: <none>")
+		if !f.HasFlags(ExprFmtHideColumns) {
+			if len(colList) == 0 {
+				tp.Child("columns: <none>")
+			}
+			f.formatArbiters(tp, t.Arbiters, t.Table)
+			f.formatMutationCols(e, tp, "insert-mapping:", t.InsertCols, t.Table)
+			f.formatColList(e, tp, "check columns:", t.CheckCols)
+			f.formatColList(e, tp, "partial index put columns:", t.PartialIndexPutCols)
+			f.formatMutationCommon(tp, &t.MutationPrivate)
 		}
-		tpChild := tp.Child("insert-mapping:")
-		f.formatMutation(e, tpChild, t.InsertCols, t.Table)
 
 	case *UpdateExpr:
-		if len(colList) == 0 {
-			tp.Child("columns: <none>")
+		if !f.HasFlags(ExprFmtHideColumns) {
+			if len(colList) == 0 {
+				tp.Child("columns: <none>")
+			}
+			f.formatColList(e, tp, "fetch columns:", t.FetchCols)
+			f.formatMutationCols(e, tp, "update-mapping:", t.UpdateCols, t.Table)
+			f.formatColList(e, tp, "check columns:", t.CheckCols)
+			f.formatColList(e, tp, "partial index put columns:", t.PartialIndexPutCols)
+			f.formatColList(e, tp, "partial index del columns:", t.PartialIndexDelCols)
+			f.formatMutationCommon(tp, &t.MutationPrivate)
 		}
-		f.formatColList(e, tp, "fetch columns:", t.FetchCols)
-		tpChild := tp.Child("update-mapping:")
-		f.formatMutation(e, tpChild, t.UpdateCols, t.Table)
+
+	case *UpsertExpr:
+		if !f.HasFlags(ExprFmtHideColumns) {
+			if len(colList) == 0 {
+				tp.Child("columns: <none>")
+			}
+			if t.CanaryCol != 0 {
+				f.formatArbiters(tp, t.Arbiters, t.Table)
+				f.formatColList(e, tp, "canary column:", opt.ColList{t.CanaryCol})
+				f.formatColList(e, tp, "fetch columns:", t.FetchCols)
+				f.formatMutationCols(e, tp, "insert-mapping:", t.InsertCols, t.Table)
+				f.formatMutationCols(e, tp, "update-mapping:", t.UpdateCols, t.Table)
+				f.formatMutationCols(e, tp, "return-mapping:", t.ReturnCols, t.Table)
+			} else {
+				f.formatMutationCols(e, tp, "upsert-mapping:", t.InsertCols, t.Table)
+			}
+			f.formatColList(e, tp, "check columns:", t.CheckCols)
+			f.formatColList(e, tp, "partial index put columns:", t.PartialIndexPutCols)
+			f.formatColList(e, tp, "partial index del columns:", t.PartialIndexDelCols)
+			f.formatMutationCommon(tp, &t.MutationPrivate)
+		}
+
+	case *DeleteExpr:
+		if !f.HasFlags(ExprFmtHideColumns) {
+			if len(colList) == 0 {
+				tp.Child("columns: <none>")
+			}
+			f.formatColList(e, tp, "fetch columns:", t.FetchCols)
+			f.formatColList(e, tp, "partial index del columns:", t.PartialIndexDelCols)
+			f.formatMutationCommon(tp, &t.MutationPrivate)
+		}
+
+	case *WithExpr:
+		if t.Mtr.Set {
+			if t.Mtr.Materialize {
+				tp.Child("materialized")
+			} else {
+				tp.Child("not-materialized")
+			}
+		}
+
+	case *WithScanExpr:
+		if !f.HasFlags(ExprFmtHideColumns) {
+			child := tp.Child("mapping:")
+			for i := range t.InCols {
+				f.Buffer.Reset()
+				f.space()
+				f.formatCol("" /* label */, t.InCols[i], opt.ColSet{} /* notNullCols */)
+				f.Buffer.WriteString(" => ")
+				f.formatCol("" /* label */, t.OutCols[i], opt.ColSet{} /* notNullCols */)
+				child.Child(f.Buffer.String())
+			}
+		}
 
 	case *CreateTableExpr:
 		tp.Child(t.Syntax.String())
 
-	case *UpsertExpr:
-		if len(colList) == 0 {
-			tp.Child("columns: <none>")
-		}
-		tp.Childf("canary column: %d", t.CanaryCol)
-		f.formatColList(e, tp, "fetch columns:", t.FetchCols)
-		tpChild := tp.Child("insert-mapping:")
-		f.formatMutation(e, tpChild, t.InsertCols, t.Table)
-		tpChild = tp.Child("update-mapping:")
-		f.formatMutation(e, tpChild, t.UpdateCols, t.Table)
+	case *CreateViewExpr:
+		tp.Child(t.ViewQuery)
 
-	case *DeleteExpr:
-		if len(colList) == 0 {
-			tp.Child("columns: <none>")
+		f.Buffer.Reset()
+		f.Buffer.WriteString("columns:")
+		for _, col := range t.Columns {
+			f.space()
+			f.formatCol(col.Alias, col.ID, opt.ColSet{} /* notNullCols */)
 		}
-		f.formatColList(e, tp, "fetch columns:", t.FetchCols)
+		tp.Child(f.Buffer.String())
+
+		n := tp.Child("dependencies")
+		for _, dep := range t.Deps {
+			f.Buffer.Reset()
+			name := dep.DataSource.Name()
+			f.Buffer.WriteString(name.String())
+			if dep.SpecificIndex {
+				fmt.Fprintf(f.Buffer, "@%s", dep.DataSource.(cat.Table).Index(dep.Index).Name())
+			}
+			colNames, isTable := dep.GetColumnNames()
+			if len(colNames) > 0 {
+				fmt.Fprintf(f.Buffer, " [columns:")
+				for _, colName := range colNames {
+					fmt.Fprintf(f.Buffer, " %s", colName)
+				}
+				fmt.Fprintf(f.Buffer, "]")
+			} else if isTable {
+				fmt.Fprintf(f.Buffer, " [no columns]")
+			}
+			n.Child(f.Buffer.String())
+		}
+
+	case *ExportExpr:
+		tp.Childf("format: %s", t.FileFormat)
+
+	case *ExplainExpr:
+		// ExplainPlan is the default, don't show it.
+		m := ""
+		if t.Options.Mode != tree.ExplainPlan {
+			m = strings.ToLower(t.Options.Mode.String())
+		}
+		if t.Options.Flags[tree.ExplainFlagVerbose] {
+			if m != "" {
+				m += ", "
+			}
+			m += "verbose"
+		}
+		if m != "" {
+			tp.Childf("mode: %s", m)
+		}
+
+	case *RecursiveCTEExpr:
+		if !f.HasFlags(ExprFmtHideColumns) {
+			tp.Childf("working table binding: &%d", t.WithID)
+			f.formatColList(e, tp, "initial columns:", t.InitialCols)
+			f.formatColList(e, tp, "recursive columns:", t.RecursiveCols)
+		}
+
+	default:
+		if opt.IsJoinOp(t) {
+			p := t.Private().(*JoinPrivate)
+			if !p.Flags.Empty() {
+				tp.Childf("flags: %s", p.Flags.String())
+			}
+		}
 	}
 
 	if !f.HasFlags(ExprFmtHideMiscProps) {
@@ -329,6 +654,13 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 			}
 		}
 
+		if join, ok := e.(joinWithMultiplicity); ok {
+			mult := join.getMultiplicity()
+			if s := mult.Format(e.Op()); s != "" {
+				tp.Childf("multiplicity: %s", s)
+			}
+		}
+
 		f.Buffer.Reset()
 		writeFlag := func(name string) {
 			if f.Buffer.Len() != 0 {
@@ -337,8 +669,8 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 			f.Buffer.WriteString(name)
 		}
 
-		if relational.CanHaveSideEffects {
-			writeFlag("side-effects")
+		if !relational.VolatilitySet.IsLeakProof() {
+			writeFlag(relational.VolatilitySet.String())
 		}
 		if relational.CanMutate {
 			writeFlag("mutations")
@@ -376,19 +708,24 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 		}
 	}
 
-	if !required.Ordering.Any() {
-		if f.HasFlags(ExprFmtHideMiscProps) {
-			tp.Childf("ordering: %s", required.Ordering.String())
-		} else {
-			// Show the provided ordering as well, unless it's exactly the same.
-			provided := e.ProvidedPhysical().Ordering
-			reqStr := required.Ordering.String()
-			provStr := provided.String()
-			if provStr == reqStr {
+	if !f.HasFlags(ExprFmtHidePhysProps) {
+		if !required.Ordering.Any() {
+			if f.HasFlags(ExprFmtHideMiscProps) {
 				tp.Childf("ordering: %s", required.Ordering.String())
 			} else {
-				tp.Childf("ordering: %s [provided: %s]", required.Ordering.String(), provided.String())
+				// Show the provided ordering as well, unless it's exactly the same.
+				provided := e.ProvidedPhysical().Ordering
+				reqStr := required.Ordering.String()
+				provStr := provided.String()
+				if provStr == reqStr {
+					tp.Childf("ordering: %s", required.Ordering.String())
+				} else {
+					tp.Childf("ordering: %s [actual: %s]", required.Ordering.String(), provided.String())
+				}
 			}
+		}
+		if required.LimitHint != 0 {
+			tp.Childf("limit hint: %.2f", required.LimitHint)
 		}
 	}
 
@@ -402,6 +739,23 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 		}
 		if len(r.InterestingOrderings) > 0 {
 			tp.Childf("interesting orderings: %s", r.InterestingOrderings.String())
+		}
+		if !r.UnfilteredCols.Empty() {
+			tp.Childf("unfiltered-cols: %s", r.UnfilteredCols.String())
+		}
+		if withUses := relational.Shared.Rule.WithUses; len(withUses) > 0 {
+			n := tp.Childf("cte-uses")
+			ids := make([]opt.WithID, 0, len(withUses))
+			for id := range withUses {
+				ids = append(ids, id)
+			}
+			sort.Slice(ids, func(i, j int) bool {
+				return ids[i] < ids[j]
+			})
+			for _, id := range ids {
+				info := withUses[id]
+				n.Childf("&%d: count=%d used-columns=%s", id, info.Count, info.UsedCols)
+			}
 		}
 	}
 
@@ -419,9 +773,20 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 }
 
 func (f *ExprFmtCtx) formatScalar(scalar opt.ScalarExpr, tp treeprinter.Node) {
+	f.formatScalarWithLabel("", scalar, tp)
+}
+
+func (f *ExprFmtCtx) formatScalarWithLabel(
+	label string, scalar opt.ScalarExpr, tp treeprinter.Node,
+) {
+	f.Buffer.Reset()
+	if label != "" {
+		f.Buffer.WriteString(label)
+		f.Buffer.WriteString(": ")
+	}
 	switch scalar.Op() {
-	case opt.ProjectionsOp, opt.AggregationsOp:
-		// Omit empty Projections and Aggregations expressions.
+	case opt.ProjectionsOp, opt.AggregationsOp, opt.FKChecksOp, opt.KVOptionsOp:
+		// Omit empty lists (except filters).
 		if scalar.ChildCount() == 0 {
 			return
 		}
@@ -429,12 +794,12 @@ func (f *ExprFmtCtx) formatScalar(scalar opt.ScalarExpr, tp treeprinter.Node) {
 	case opt.FiltersOp:
 		// Show empty Filters expression as "filters (true)".
 		if scalar.ChildCount() == 0 {
-			tp.Child("filters (true)")
+			f.Buffer.WriteString("filters (true)")
+			tp.Child(f.Buffer.String())
 			return
 		}
 
 	case opt.IfErrOp:
-		f.Buffer.Reset()
 		fmt.Fprintf(f.Buffer, "%v", scalar.Op())
 		f.FormatScalarProps(scalar)
 
@@ -449,83 +814,162 @@ func (f *ExprFmtCtx) formatScalar(scalar opt.ScalarExpr, tp treeprinter.Node) {
 		}
 
 		return
+
+	case opt.AggFilterOp:
+		fmt.Fprintf(f.Buffer, "%v", scalar.Op())
+		f.FormatScalarProps(scalar)
+		tp = tp.Child(f.Buffer.String())
+
+		f.formatExpr(scalar.Child(0), tp)
+		f.formatExpr(scalar.Child(1), tp.Child("filter"))
+
+		return
+
+	case opt.ScalarListOp:
+		// Don't show scalar-list as a separate node, as it's redundant with its
+		// parent.
+		for i, n := 0, scalar.ChildCount(); i < n; i++ {
+			f.formatExpr(scalar.Child(i), tp)
+		}
+		return
 	}
 
-	// Don't show scalar-list, as it's redundant with its parent.
-	if scalar.Op() != opt.ScalarListOp {
-		f.Buffer.Reset()
-		propsExpr := scalar
-		switch scalar.Op() {
-		case opt.FiltersItemOp, opt.ProjectionsItemOp, opt.AggregationsItemOp, opt.ZipItemOp:
-			// Use properties from the item, but otherwise omit it from output.
-			scalar = scalar.Child(0).(opt.ScalarExpr)
+	// Omit various list items from the output, but show some of their properties
+	// along with the properties of their child.
+	var scalarProps []string
+	switch scalar.Op() {
+	case opt.FiltersItemOp, opt.ProjectionsItemOp, opt.AggregationsItemOp,
+		opt.ZipItemOp, opt.WindowsItemOp:
+
+		emitProp := func(format string, args ...interface{}) {
+			scalarProps = append(scalarProps, fmt.Sprintf(format, args...))
+		}
+		switch item := scalar.(type) {
+		case *ProjectionsItem:
+			if !f.HasFlags(ExprFmtHideColumns) {
+				emitProp("as=%s", f.ColumnString(item.Col))
+			}
+
+		case *AggregationsItem:
+			if !f.HasFlags(ExprFmtHideColumns) {
+				emitProp("as=%s", f.ColumnString(item.Col))
+			}
+
+		case *ZipItem:
+			// TODO(radu): show the item.Cols
+
+		case *WindowsItem:
+			if !f.HasFlags(ExprFmtHideColumns) {
+				emitProp("as=%s", f.ColumnString(item.Col))
+			}
+			// Only show the frame if it differs from the default.
+			def := WindowFrame{
+				Mode:           tree.RANGE,
+				StartBoundType: tree.UnboundedPreceding,
+				EndBoundType:   tree.CurrentRow,
+				FrameExclusion: tree.NoExclusion,
+			}
+			if item.Frame != def {
+				emitProp("frame=%q", item.Frame.String())
+			}
 		}
 
-		fmt.Fprintf(f.Buffer, "%v", scalar.Op())
-		f.formatScalarPrivate(scalar)
-		f.FormatScalarProps(propsExpr)
-		tp = tp.Child(f.Buffer.String())
+		scalarProps = append(scalarProps, f.scalarPropsStrings(scalar)...)
+		scalar = scalar.Child(0).(opt.ScalarExpr)
+
+	default:
+		scalarProps = f.scalarPropsStrings(scalar)
 	}
 
-	for i, n := 0, scalar.ChildCount(); i < n; i++ {
-		f.formatExpr(scalar.Child(i), tp)
+	var intercepted bool
+	if f.HasFlags(ExprFmtHideScalars) && ScalarFmtInterceptor != nil {
+		if str := ScalarFmtInterceptor(f, scalar); str != "" {
+			f.Buffer.WriteString(str)
+			intercepted = true
+		}
 	}
+	if !intercepted {
+		fmt.Fprintf(f.Buffer, "%v", scalar.Op())
+		f.formatScalarPrivate(scalar)
+	}
+	if len(scalarProps) != 0 {
+		f.Buffer.WriteString(" [")
+		f.Buffer.WriteString(strings.Join(scalarProps, ", "))
+		f.Buffer.WriteByte(']')
+	}
+	tp = tp.Child(f.Buffer.String())
+
+	if !intercepted {
+		for i, n := 0, scalar.ChildCount(); i < n; i++ {
+			f.formatExpr(scalar.Child(i), tp)
+		}
+	}
+}
+
+// scalarPropsStrings returns a slice of strings, each describing a property;
+// for example:
+//   {"type=bool", "outer=(1)", "constraints=(/1: [/1 - /1]; tight)"}
+func (f *ExprFmtCtx) scalarPropsStrings(scalar opt.ScalarExpr) []string {
+	typ := scalar.DataType()
+	if typ == nil {
+		if scalar.Op() == opt.FKChecksItemOp || scalar.Op() == opt.KVOptionsItemOp {
+			// These are not true scalars and have no properties.
+			return nil
+		}
+		// Don't panic if scalar properties don't yet exist when printing
+		// expression.
+		return []string{"type=undefined"}
+	}
+
+	var res []string
+	emitProp := func(format string, args ...interface{}) {
+		res = append(res, fmt.Sprintf(format, args...))
+	}
+	if !f.HasFlags(ExprFmtHideTypes) && typ.Family() != types.AnyFamily {
+		emitProp("type=%s", typ)
+	}
+	if propsExpr, ok := scalar.(ScalarPropsExpr); ok {
+		scalarProps := propsExpr.ScalarProps()
+		if !f.HasFlags(ExprFmtHideMiscProps) {
+			if !scalarProps.OuterCols.Empty() {
+				emitProp("outer=%s", scalarProps.OuterCols)
+			}
+			if !scalarProps.VolatilitySet.IsLeakProof() {
+				emitProp(scalarProps.VolatilitySet.String())
+			}
+			if scalarProps.HasCorrelatedSubquery {
+				emitProp("correlated-subquery")
+			} else if scalarProps.HasSubquery {
+				emitProp("subquery")
+			}
+		}
+
+		if !f.HasFlags(ExprFmtHideConstraints) {
+			if scalarProps.Constraints != nil && !scalarProps.Constraints.IsUnconstrained() {
+				var tight string
+				if scalarProps.TightConstraints {
+					tight = "; tight"
+				}
+				emitProp("constraints=(%s%s)", scalarProps.Constraints, tight)
+			}
+		}
+
+		if !f.HasFlags(ExprFmtHideFuncDeps) && !scalarProps.FuncDeps.Empty() {
+			emitProp("fd=%s", scalarProps.FuncDeps)
+		}
+	}
+	return res
 }
 
 // FormatScalarProps writes out a string representation of the scalar
 // properties (with a preceding space); for example:
 //  " [type=bool, outer=(1), constraints=(/1: [/1 - /1]; tight)]"
 func (f *ExprFmtCtx) FormatScalarProps(scalar opt.ScalarExpr) {
-	// Don't panic if scalar properties don't yet exist when printing
-	// expression.
-	typ := scalar.DataType()
-	if typ == nil {
-		f.Buffer.WriteString(" [type=undefined]")
-	} else {
-		first := true
-		writeProp := func(format string, args ...interface{}) {
-			if first {
-				f.Buffer.WriteString(" [")
-				first = false
-			} else {
-				f.Buffer.WriteString(", ")
-			}
-			fmt.Fprintf(f.Buffer, format, args...)
-		}
-
-		if typ != types.Any {
-			writeProp("type=%s", typ)
-		}
-
-		if propsExpr, ok := scalar.(ScalarPropsExpr); ok && f.Memo != nil {
-			scalarProps := propsExpr.ScalarProps(f.Memo)
-			if !f.HasFlags(ExprFmtHideMiscProps) {
-				if !scalarProps.OuterCols.Empty() {
-					writeProp("outer=%s", scalarProps.OuterCols)
-				}
-				if scalarProps.CanHaveSideEffects {
-					writeProp("side-effects")
-				}
-			}
-
-			if !f.HasFlags(ExprFmtHideConstraints) {
-				if scalarProps.Constraints != nil && !scalarProps.Constraints.IsUnconstrained() {
-					writeProp("constraints=(%s", scalarProps.Constraints)
-					if scalarProps.TightConstraints {
-						f.Buffer.WriteString("; tight")
-					}
-					f.Buffer.WriteString(")")
-				}
-			}
-
-			if !f.HasFlags(ExprFmtHideFuncDeps) && !scalarProps.FuncDeps.Empty() {
-				writeProp("fd=%s", scalarProps.FuncDeps)
-			}
-		}
-
-		if !first {
-			f.Buffer.WriteString("]")
-		}
+	props := f.scalarPropsStrings(scalar)
+	if len(props) != 0 {
+		f.Buffer.WriteString(" [")
+		f.Buffer.WriteString(strings.Join(props, ", "))
+		f.Buffer.WriteByte(']')
 	}
 }
 
@@ -534,12 +978,6 @@ func (f *ExprFmtCtx) formatScalarPrivate(scalar opt.ScalarExpr) {
 	switch t := scalar.(type) {
 	case *NullExpr, *TupleExpr, *CollateExpr:
 		// Private is redundant with logical type property.
-		private = nil
-
-	case *ProjectionsExpr, *AggregationsExpr:
-		// The private data of these ops was already used to print the output
-		// columns for their containing op (Project or GroupBy), so no need to
-		// print again.
 		private = nil
 
 	case *AnyExpr:
@@ -555,6 +993,44 @@ func (f *ExprFmtCtx) formatScalarPrivate(scalar opt.ScalarExpr) {
 		// We don't want to show the OriginalExpr.
 		private = nil
 
+	case *CastExpr:
+		private = t.Typ.SQLString()
+
+	case *KVOptionsItem:
+		fmt.Fprintf(f.Buffer, " %s", t.Key)
+
+	case *FKChecksItem:
+		origin := f.Memo.metadata.TableMeta(t.OriginTable)
+		referenced := f.Memo.metadata.TableMeta(t.ReferencedTable)
+		var fk cat.ForeignKeyConstraint
+		if t.FKOutbound {
+			fk = origin.Table.OutboundForeignKey(t.FKOrdinal)
+		} else {
+			fk = referenced.Table.InboundForeignKey(t.FKOrdinal)
+		}
+		// Print the FK as:
+		//   child(a,b) -> parent(a,b)
+		//
+		// TODO(radu): maybe flip these if we are deleting from the parent (i.e.
+		// FKOutbound=false)?
+		fmt.Fprintf(f.Buffer, ": %s(", origin.Alias.ObjectName)
+		for i := 0; i < fk.ColumnCount(); i++ {
+			if i > 0 {
+				f.Buffer.WriteByte(',')
+			}
+			col := origin.Table.Column(fk.OriginColumnOrdinal(origin.Table, i))
+			f.Buffer.WriteString(string(col.ColName()))
+		}
+		fmt.Fprintf(f.Buffer, ") -> %s(", referenced.Alias.ObjectName)
+		for i := 0; i < fk.ColumnCount(); i++ {
+			if i > 0 {
+				f.Buffer.WriteByte(',')
+			}
+			col := referenced.Table.Column(fk.ReferencedColumnOrdinal(referenced.Table, i))
+			f.Buffer.WriteString(string(col.ColName()))
+		}
+		f.Buffer.WriteByte(')')
+
 	default:
 		private = scalar.Private()
 	}
@@ -565,9 +1041,64 @@ func (f *ExprFmtCtx) formatScalarPrivate(scalar opt.ScalarExpr) {
 	}
 }
 
+// formatIndex outputs the specified index into the context's buffer with the
+// format:
+//
+//   table_alias@index_name
+//
+// If reverse is true, ",rev" is appended.
+//
+// If the index is a partial index, ",partial" is appended.
+//
+// If the table is aliased, " [as=alias]" is appended.
+func (f *ExprFmtCtx) formatIndex(tabID opt.TableID, idxOrd cat.IndexOrdinal, reverse bool) {
+	md := f.Memo.Metadata()
+	tabMeta := md.TableMeta(tabID)
+	index := tabMeta.Table.Index(idxOrd)
+	if idxOrd == cat.PrimaryIndex {
+		// Don't output the index name if it's the primary index.
+		fmt.Fprintf(f.Buffer, " %s", tableName(f, tabID))
+	} else {
+		fmt.Fprintf(f.Buffer, " %s@%s", tableName(f, tabID), index.Name())
+	}
+	if reverse {
+		f.Buffer.WriteString(",rev")
+	}
+	if _, isPartial := index.Predicate(); isPartial {
+		f.Buffer.WriteString(",partial")
+	}
+	alias := md.TableMeta(tabID).Alias.Table()
+	if alias != string(tabMeta.Table.Name()) {
+		fmt.Fprintf(f.Buffer, " [as=%s]", alias)
+	}
+}
+
+// formatArbiters constructs a new treeprinter child containing the
+// specified list of arbiter indexes.
+func (f *ExprFmtCtx) formatArbiters(
+	tp treeprinter.Node, arbiters cat.IndexOrdinals, tabID opt.TableID,
+) {
+	md := f.Memo.Metadata()
+	tab := md.Table(tabID)
+
+	if len(arbiters) > 0 {
+		f.Buffer.Reset()
+		f.Buffer.WriteString("arbiter indexes:")
+		for _, idx := range arbiters {
+			name := string(tab.Index(idx).Name())
+			f.space()
+			f.Buffer.WriteString(name)
+		}
+		tp.Child(f.Buffer.String())
+	}
+}
+
 func (f *ExprFmtCtx) formatColumns(
 	nd RelExpr, tp treeprinter.Node, cols opt.ColList, presentation physical.Presentation,
 ) {
+	if f.HasFlags(ExprFmtHideColumns) {
+		return
+	}
 	if presentation.Any() {
 		f.formatColList(nd, tp, "columns:", cols)
 		return
@@ -581,14 +1112,16 @@ func (f *ExprFmtCtx) formatColumns(
 	f.Buffer.Reset()
 	f.Buffer.WriteString("columns:")
 	for _, col := range presentation {
-		hidden.Remove(int(col.ID))
-		formatCol(f, col.Alias, col.ID, notNullCols, false /* omitType */)
+		hidden.Remove(col.ID)
+		f.space()
+		f.formatCol(col.Alias, col.ID, notNullCols)
 	}
 	if !hidden.Empty() {
 		f.Buffer.WriteString("  [hidden:")
 		for _, col := range cols {
-			if hidden.Contains(int(col)) {
-				formatCol(f, "" /* label */, col, notNullCols, false /* omitType */)
+			if hidden.Contains(col) {
+				f.space()
+				f.formatCol("" /* label */, col, notNullCols)
 			}
 		}
 		f.Buffer.WriteString("]")
@@ -606,52 +1139,78 @@ func (f *ExprFmtCtx) formatColList(
 		f.Buffer.Reset()
 		f.Buffer.WriteString(heading)
 		for _, col := range colList {
-			formatCol(f, "" /* label */, col, notNullCols, false /* omitType */)
+			if col != 0 {
+				f.space()
+				f.formatCol("" /* label */, col, notNullCols)
+			}
 		}
 		tp.Child(f.Buffer.String())
 	}
 }
 
-// formatMutation adds a new treeprinter child for each non-zero column in the
+// formatMutationCols adds a new treeprinter child for each non-zero column in the
 // given list. Each child shows how the column will be mutated, with the id of
 // the "before" and "after" columns, similar to this:
 //
 //   a:1 => x:4
 //
-func (f *ExprFmtCtx) formatMutation(
-	nd RelExpr, tp treeprinter.Node, colList opt.ColList, tabID opt.TableID,
+func (f *ExprFmtCtx) formatMutationCols(
+	nd RelExpr, tp treeprinter.Node, heading string, colList opt.ColList, tabID opt.TableID,
 ) {
+	if len(colList) == 0 {
+		return
+	}
+
+	tpChild := tp.Child(heading)
 	for i, col := range colList {
 		if col != 0 {
-			f.Buffer.Reset()
-			formatCol(f, "" /* label */, col, opt.ColSet{}, true /* omitType */)
-			f.Buffer.WriteString(" =>")
-			formatCol(f, "" /* label */, tabID.ColumnID(i), opt.ColSet{}, true /* omitType */)
-			tp.Child(f.Buffer.String())
+			tpChild.Child(fmt.Sprintf("%s => %s", f.ColumnString(col), f.ColumnString(tabID.ColumnID(i))))
 		}
 	}
 }
 
-// formatCol outputs the specified column into the context's buffer using the
+// formatMutationCommon shows the MutationPrivate fields that format the same
+// for all types of mutations.
+func (f *ExprFmtCtx) formatMutationCommon(tp treeprinter.Node, p *MutationPrivate) {
+	if p.WithID != 0 {
+		tp.Childf("input binding: &%d", p.WithID)
+	}
+	if len(p.FKCascades) > 0 {
+		c := tp.Childf("cascades")
+		for i := range p.FKCascades {
+			c.Child(p.FKCascades[i].FKName)
+		}
+	}
+}
+
+// ColumnString returns the column in the same format as formatColSimple.
+func (f *ExprFmtCtx) ColumnString(id opt.ColumnID) string {
+	var buf bytes.Buffer
+	f.formatColSimpleToBuffer(&buf, "" /* label */, id)
+	return buf.String()
+}
+
+// formatColSimple outputs the specified column into the context's buffer using the
 // following format:
-//   label:index(type)
+//   label:id
 //
-// If the column is not nullable, then this is the format:
-//   label:index(type!null)
+// The :id part is omitted if the formatting flags include ExprFmtHideColumns.
 //
 // If a label is given, then it is used. Otherwise, a "best effort" label is
 // used from query metadata.
-//
-// If omitType is true, then the type specifier (including not nullable) is
-// omitted from the output.
-func formatCol(
-	f *ExprFmtCtx, label string, id opt.ColumnID, notNullCols opt.ColSet, omitType bool,
-) {
-	md := f.Memo.metadata
-	colMeta := md.ColumnMeta(id)
+func (f *ExprFmtCtx) formatColSimple(label string, id opt.ColumnID) {
+	f.formatColSimpleToBuffer(f.Buffer, label, id)
+}
+
+func (f *ExprFmtCtx) formatColSimpleToBuffer(buf *bytes.Buffer, label string, id opt.ColumnID) {
 	if label == "" {
-		fullyQualify := !f.HasFlags(ExprFmtHideQualifications)
-		label = colMeta.QualifiedAlias(fullyQualify)
+		if f.Memo != nil {
+			md := f.Memo.metadata
+			fullyQualify := !f.HasFlags(ExprFmtHideQualifications)
+			label = md.QualifiedAlias(id, fullyQualify, f.Catalog)
+		} else {
+			label = fmt.Sprintf("unknown%d", id)
+		}
 	}
 
 	if !isSimpleColumnName(label) {
@@ -660,17 +1219,36 @@ func formatCol(
 		label = "\"" + label + "\""
 	}
 
-	f.Buffer.WriteByte(' ')
-	f.Buffer.WriteString(label)
-	f.Buffer.WriteByte(':')
-	fmt.Fprintf(f.Buffer, "%d", id)
-	if !omitType {
-		f.Buffer.WriteByte('(')
-		f.Buffer.WriteString(colMeta.Type.String())
+	buf.WriteString(label)
+	if !f.HasFlags(ExprFmtHideColumns) {
+		buf.WriteByte(':')
+		fmt.Fprintf(buf, "%d", id)
+	}
+}
 
-		if notNullCols.Contains(int(id)) {
-			f.Buffer.WriteString("!null")
-		}
+// formatCol outputs the specified column into the context's buffer using the
+// following format:
+//   label:id(type)
+//
+// If the column is not nullable, then this is the format:
+//   label:id(type!null)
+//
+// Some of the components can be omitted depending on formatting flags.
+//
+// If a label is given, then it is used. Otherwise, a "best effort" label is
+// used from query metadata.
+func (f *ExprFmtCtx) formatCol(label string, id opt.ColumnID, notNullCols opt.ColSet) {
+	f.formatColSimple(label, id)
+	parenOpen := false
+	if !f.HasFlags(ExprFmtHideTypes) && f.Memo != nil {
+		f.Buffer.WriteByte('(')
+		parenOpen = true
+		f.Buffer.WriteString(f.Memo.metadata.ColumnMeta(id).Type.String())
+	}
+	if !f.HasFlags(ExprFmtHideNotNull) && notNullCols.Contains(id) {
+		f.Buffer.WriteString("!null")
+	}
+	if parenOpen {
 		f.Buffer.WriteByte(')')
 	}
 }
@@ -687,34 +1265,29 @@ func FormatPrivate(f *ExprFmtCtx, private interface{}, physProps *physical.Requi
 	}
 	switch t := private.(type) {
 	case *opt.ColumnID:
-		fullyQualify := !f.HasFlags(ExprFmtHideQualifications)
-		label := f.Memo.metadata.ColumnMeta(*t).QualifiedAlias(fullyQualify)
-		fmt.Fprintf(f.Buffer, " %s", label)
+		f.space()
+		f.formatColSimple("" /* label */, *t)
+
+	case *opt.ColList:
+		for _, col := range *t {
+			f.space()
+			f.formatColSimple("" /* label */, col)
+		}
 
 	case *TupleOrdinal:
 		fmt.Fprintf(f.Buffer, " %d", *t)
 
 	case *ScanPrivate:
-		// Don't output name of index if it's the primary index.
-		tab := f.Memo.metadata.Table(t.Table)
-		if t.Index == cat.PrimaryIndex {
-			fmt.Fprintf(f.Buffer, " %s", tableName(f, t.Table))
-		} else {
-			fmt.Fprintf(f.Buffer, " %s@%s", tableName(f, t.Table), tab.Index(t.Index).Name())
-		}
-		if ScanIsReverseFn(f.Memo.Metadata(), t, &physProps.Ordering) {
-			f.Buffer.WriteString(",rev")
-		}
+		f.formatIndex(t.Table, t.Index, ScanIsReverseFn(f.Memo.Metadata(), t, &physProps.Ordering))
 
-	case *VirtualScanPrivate:
-		// Always fully qualify virtual table names.
-		tabMeta := f.Memo.metadata.TableMeta(t.Table)
-		fmt.Fprintf(f.Buffer, " %s", tabMeta.Table.Name())
+	case *SequenceSelectPrivate:
+		seq := f.Memo.metadata.Sequence(t.Sequence)
+		fmt.Fprintf(f.Buffer, " %s", seq.Name())
 
 	case *MutationPrivate:
-		fmt.Fprintf(f.Buffer, " %s", tableName(f, t.Table))
+		f.formatIndex(t.Table, cat.PrimaryIndex, false /* reverse */)
 
-	case *RowNumberPrivate:
+	case *OrdinalityPrivate:
 		if !t.Ordering.Any() {
 			fmt.Fprintf(f.Buffer, " ordering=%s", t.Ordering)
 		}
@@ -727,27 +1300,24 @@ func FormatPrivate(f *ExprFmtCtx, private interface{}, physProps *physical.Requi
 
 	case *IndexJoinPrivate:
 		tab := f.Memo.metadata.Table(t.Table)
-		fmt.Fprintf(f.Buffer, " %s", tab.Name().TableName)
+		fmt.Fprintf(f.Buffer, " %s", tab.Name())
+
+	case *InvertedFilterPrivate:
+		col := f.Memo.metadata.ColumnMeta(t.InvertedColumn)
+		fmt.Fprintf(f.Buffer, " %s", col.Alias)
 
 	case *LookupJoinPrivate:
-		tab := f.Memo.metadata.Table(t.Table)
-		if t.Index == cat.PrimaryIndex {
-			fmt.Fprintf(f.Buffer, " %s", tab.Name().TableName)
-		} else {
-			fmt.Fprintf(f.Buffer, " %s@%s", tab.Name().TableName, tab.Index(t.Index).Name())
-		}
+		f.formatIndex(t.Table, t.Index, false /* reverse */)
+
+	case *InvertedJoinPrivate:
+		f.formatIndex(t.Table, t.Index, false /* reverse */)
+
+	case *ValuesPrivate:
+		fmt.Fprintf(f.Buffer, " id=v%d", t.ID)
 
 	case *ZigzagJoinPrivate:
-		leftTab := f.Memo.metadata.Table(t.LeftTable)
-		rightTab := f.Memo.metadata.Table(t.RightTable)
-		fmt.Fprintf(f.Buffer, " %s", leftTab.Name().TableName)
-		if t.LeftIndex != cat.PrimaryIndex {
-			fmt.Fprintf(f.Buffer, "@%s", leftTab.Index(t.LeftIndex).Name())
-		}
-		fmt.Fprintf(f.Buffer, " %s", rightTab.Name().TableName)
-		if t.RightIndex != cat.PrimaryIndex {
-			fmt.Fprintf(f.Buffer, "@%s", rightTab.Index(t.RightIndex).Name())
-		}
+		f.formatIndex(t.LeftTable, t.LeftIndex, false /* reverse */)
+		f.formatIndex(t.RightTable, t.RightIndex, false /* reverse */)
 
 	case *MergeJoinPrivate:
 		fmt.Fprintf(f.Buffer, " %s,%s,%s", t.JoinType, t.LeftEq, t.RightEq)
@@ -755,12 +1325,49 @@ func FormatPrivate(f *ExprFmtCtx, private interface{}, physProps *physical.Requi
 	case *FunctionPrivate:
 		fmt.Fprintf(f.Buffer, " %s", t.Name)
 
+	case *WindowsItemPrivate:
+		fmt.Fprintf(f.Buffer, " frame=%q", &t.Frame)
+
+	case *WindowPrivate:
+		fmt.Fprintf(f.Buffer, " partition=%s", t.Partition)
+		if !t.Ordering.Any() {
+			fmt.Fprintf(f.Buffer, " ordering=%s", t.Ordering)
+		}
+
 	case *physical.OrderingChoice:
 		if !t.Any() {
 			fmt.Fprintf(f.Buffer, " ordering=%s", t)
 		}
 
-	case *ExplainPrivate, *opt.ColSet, *opt.ColList, *SetPrivate, types.T:
+	case *OpaqueRelPrivate:
+		f.space()
+		f.Buffer.WriteString(t.Metadata.String())
+
+	case *AlterTableSplitPrivate:
+		f.formatIndex(t.Table, t.Index, false /* reverse */)
+
+	case *AlterTableRelocatePrivate:
+		FormatPrivate(f, &t.AlterTableSplitPrivate, nil)
+		if t.RelocateLease {
+			f.Buffer.WriteString(" [lease]")
+		}
+
+	case *ControlJobsPrivate:
+		fmt.Fprintf(f.Buffer, " (%s)", tree.JobCommandToStatement[t.Command])
+
+	case *CancelPrivate:
+		if t.IfExists {
+			f.Buffer.WriteString(" [if-exists]")
+		}
+
+	case *CreateViewPrivate:
+		schema := f.Memo.Metadata().Schema(t.Schema)
+		fmt.Fprintf(f.Buffer, " %s.%s", schema.Name(), t.ViewName)
+
+	case *JoinPrivate:
+		// Nothing to show; flags are shown separately.
+
+	case *ExplainPrivate, *opt.ColSet, *SetPrivate, *types.T, *ExportPrivate:
 		// Don't show anything, because it's mostly redundant.
 
 	default:
@@ -768,13 +1375,19 @@ func FormatPrivate(f *ExprFmtCtx, private interface{}, physProps *physical.Requi
 	}
 }
 
-// tableName returns the alias for a table to be used for pretty-printing.
+// tableName returns the table name to be used for pretty-printing. If
+// ExprFmtHideQualifications is not set, the fully qualified table name is
+// returned.
 func tableName(f *ExprFmtCtx, tabID opt.TableID) string {
+	tabMeta := f.Memo.metadata.TableMeta(tabID)
 	if f.HasFlags(ExprFmtHideQualifications) {
-		tabMeta := f.Memo.metadata.TableMeta(tabID)
-		return tabMeta.Name()
+		return string(tabMeta.Table.Name())
 	}
-	return f.Memo.metadata.Table(tabID).Name().String()
+	tn, err := f.Catalog.FullyQualifiedName(context.TODO(), tabMeta.Table)
+	if err != nil {
+		panic(err)
+	}
+	return tn.FQString()
 }
 
 // isSimpleColumnName returns true if the given label consists of only ASCII

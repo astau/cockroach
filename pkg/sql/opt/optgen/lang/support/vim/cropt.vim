@@ -50,9 +50,10 @@ syn keyword operator Scan ScanPrivate VirtualScan VirtualScanPrivate Values Sele
 syn keyword operator InnerJoin LeftJoin RightJoin FullJoin SemiJoin AntiJoin
 syn keyword operator IndexJoin IndexJoinPrivate LookupJoin LookupJoinPrivate
 syn keyword operator MergeJoin MergeJoinPrivate
-syn keyword operator InnerJoinApply LeftJoinApply RightJoinApply FullJoinApply
+syn keyword operator InnerJoinApply LeftJoinApply
 syn keyword operator SemiJoinApply AntiJoinApply
-syn keyword operator GroupBy GroupingPrivate ScalarGroupBy DistinctOn
+syn keyword operator GroupBy GroupingPrivate ScalarGroupBy
+syn keyword operator DistinctOn EnsureDistinctOn UpsertDistinctOn EnsureUpsertDistinctOn
 syn keyword operator Union SetPrivate Intersect Except UnionAll IntersectAll ExceptAll
 syn keyword operator Limit Offset Max1Row Explain ExplainPrivate
 syn keyword operator ShowTraceForSession ShowTracePrivate RowNumber RowNumberPrivate ProjectSet

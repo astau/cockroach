@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 // Package pgconnect provides a way to get byte encodings from a simple query.
 package pgconnect
@@ -22,8 +18,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
-	"github.com/jackc/pgx/pgproto3"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
+	"github.com/jackc/pgproto3/v2"
 )
 
 // Connect connects to the postgres-compatible server at addr with specified
@@ -43,10 +39,7 @@ func Connect(
 	}
 	defer conn.Close()
 
-	fe, err := pgproto3.NewFrontend(conn, conn)
-	if err != nil {
-		return nil, errors.Wrap(err, "new frontend")
-	}
+	fe := pgproto3.NewFrontend(pgproto3.NewChunkReader(conn), conn)
 
 	send := make(chan pgproto3.FrontendMessage)
 	recv := make(chan pgproto3.BackendMessage)
@@ -106,7 +99,7 @@ func Connect(
 		}
 		{
 			r := <-recv
-			if msg, ok := r.(*pgproto3.Authentication); !ok || msg.Type != 0 {
+			if _, ok := r.(*pgproto3.AuthenticationOk); !ok {
 				return errors.Errorf("unexpected: %#v\n", r)
 			}
 		}

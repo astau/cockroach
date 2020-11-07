@@ -1,27 +1,25 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
+// +build race
 
 package memo
 
 import (
-	"fmt"
-
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 // CheckExpr does sanity checking on an Expr. This code is called in testrace
@@ -29,13 +27,11 @@ import (
 // builds).
 //
 // This function does not assume that the expression has been fully normalized.
-func (m *Memo) checkExpr(e opt.Expr) {
-	// RaceEnabled ensures that checks are run on every PR (as part of make
-	// testrace) while keeping the check code out of non-test builds.
-	if !util.RaceEnabled {
-		return
-	}
-
+//
+// This function is only defined in race builds, so that checks are run on every
+// PR (as part of make testrace) while keeping the check code out of non-test
+// builds, since it can be expensive to run.
+func (m *Memo) CheckExpr(e opt.Expr) {
 	// Check properties.
 	switch t := e.(type) {
 	case RelExpr:
@@ -57,37 +53,47 @@ func (m *Memo) checkExpr(e opt.Expr) {
 		}
 
 	case ScalarPropsExpr:
-		t.ScalarProps(m).Verify()
+		t.ScalarProps().Verify()
+
+		// Check that list items are not nested.
+		if opt.IsListItemOp(t.Child(0)) {
+			panic(errors.AssertionFailedf("projections list item cannot contain another list item"))
+		}
+	}
+
+	if !opt.IsListOp(e) {
+		for i := 0; i < e.ChildCount(); i++ {
+			child := e.Child(i)
+			if opt.IsListItemOp(child) {
+				panic(errors.AssertionFailedf("non-list op contains item op: %s", log.Safe(child.Op())))
+			}
+		}
 	}
 
 	// Check operator-specific fields.
 	switch t := e.(type) {
 	case *ScanExpr:
 		if t.Flags.NoIndexJoin && t.Flags.ForceIndex {
-			panic("NoIndexJoin and ForceIndex set")
+			panic(errors.AssertionFailedf("NoIndexJoin and ForceIndex set"))
 		}
 
 	case *ProjectExpr:
 		for _, item := range t.Projections {
-			// Check that list items are not nested.
-			if opt.IsListItemOp(item.Element) {
-				panic("projections list item cannot contain another list item")
-			}
-
 			// Check that column id is set.
 			if item.Col == 0 {
-				panic("projections column cannot have id of 0")
+				panic(errors.AssertionFailedf("projections column cannot have id of 0"))
 			}
 
 			// Check that column is not both passthrough and synthesized.
-			if t.Passthrough.Contains(int(item.Col)) {
-				panic(fmt.Sprintf("both passthrough and synthesized have column %d", item.Col))
+			if t.Passthrough.Contains(item.Col) {
+				panic(errors.AssertionFailedf(
+					"both passthrough and synthesized have column %d", log.Safe(item.Col)))
 			}
 
 			// Check that columns aren't passed through in projection expressions.
 			if v, ok := item.Element.(*VariableExpr); ok {
 				if v.Col == item.Col {
-					panic(fmt.Sprintf("projection passes through column %d", item.Col))
+					panic(errors.AssertionFailedf("projection passes through column %d", log.Safe(item.Col)))
 				}
 			}
 		}
@@ -106,7 +112,7 @@ func (m *Memo) checkExpr(e opt.Expr) {
 
 			default:
 				if !opt.IsAggregateOp(scalar) {
-					panic(fmt.Sprintf("aggregate contains illegal op: %s", scalar.Op()))
+					panic(errors.AssertionFailedf("aggregate contains illegal op: %s", log.Safe(scalar.Op())))
 				}
 			}
 		}
@@ -116,49 +122,76 @@ func (m *Memo) checkExpr(e opt.Expr) {
 
 			// Check that column id is set.
 			if item.Col == 0 {
-				panic("aggregations column cannot have id of 0")
+				panic(errors.AssertionFailedf("aggregations column cannot have id of 0"))
 			}
 
 			// Check that we don't have any bare variables as aggregations.
 			if item.Agg.Op() == opt.VariableOp {
-				panic("aggregation contains bare variable")
+				panic(errors.AssertionFailedf("aggregation contains bare variable"))
 			}
 		}
 
-	case *DistinctOnExpr:
+	case *DistinctOnExpr, *EnsureDistinctOnExpr, *UpsertDistinctOnExpr, *EnsureUpsertDistinctOnExpr:
+		checkErrorOnDup(e.(RelExpr))
+
 		// Check that aggregates can be only FirstAgg or ConstAgg.
-		for _, item := range t.Aggregations {
+		for _, item := range *t.Child(1).(*AggregationsExpr) {
 			switch item.Agg.Op() {
 			case opt.FirstAggOp, opt.ConstAggOp:
 
 			default:
-				panic(fmt.Sprintf("distinct-on contains %s", item.Agg.Op()))
+				panic(errors.AssertionFailedf("distinct-on contains %s", log.Safe(item.Agg.Op())))
 			}
 		}
 
 	case *GroupByExpr, *ScalarGroupByExpr:
+		checkErrorOnDup(e.(RelExpr))
+
 		// Check that aggregates cannot be FirstAgg.
 		for _, item := range *t.Child(1).(*AggregationsExpr) {
 			switch item.Agg.Op() {
 			case opt.FirstAggOp:
-				panic(fmt.Sprintf("group-by contains %s", item.Agg.Op()))
+				panic(errors.AssertionFailedf("group-by contains %s", log.Safe(item.Agg.Op())))
 			}
 		}
 
 	case *IndexJoinExpr:
 		if t.Cols.Empty() {
-			panic(fmt.Sprintf("index join with no columns"))
+			panic(errors.AssertionFailedf("index join with no columns"))
 		}
 
 	case *LookupJoinExpr:
 		if len(t.KeyCols) == 0 {
-			panic(fmt.Sprintf("lookup join with no key columns"))
+			panic(errors.AssertionFailedf("lookup join with no key columns"))
 		}
 		if t.Cols.Empty() {
-			panic(fmt.Sprintf("lookup join with no output columns"))
+			panic(errors.AssertionFailedf("lookup join with no output columns"))
 		}
 		if t.Cols.SubsetOf(t.Input.Relational().OutputCols) {
-			panic(fmt.Sprintf("lookup join with no lookup columns"))
+			panic(errors.AssertionFailedf("lookup join with no lookup columns"))
+		}
+		var requiredCols opt.ColSet
+		requiredCols.UnionWith(t.Relational().OutputCols)
+		requiredCols.UnionWith(t.ConstFilters.OuterCols(m))
+		requiredCols.UnionWith(t.On.OuterCols(m))
+		requiredCols.UnionWith(t.KeyCols.ToSet())
+		idx := m.Metadata().Table(t.Table).Index(t.Index)
+		for i := range t.KeyCols {
+			requiredCols.Add(t.Table.ColumnID(idx.Column(i).Ordinal()))
+		}
+		if !t.Cols.SubsetOf(requiredCols) {
+			panic(errors.AssertionFailedf("lookup join with columns that are not required"))
+		}
+		if t.IsSecondJoinInPairedJoiner {
+			ij, ok := t.Input.(*InvertedJoinExpr)
+			if !ok {
+				panic(errors.AssertionFailedf(
+					"lookup paired-join is paired with %T instead of inverted join", t.Input))
+			}
+			if !ij.IsFirstJoinInPairedJoiner {
+				panic(errors.AssertionFailedf(
+					"lookup paired-join is paired with inverted join that thinks it is unpaired"))
+			}
 		}
 
 	case *InsertExpr:
@@ -170,11 +203,12 @@ func (m *Memo) checkExpr(e opt.Expr) {
 		// Ensure that insert columns include all columns except for delete-only
 		// mutation columns (which do not need to be part of INSERT).
 		for i, n := 0, tab.ColumnCount(); i < n; i++ {
-			mut, ok := tab.Column(i).(*cat.MutationColumn)
-			if !ok || !mut.IsDeleteOnly {
-				if t.InsertCols[i] == 0 {
-					panic("insert values not provided for all table columns")
-				}
+			kind := tab.Column(i).Kind()
+			if (kind == cat.Ordinary || kind == cat.WriteOnly) && t.InsertCols[i] == 0 {
+				panic(errors.AssertionFailedf("insert values not provided for all table columns"))
+			}
+			if (kind == cat.System || kind.IsVirtual()) && t.InsertCols[i] != 0 {
+				panic(errors.AssertionFailedf("system or virtual column found in insertion columns"))
 			}
 		}
 
@@ -189,36 +223,65 @@ func (m *Memo) checkExpr(e opt.Expr) {
 
 	case *ZigzagJoinExpr:
 		if len(t.LeftEqCols) != len(t.RightEqCols) {
-			panic(fmt.Sprintf("zigzag join with mismatching eq columns"))
+			panic(errors.AssertionFailedf("zigzag join with mismatching eq columns"))
 		}
-
-	default:
-		if !opt.IsListOp(e) {
-			for i := 0; i < e.ChildCount(); i++ {
-				child := e.Child(i)
-				if opt.IsListItemOp(child) {
-					panic(fmt.Sprintf("non-list op contains item op: %s", child.Op()))
-				}
+		meta := m.Metadata()
+		left, right := meta.Table(t.LeftTable), meta.Table(t.RightTable)
+		for i := 0; i < left.ColumnCount(); i++ {
+			if left.Column(i).Kind() == cat.System && t.Cols.Contains(t.LeftTable.ColumnID(i)) {
+				panic(errors.AssertionFailedf("zigzag join should not contain system column"))
+			}
+		}
+		for i := 0; i < right.ColumnCount(); i++ {
+			if right.Column(i).Kind() == cat.System && t.Cols.Contains(t.RightTable.ColumnID(i)) {
+				panic(errors.AssertionFailedf("zigzag join should not contain system column"))
 			}
 		}
 
-		if e.Op() == opt.StringAggOp && !CanExtractConstDatum(e.Child(1)) {
-			panic(fmt.Sprintf("second argument to StringAggOp must always be constant, but got %s", e.Child(1).Op()))
+	case *AggDistinctExpr:
+		if t.Input.Op() == opt.AggFilterOp {
+			panic(errors.AssertionFailedf("AggFilter should always be on top of AggDistinct"))
 		}
 
+	case *ConstExpr:
+		if t.Value == tree.DNull {
+			panic(errors.AssertionFailedf("NULL values should always use NullExpr, not ConstExpr"))
+		}
+
+	default:
 		if opt.IsJoinOp(e) {
+			left := e.Child(0).(RelExpr)
+			right := e.Child(1).(RelExpr)
+			// The left side cannot depend on the right side columns.
+			if left.Relational().OuterCols.Intersects(right.Relational().OutputCols) {
+				panic(errors.AssertionFailedf(
+					"%s left side has outer cols in right side", log.Safe(e.Op()),
+				))
+			}
+
+			// The reverse is allowed but only for apply variants.
+			if !opt.IsJoinApplyOp(e) {
+				if right.Relational().OuterCols.Intersects(left.Relational().OutputCols) {
+					panic(errors.AssertionFailedf("%s is correlated", log.Safe(e.Op())))
+				}
+			}
 			checkFilters(*e.Child(2).(*FiltersExpr))
 		}
 	}
 
 	// Check orderings within operators.
 	checkExprOrdering(e)
+
+	// Check for overlapping column IDs in child relational expressions.
+	if opt.IsRelationalOp(e) {
+		checkOutputCols(e)
+	}
 }
 
 func (m *Memo) checkColListLen(colList opt.ColList, expectedLen int, listName string) {
 	if len(colList) != expectedLen {
-		panic(fmt.Sprintf("column list %s expected length = %d, actual length = %d",
-			listName, expectedLen, len(colList)))
+		panic(errors.AssertionFailedf("column list %s expected length = %d, actual length = %d",
+			listName, log.Safe(expectedLen), len(colList)))
 	}
 }
 
@@ -227,12 +290,12 @@ func (m *Memo) checkMutationExpr(rel RelExpr, private *MutationPrivate) {
 	tab := m.Metadata().Table(private.Table)
 	var mutCols opt.ColSet
 	for i, n := 0, tab.ColumnCount(); i < n; i++ {
-		if _, ok := tab.Column(i).(*cat.MutationColumn); ok {
-			mutCols.Add(int(private.Table.ColumnID(i)))
+		if tab.Column(i).IsMutation() {
+			mutCols.Add(private.Table.ColumnID(i))
 		}
 	}
 	if rel.Relational().OutputCols.Intersects(mutCols) {
-		panic("output columns cannot include mutation columns")
+		panic(errors.AssertionFailedf("output columns cannot include mutation columns"))
 	}
 }
 
@@ -244,7 +307,7 @@ func checkExprOrdering(e opt.Expr) {
 	switch t := e.Private().(type) {
 	case *physical.OrderingChoice:
 		ordering = *t
-	case *RowNumberPrivate:
+	case *OrdinalityPrivate:
 		ordering = t.Ordering
 	case GroupingPrivate:
 		ordering = t.Ordering
@@ -252,14 +315,64 @@ func checkExprOrdering(e opt.Expr) {
 		return
 	}
 	if outCols := e.(RelExpr).Relational().OutputCols; !ordering.SubsetOfCols(outCols) {
-		panic(fmt.Sprintf("invalid ordering %v (op: %s, outcols: %v)", ordering, e.Op(), outCols))
+		panic(errors.AssertionFailedf(
+			"invalid ordering %v (op: %s, outcols: %v)",
+			log.Safe(ordering), log.Safe(e.Op()), log.Safe(outCols),
+		))
 	}
 }
 
 func checkFilters(filters FiltersExpr) {
 	for _, item := range filters {
-		if opt.IsListItemOp(item.Condition) {
-			panic("filters list item cannot contain another list item")
+		if item.Condition.Op() == opt.RangeOp {
+			if !item.scalar.TightConstraints {
+				panic(errors.AssertionFailedf("range operator should always have tight constraints"))
+			}
+			if item.scalar.OuterCols.Len() != 1 {
+				panic(errors.AssertionFailedf("range operator should have exactly one outer col"))
+			}
 		}
+	}
+}
+
+func checkErrorOnDup(e RelExpr) {
+	// Only EnsureDistinctOn and EnsureUpsertDistinctOn should set the ErrorOnDup
+	// field to a value.
+	if e.Op() != opt.EnsureDistinctOnOp &&
+		e.Op() != opt.EnsureUpsertDistinctOnOp &&
+		e.Private().(*GroupingPrivate).ErrorOnDup != "" {
+		panic(errors.AssertionFailedf(
+			"%s should never set ErrorOnDup to a non-empty string", log.Safe(e.Op())))
+	}
+	if (e.Op() == opt.EnsureDistinctOnOp ||
+		e.Op() == opt.EnsureUpsertDistinctOnOp) &&
+		e.Private().(*GroupingPrivate).ErrorOnDup == "" {
+		panic(errors.AssertionFailedf(
+			"%s should never leave ErrorOnDup as an empty string", log.Safe(e.Op())))
+	}
+}
+
+func checkOutputCols(e opt.Expr) {
+	set := opt.ColSet{}
+
+	for i := 0; i < e.ChildCount(); i++ {
+		rel, ok := e.Child(i).(RelExpr)
+		if !ok {
+			continue
+		}
+
+		// The output columns of child expressions cannot overlap. The only
+		// exception is the first child of RecursiveCTE.
+		if e.Op() == opt.RecursiveCTEOp && i == 0 {
+			continue
+		}
+		cols := rel.Relational().OutputCols
+		if set.Intersects(cols) {
+			panic(errors.AssertionFailedf(
+				"%s RelExpr children have intersecting columns", log.Safe(e.Op()),
+			))
+		}
+
+		set.UnionWith(cols)
 	}
 }

@@ -1,5 +1,3 @@
-# LogicTest: fakedist fakedist-opt
-
 # ------------------------------------------------------------------------------
 # Zigzag join tests on non-inverted indexes.
 # ------------------------------------------------------------------------------
@@ -7,7 +5,7 @@
 statement ok
 CREATE TABLE a (n INT PRIMARY KEY, a INT, b INT, c STRING, INDEX a_idx(a), INDEX b_idx(b));
 INSERT INTO a SELECT a,a,a%3,'foo' FROM generate_series(1,10) AS g(a) ;
-SET experimental_enable_zigzag_join = true
+SET enable_zigzag_join = true
 
 query III rowsort
 SELECT n,a,b FROM a WHERE a = 4 AND b = 1
@@ -35,7 +33,7 @@ SELECT * FROM a WHERE a = 5 AND b = 2 AND c = 'foo'
 
 # Turn off zigzag joins and verify output.
 statement ok
-SET experimental_enable_zigzag_join = false
+SET enable_zigzag_join = false
 
 query III rowsort
 SELECT n,a,b FROM a WHERE a = 4 AND b = 1
@@ -46,6 +44,23 @@ query III rowsort
 SELECT n,a,b FROM a WHERE a = 5 AND b = 2
 ----
 5  5  2
+
+statement ok
+SET enable_zigzag_join = true
+
+# Regression test for 42164 ("invalid indexIdx" error).
+statement ok
+DROP INDEX a@a_idx;
+DROP INDEX a@b_idx;
+CREATE INDEX c_idx ON a(c);
+CREATE INDEX a_idx_2 ON a(a);
+CREATE INDEX b_idx_2 ON a(b);
+SELECT n,a,b FROM a WHERE a = 4 AND b = 1;
+
+# Regression test for 48003 ("non-values node passed as fixed value to zigzag
+# join" error).
+statement ok
+SELECT n FROM a WHERE b = 1 AND (((a < 1) AND (a > 1)) OR (a >= 2 AND a <= 2))
 
 # ------------------------------------------------------------------------------
 # Zigzag join tests on inverted indexes.
@@ -128,9 +143,6 @@ INSERT INTO d VALUES (31,  '{"a": {"b": "c", "d": "e"}, "f": "g"}')
 
 ## Multi-path contains queries with zigzag joins enabled.
 
-statement ok
-SET experimental_enable_zigzag_join = true;
-
 query IT
 SELECT * from d where b @> '{"a": {"b": "c"}, "f": "g"}'
 ----
@@ -172,6 +184,3 @@ query IT
 SELECT * from d where b @> '[{"a": {"b": [[2]]}}, "d"]'
 ----
 16  [{"a": {"b": [1, [2]]}}, "d"]
-
-statement ok
-SET experimental_enable_zigzag_join = false;

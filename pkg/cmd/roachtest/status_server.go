@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -49,10 +45,14 @@ func runStatusServer(ctx context.Context, t *test, c *cluster) {
 		urlMap[i+1] = `http://` + addr
 	}
 
+	// The status endpoints below may take a while to produce their answer, maybe more
+	// than the 3 second timeout of the default http client.
+	httpClient := httputil.NewClientWithTimeout(15 * time.Second)
+
 	// get performs an HTTP GET to the specified path for a specific node.
 	get := func(base, rel string) []byte {
 		url := base + rel
-		resp, err := http.Get(url)
+		resp, err := httpClient.Get(context.TODO(), url)
 		if err != nil {
 			t.Fatalf("could not GET %s - %s", url, err)
 		}
@@ -97,7 +97,7 @@ func runStatusServer(ctx context.Context, t *test, c *cluster) {
 	}
 
 	// Check local response for the every node.
-	for i := 1; i <= c.nodes; i++ {
+	for i := 1; i <= c.spec.NodeCount; i++ {
 		id := idMap[i]
 		checkNode(urlMap[i], id, id, id)
 		get(urlMap[i], "/_status/nodes")
@@ -105,7 +105,7 @@ func runStatusServer(ctx context.Context, t *test, c *cluster) {
 
 	// Proxy from the first node to the last node.
 	firstNode := 1
-	lastNode := c.nodes
+	lastNode := c.spec.NodeCount
 	firstID := idMap[firstNode]
 	lastID := idMap[lastNode]
 	checkNode(urlMap[firstNode], firstID, lastID, lastID)

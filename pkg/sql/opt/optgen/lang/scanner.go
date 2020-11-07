@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package lang
 
@@ -78,6 +74,8 @@ const (
 	COMMA
 	// CARET is the caret rune: ^
 	CARET
+	// DOT is the dot rune: .
+	DOT
 	// ELLIPSES is three periods in succession: ...
 	ELLIPSES
 	// PIPE is the vertical line rune: |
@@ -235,16 +233,24 @@ func (s *Scanner) Scan() Token {
 			if s.read() == '.' {
 				s.tok = ELLIPSES
 				s.lit = "..."
-				break
+			} else {
+				s.unread()
+				s.tok = ILLEGAL
+				s.lit = ".."
 			}
+			break
 		}
-
-		s.tok = ILLEGAL
+		s.unread()
+		s.tok = DOT
 		s.lit = "."
 
 	case '"':
 		s.unread()
-		return s.scanStringLiteral()
+		return s.scanStringLiteral('"', false /* multiLine */)
+
+	case '`':
+		s.unread()
+		return s.scanStringLiteral('`', true /* multiLine */)
 
 	case '#':
 		s.unread()
@@ -371,7 +377,7 @@ func (s *Scanner) scanIdentifier() Token {
 	return s.tok
 }
 
-func (s *Scanner) scanStringLiteral() Token {
+func (s *Scanner) scanStringLiteral(endChar rune, multiLine bool) Token {
 	// Create a buffer and read the current character into it.
 	var buf bytes.Buffer
 	buf.WriteRune(s.read())
@@ -380,7 +386,7 @@ func (s *Scanner) scanStringLiteral() Token {
 	// newline, or EOF is read.
 	for {
 		ch := s.read()
-		if ch == errRune || ch == eofRune || ch == '\n' {
+		if ch == errRune || ch == eofRune || (!multiLine && ch == '\n') {
 			s.unread()
 			s.tok = ILLEGAL
 			break
@@ -388,7 +394,7 @@ func (s *Scanner) scanStringLiteral() Token {
 
 		buf.WriteRune(ch)
 
-		if ch == '"' {
+		if ch == endChar {
 			s.tok = STRING
 			break
 		}

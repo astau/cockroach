@@ -1,31 +1,26 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
 import (
 	"context"
 	"fmt"
-	"runtime"
 	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/binfetcher"
+	"github.com/cockroachdb/errors"
 )
 
-func registerScaleData(r *registry) {
+func registerScaleData(r *testRegistry) {
 	// apps is a suite of Sqlapp applications designed to be used to check the
 	// consistency of a database under load. Each Sqlapp application launches a
 	// set of workers who perform database operations while another worker
@@ -36,19 +31,27 @@ func registerScaleData(r *registry) {
 	// The map provides a mapping between application name and command-line
 	// flags unique to that application.
 	apps := map[string]string{
-		"distributed_semaphore": "",
-		"filesystem_simulator":  "",
-		"jobcoordinator":        "--num_jobs_per_worker=8 --job_period_scale_millis=100",
+		"distributed-semaphore": "",
+		"filesystem-simulator":  "",
+		"job-coordinator":       "--num_jobs_per_worker=8 --job_period_scale_millis=100",
 	}
 
 	for app, flags := range apps {
 		app, flags := app, flags // copy loop iterator vars
 		const duration = 10 * time.Minute
 		for _, n := range []int{3, 6} {
+			var skip, skipDetail string
+			if app == "job-coordinator" {
+				skip = "skipping flaky scaledata/job-coordinator test"
+				skipDetail = "work underway to deflake https://github.com/cockroachdb/cockroach/issues/51765"
+			}
 			r.Add(testSpec{
-				Name:    fmt.Sprintf("scaledata/%s/nodes=%d", app, n),
-				Timeout: 2 * duration,
-				Nodes:   nodes(n + 1),
+				Name:        fmt.Sprintf("scaledata/%s/nodes=%d", app, n),
+				Owner:       OwnerKV,
+				Timeout:     2 * duration,
+				Cluster:     makeClusterSpec(n + 1),
+				Skip:        skip,
+				SkipDetails: skipDetail,
 				Run: func(ctx context.Context, t *test, c *cluster) {
 					runSqlapp(ctx, t, c, app, flags, duration)
 				},
@@ -58,25 +61,32 @@ func registerScaleData(r *registry) {
 }
 
 func runSqlapp(ctx context.Context, t *test, c *cluster, app, flags string, dur time.Duration) {
-	roachNodeCount := c.nodes - 1
+	roachNodeCount := c.spec.NodeCount - 1
 	roachNodes := c.Range(1, roachNodeCount)
-	appNode := c.Node(c.nodes)
+	appNode := c.Node(c.spec.NodeCount)
 
-	if local && runtime.GOOS != "linux" {
-		t.Fatalf("must run on linux os, found %s", runtime.GOOS)
-	}
-	b, err := binfetcher.Download(ctx, binfetcher.Options{
-		Component: "rubrik",
-		Binary:    app,
-		Version:   "LATEST",
-		GOOS:      "linux",
-		GOARCH:    "amd64",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	if local {
+		appBinary, err := findBinary("", app)
+		if err != nil {
+			err = errors.WithHint(err,
+				"place binaries built from cockroachdb/rksql in repo root, or add to $PATH")
+			t.Fatal(err)
+		}
+		c.Put(ctx, appBinary, app, appNode)
+	} else {
+		b, err := binfetcher.Download(ctx, binfetcher.Options{
+			Component: "rubrik",
+			Binary:    app,
+			Version:   "LATEST",
+			GOOS:      "linux",
+			GOARCH:    "amd64",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
 
-	c.Put(ctx, b, app, appNode)
+		c.Put(ctx, b, app, appNode)
+	}
 	c.Put(ctx, cockroach, "./cockroach", roachNodes)
 	c.Start(ctx, t, roachNodes)
 
@@ -100,18 +110,8 @@ func runSqlapp(ctx context.Context, t *test, c *cluster, app, flags string, dur 
 		m.Go(ch.Runner(c, m))
 	}
 	m.Go(func(ctx context.Context) error {
-		// Sqlapp logs are very noisy - so noisy that if not directed to /dev/null
-		// they often have the effect of slowing down the test so much that it
-		// fails. To get around this we create a new logger that writes to an
-		// artifacts file but does not output to stdout or stderr.
-		sqlappL, err := t.l.ChildLogger("sqlapp", logPrefix(""), quietStdout, quietStderr)
-		if err != nil {
-			return err
-		}
-		defer sqlappL.close()
-
 		t.Status("installing schema")
-		err = c.RunL(ctx, sqlappL, appNode, fmt.Sprintf("./%s --install_schema "+
+		err := c.RunE(ctx, appNode, fmt.Sprintf("./%s --install_schema "+
 			"--cockroach_ip_addresses_csv='%s' %s", app, addrStr, flags))
 		if err != nil {
 			return err
@@ -119,7 +119,7 @@ func runSqlapp(ctx context.Context, t *test, c *cluster, app, flags string, dur 
 
 		t.Status("running consistency checker")
 		const workers = 16
-		return c.RunL(ctx, sqlappL, appNode, fmt.Sprintf("./%s  --duration_secs=%d "+
+		return c.RunE(ctx, appNode, fmt.Sprintf("./%s  --duration_secs=%d "+
 			"--num_workers=%d --cockroach_ip_addresses_csv='%s' %s",
 			app, int(dur.Seconds()), workers, addrStr, flags))
 	})

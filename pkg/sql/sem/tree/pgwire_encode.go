@@ -1,22 +1,20 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tree
 
 import (
 	"bytes"
 	"unicode/utf8"
+
+	"github.com/lib/pq/oid"
 )
 
 func (d *DTuple) pgwireFormat(ctx *FmtCtx) {
@@ -38,9 +36,9 @@ func (d *DTuple) pgwireFormat(ctx *FmtCtx) {
 		switch dv := UnwrapDatum(nil, v).(type) {
 		case dNull:
 		case *DString:
-			pgwireFormatStringInTuple(ctx.Buffer, string(*dv))
+			pgwireFormatStringInTuple(&ctx.Buffer, string(*dv))
 		case *DCollatedString:
-			pgwireFormatStringInTuple(ctx.Buffer, dv.Contents)
+			pgwireFormatStringInTuple(&ctx.Buffer, dv.Contents)
 			// Bytes cannot use the default case because they will be incorrectly
 			// double escaped.
 		case *DBytes:
@@ -48,10 +46,10 @@ func (d *DTuple) pgwireFormat(ctx *FmtCtx) {
 		case *DJSON:
 			var buf bytes.Buffer
 			dv.JSON.Format(&buf)
-			pgwireFormatStringInTuple(ctx.Buffer, buf.String())
+			pgwireFormatStringInTuple(&ctx.Buffer, buf.String())
 		default:
 			s := AsStringWithFlags(v, ctx.flags)
-			pgwireFormatStringInTuple(ctx.Buffer, s)
+			pgwireFormatStringInTuple(&ctx.Buffer, s)
 		}
 		comma = ","
 	}
@@ -90,6 +88,20 @@ func (d *DArray) pgwireFormat(ctx *FmtCtx) {
 	// instead printed as-is. Only non-valid characters get escaped to
 	// hex. So we delegate this formatting to a tuple-specific
 	// string printer called pgwireFormatStringInArray().
+	switch d.ResolvedType().Oid() {
+	case oid.T_int2vector, oid.T_oidvector:
+		// vectors are serialized as a string of space-separated values.
+		sep := ""
+		// TODO(justin): add a test for nested arrays when #32552 is
+		// addressed.
+		for _, d := range d.Array {
+			ctx.WriteString(sep)
+			ctx.FormatNode(d)
+			sep = " "
+		}
+		return
+	}
+
 	ctx.WriteByte('{')
 	comma := ""
 	for _, v := range d.Array {
@@ -98,16 +110,16 @@ func (d *DArray) pgwireFormat(ctx *FmtCtx) {
 		case dNull:
 			ctx.WriteString("NULL")
 		case *DString:
-			pgwireFormatStringInArray(ctx.Buffer, string(*dv))
+			pgwireFormatStringInArray(&ctx.Buffer, string(*dv))
 		case *DCollatedString:
-			pgwireFormatStringInArray(ctx.Buffer, dv.Contents)
+			pgwireFormatStringInArray(&ctx.Buffer, dv.Contents)
 			// Bytes cannot use the default case because they will be incorrectly
 			// double escaped.
 		case *DBytes:
 			ctx.FormatNode(dv)
 		default:
 			s := AsStringWithFlags(v, ctx.flags)
-			pgwireFormatStringInArray(ctx.Buffer, s)
+			pgwireFormatStringInArray(&ctx.Buffer, s)
 		}
 		comma = ","
 	}

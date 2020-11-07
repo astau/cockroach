@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package interleavedpartitioned
 
@@ -24,11 +19,15 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach-go/crdb"
+	"github.com/cockroachdb/cockroach/pkg/col/coldata"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
+	"github.com/cockroachdb/errors"
 	"github.com/spf13/pflag"
 )
 
@@ -389,7 +388,7 @@ func (w *interleavedPartitioned) Tables() []workload.Table {
 		Schema: genericChildSchema,
 		InitialRows: workload.BatchedTuples{
 			NumBatches: w.initSessions,
-			Batch:      w.childInitialRowBatchFunc(2, w.customersPerSession),
+			FillBatch:  w.childInitialRowBatchFunc(2, w.customersPerSession),
 		},
 	}
 	devicesTable := workload.Table{
@@ -397,7 +396,7 @@ func (w *interleavedPartitioned) Tables() []workload.Table {
 		Schema: deviceSchema,
 		InitialRows: workload.BatchedTuples{
 			NumBatches: w.initSessions,
-			Batch:      w.deviceInitialRowBatch,
+			FillBatch:  w.deviceInitialRowBatch,
 		},
 	}
 	variantsTable := workload.Table{
@@ -405,7 +404,7 @@ func (w *interleavedPartitioned) Tables() []workload.Table {
 		Schema: genericChildSchema,
 		InitialRows: workload.BatchedTuples{
 			NumBatches: w.initSessions,
-			Batch:      w.childInitialRowBatchFunc(3, w.variantsPerSession),
+			FillBatch:  w.childInitialRowBatchFunc(3, w.variantsPerSession),
 		},
 	}
 	parametersTable := workload.Table{
@@ -413,7 +412,7 @@ func (w *interleavedPartitioned) Tables() []workload.Table {
 		Schema: genericChildSchema,
 		InitialRows: workload.BatchedTuples{
 			NumBatches: w.initSessions,
-			Batch:      w.childInitialRowBatchFunc(4, w.parametersPerSession),
+			FillBatch:  w.childInitialRowBatchFunc(4, w.parametersPerSession),
 		},
 	}
 	queriesTable := workload.Table{
@@ -421,7 +420,7 @@ func (w *interleavedPartitioned) Tables() []workload.Table {
 		Schema: querySchema,
 		InitialRows: workload.BatchedTuples{
 			NumBatches: w.initSessions,
-			Batch:      w.queryInitialRowBatch,
+			FillBatch:  w.queryInitialRowBatch,
 		},
 	}
 	return []workload.Table{
@@ -431,7 +430,7 @@ func (w *interleavedPartitioned) Tables() []workload.Table {
 
 // Ops implements the Opser interface.
 func (w *interleavedPartitioned) Ops(
-	urls []string, reg *workload.HistogramRegistry,
+	ctx context.Context, urls []string, reg *histogram.Registry,
 ) (workload.QueryLoad, error) {
 	sqlDatabase, err := workload.SanitizeUrls(w, ``, urls)
 	if err != nil {
@@ -542,7 +541,7 @@ func (w *interleavedPartitioned) Ops(
 }
 
 func (w *interleavedPartitioned) deleteFunc(
-	ctx context.Context, hists *workload.Histograms, rng *rand.Rand,
+	ctx context.Context, hists *histogram.Histograms, rng *rand.Rand,
 ) error {
 	start := timeutil.Now()
 	var statement *gosql.Stmt
@@ -563,7 +562,7 @@ func (w *interleavedPartitioned) deleteFunc(
 }
 
 func (w *interleavedPartitioned) insertFunc(
-	ctx context.Context, db *gosql.DB, hists *workload.Histograms, rng *rand.Rand, workerID int,
+	ctx context.Context, db *gosql.DB, hists *histogram.Histograms, rng *rand.Rand, workerID int,
 ) error {
 	start := timeutil.Now()
 	// Execute the transaction.
@@ -658,19 +657,19 @@ func (w *interleavedPartitioned) insertFunc(
 func (w *interleavedPartitioned) fetchSessionID(
 	ctx context.Context,
 	rng *rand.Rand,
-	hists *workload.Histograms,
+	hists *histogram.Histograms,
 	locality string,
 	localPercent int,
 ) (string, error) {
 	start := timeutil.Now()
 	baseSessionID := randomSessionID(rng, locality, localPercent)
 	var sessionID string
-	if err := w.findSessionIDStatement1.QueryRowContext(ctx, baseSessionID).Scan(&sessionID); err != nil && err != gosql.ErrNoRows {
+	if err := w.findSessionIDStatement1.QueryRowContext(ctx, baseSessionID).Scan(&sessionID); err != nil && !errors.Is(err, gosql.ErrNoRows) {
 		return "", err
 	}
 	// Didn't find a next session ID, let's try the other way.
 	if len(sessionID) == 0 {
-		if err := w.findSessionIDStatement2.QueryRowContext(ctx, baseSessionID).Scan(&sessionID); err != nil && err != gosql.ErrNoRows {
+		if err := w.findSessionIDStatement2.QueryRowContext(ctx, baseSessionID).Scan(&sessionID); err != nil && !errors.Is(err, gosql.ErrNoRows) {
 			return "", err
 		}
 	}
@@ -684,7 +683,7 @@ func (w *interleavedPartitioned) fetchSessionID(
 }
 
 func (w *interleavedPartitioned) retrieveFunc(
-	ctx context.Context, hists *workload.Histograms, rng *rand.Rand,
+	ctx context.Context, hists *histogram.Histograms, rng *rand.Rand,
 ) error {
 	sessionID, err := w.fetchSessionID(ctx, rng, hists, w.locality, w.retrieveLocalPercent)
 	if err != nil {
@@ -710,7 +709,7 @@ func (w *interleavedPartitioned) retrieveFunc(
 }
 
 func (w *interleavedPartitioned) updateFunc(
-	ctx context.Context, hists *workload.Histograms, rng *rand.Rand,
+	ctx context.Context, hists *histogram.Histograms, rng *rand.Rand,
 ) error {
 	sessionID, err := w.fetchSessionID(ctx, rng, hists, w.locality, w.updateLocalPercent)
 	if err != nil {
@@ -750,7 +749,9 @@ func (w *interleavedPartitioned) Hooks() workload.Hooks {
 			}
 			if _, err := db.Exec(
 				fmt.Sprintf(
-					"ALTER PARTITION west OF TABLE sessions CONFIGURE ZONE USING lease_preferences = '[[+zone=%s]]'",
+					"ALTER PARTITION west OF TABLE sessions CONFIGURE ZONE USING"+
+						" lease_preferences = '[[+zone=%[1]s]]', "+
+						"constraints = '{+zone=%[1]s : 1}', num_replicas = 3",
 					w.westZoneName,
 				),
 			); err != nil {
@@ -758,7 +759,9 @@ func (w *interleavedPartitioned) Hooks() workload.Hooks {
 			}
 			if _, err := db.Exec(
 				fmt.Sprintf(
-					"ALTER PARTITION east OF TABLE sessions CONFIGURE ZONE USING lease_preferences = '[[+zone=%s]]'",
+					"ALTER PARTITION east OF TABLE sessions CONFIGURE ZONE USING"+
+						" lease_preferences = '[[+zone=%[1]s]]', "+
+						"constraints = '{+zone=%[1]s : 1}', num_replicas = 3",
 					w.eastZoneName,
 				),
 			); err != nil {
@@ -811,66 +814,111 @@ func (w *interleavedPartitioned) sessionsInitialRow(rowIdx int) []interface{} {
 	}
 }
 
+var childTypes = []*types.T{
+	types.Bytes,
+	types.Bytes,
+	types.Bytes,
+	types.Bytes,
+	types.Bytes,
+}
+
 func (w *interleavedPartitioned) childInitialRowBatchFunc(
 	rngFactor int64, nPerBatch int,
-) func(int) [][]interface{} {
-	return func(sessionRowIdx int) [][]interface{} {
+) func(int, coldata.Batch, *bufalloc.ByteAllocator) {
+	return func(sessionRowIdx int, cb coldata.Batch, a *bufalloc.ByteAllocator) {
 		sessionRNG := rand.New(rand.NewSource(int64(sessionRowIdx)))
 		sessionID := randomSessionID(sessionRNG, `east`, w.initEastPercent)
 		nowString := timeutil.Now().UTC().Format(time.RFC3339)
 		rng := rand.New(rand.NewSource(int64(sessionRowIdx) + rngFactor))
-		var rows [][]interface{}
-		for i := 0; i < nPerBatch; i++ {
-			rows = append(rows, []interface{}{
-				sessionID,           // session_id
-				randString(rng, 50), // id
-				randString(rng, 50), // value
-				nowString,           // created
-				nowString,           // updated
-			})
+
+		cb.Reset(childTypes, nPerBatch, coldata.StandardColumnFactory)
+		sessionIDCol := cb.ColVec(0).Bytes()
+		idCol := cb.ColVec(1).Bytes()
+		valueCol := cb.ColVec(2).Bytes()
+		createdCol := cb.ColVec(3).Bytes()
+		updatedCol := cb.ColVec(4).Bytes()
+		for rowIdx := 0; rowIdx < nPerBatch; rowIdx++ {
+			sessionIDCol.Set(rowIdx, []byte(sessionID))
+			idCol.Set(rowIdx, []byte(randString(rng, 50)))
+			valueCol.Set(rowIdx, []byte(randString(rng, 50)))
+			createdCol.Set(rowIdx, []byte(nowString))
+			updatedCol.Set(rowIdx, []byte(nowString))
 		}
-		return rows
 	}
 }
 
-func (w *interleavedPartitioned) deviceInitialRowBatch(sessionRowIdx int) [][]interface{} {
+var deviceTypes = []*types.T{
+	types.Bytes,
+	types.Bytes,
+	types.Bytes,
+	types.Bytes,
+	types.Bytes,
+	types.Bytes,
+	types.Bytes,
+	types.Bytes,
+	types.Bytes,
+	types.Bytes,
+}
+
+func (w *interleavedPartitioned) deviceInitialRowBatch(
+	sessionRowIdx int, cb coldata.Batch, a *bufalloc.ByteAllocator,
+) {
 	rng := rand.New(rand.NewSource(int64(sessionRowIdx) * 64))
 	sessionRNG := rand.New(rand.NewSource(int64(sessionRowIdx)))
 	sessionID := randomSessionID(sessionRNG, `east`, w.initEastPercent)
 	nowString := timeutil.Now().UTC().Format(time.RFC3339)
-	var rows [][]interface{}
-	for i := 0; i < w.devicesPerSession; i++ {
-		rows = append(rows, []interface{}{
-			sessionID,            // session_id
-			randString(rng, 100), // id
-			randString(rng, 50),  // device_id
-			randString(rng, 50),  // name
-			randString(rng, 50),  // make
-			randString(rng, 50),  // macaddress
-			randString(rng, 50),  // model
-			randString(rng, 50),  // serial_number
-			nowString,            // created
-			nowString,            // updated
-		})
+
+	cb.Reset(deviceTypes, w.devicesPerSession, coldata.StandardColumnFactory)
+	sessionIDCol := cb.ColVec(0).Bytes()
+	idCol := cb.ColVec(1).Bytes()
+	deviceIDCol := cb.ColVec(2).Bytes()
+	nameCol := cb.ColVec(3).Bytes()
+	makeCol := cb.ColVec(4).Bytes()
+	macaddressCol := cb.ColVec(5).Bytes()
+	modelCol := cb.ColVec(6).Bytes()
+	serialNumberCol := cb.ColVec(7).Bytes()
+	createdCol := cb.ColVec(8).Bytes()
+	updatedCol := cb.ColVec(9).Bytes()
+	for rowIdx := 0; rowIdx < w.devicesPerSession; rowIdx++ {
+		sessionIDCol.Set(rowIdx, []byte(sessionID))
+		idCol.Set(rowIdx, []byte(randString(rng, 100)))
+		deviceIDCol.Set(rowIdx, []byte(randString(rng, 50)))
+		nameCol.Set(rowIdx, []byte(randString(rng, 50)))
+		makeCol.Set(rowIdx, []byte(randString(rng, 50)))
+		macaddressCol.Set(rowIdx, []byte(randString(rng, 50)))
+		modelCol.Set(rowIdx, []byte(randString(rng, 50)))
+		serialNumberCol.Set(rowIdx, []byte(randString(rng, 50)))
+		createdCol.Set(rowIdx, []byte(nowString))
+		updatedCol.Set(rowIdx, []byte(nowString))
 	}
-	return rows
 }
 
-func (w *interleavedPartitioned) queryInitialRowBatch(sessionRowIdx int) [][]interface{} {
-	var rows [][]interface{}
+var queryTypes = []*types.T{
+	types.Bytes,
+	types.Bytes,
+	types.Bytes,
+	types.Bytes,
+}
+
+func (w *interleavedPartitioned) queryInitialRowBatch(
+	sessionRowIdx int, cb coldata.Batch, a *bufalloc.ByteAllocator,
+) {
 	rng := rand.New(rand.NewSource(int64(sessionRowIdx) * 64))
 	sessionRNG := rand.New(rand.NewSource(int64(sessionRowIdx)))
 	sessionID := randomSessionID(sessionRNG, `east`, w.initEastPercent)
 	nowString := timeutil.Now().UTC().Format(time.RFC3339)
-	for i := 0; i < w.queriesPerSession; i++ {
-		rows = append(rows, []interface{}{
-			sessionID,           // session_id
-			randString(rng, 50), // id
-			nowString,           // created
-			nowString,           // updated
-		})
+
+	cb.Reset(queryTypes, w.queriesPerSession, coldata.StandardColumnFactory)
+	sessionIDCol := cb.ColVec(0).Bytes()
+	idCol := cb.ColVec(1).Bytes()
+	createdCol := cb.ColVec(2).Bytes()
+	updatedCol := cb.ColVec(3).Bytes()
+	for rowIdx := 0; rowIdx < w.queriesPerSession; rowIdx++ {
+		sessionIDCol.Set(rowIdx, []byte(sessionID))
+		idCol.Set(rowIdx, []byte(randString(rng, 50)))
+		createdCol.Set(rowIdx, []byte(nowString))
+		updatedCol.Set(rowIdx, []byte(nowString))
 	}
-	return rows
 }
 
 func randomSessionID(rng *rand.Rand, locality string, localPercent int) string {

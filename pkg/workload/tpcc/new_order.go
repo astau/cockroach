@@ -1,24 +1,18 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tpcc
 
 import (
 	"context"
 	"fmt"
-	"math/rand"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -27,8 +21,9 @@ import (
 	"github.com/cockroachdb/cockroach-go/crdb"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
+	"github.com/cockroachdb/errors"
 	"github.com/lib/pq"
-	"github.com/pkg/errors"
+	"golang.org/x/exp/rand"
 )
 
 // From the TPCC spec, section 2.4:
@@ -123,7 +118,7 @@ func createNewOrder(
 	)
 
 	n.insertNewOrder = n.sr.Define(`
-		INSERT INTO new_order (no_o_id, no_d_id, no_w_id) 
+		INSERT INTO new_order (no_o_id, no_d_id, no_w_id)
 		VALUES ($1, $2, $3)`,
 	)
 
@@ -137,13 +132,13 @@ func createNewOrder(
 func (n *newOrder) run(ctx context.Context, wID int) (interface{}, error) {
 	atomic.AddUint64(&n.config.auditor.newOrderTransactions, 1)
 
-	rng := rand.New(rand.NewSource(timeutil.Now().UnixNano()))
+	rng := rand.New(rand.NewSource(uint64(timeutil.Now().UnixNano())))
 
 	d := newOrderData{
 		wID:    wID,
-		dID:    randInt(rng, 1, 10),
-		cID:    randCustomerID(rng),
-		oOlCnt: randInt(rng, 5, 15),
+		dID:    int(randInt(rng, 1, 10)),
+		cID:    n.config.randCustomerID(rng),
+		oOlCnt: int(randInt(rng, 5, 15)),
 	}
 	d.items = make([]orderItem, d.oOlCnt)
 
@@ -177,7 +172,7 @@ func (n *newOrder) run(ctx context.Context, wID int) (interface{}, error) {
 		} else {
 			// Loop until we find a unique item ID.
 			for {
-				item.olIID = randItemID(rng)
+				item.olIID = n.config.randItemID(rng)
 				if _, ok := itemIDs[item.olIID]; !ok {
 					itemIDs[item.olIID] = struct{}{}
 					break
@@ -438,7 +433,7 @@ func (n *newOrder) run(ctx context.Context, wID int) (interface{}, error) {
 
 			return nil
 		})
-	if err == errSimulated {
+	if errors.Is(err, errSimulated) {
 		return d, nil
 	}
 	return d, err

@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -31,7 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // HealthChecker runs a regular check that verifies that a specified subset
@@ -135,7 +130,7 @@ func (hc *HealthChecker) Runner(ctx context.Context) (err error) {
 
 		if elapsed := timeutil.Since(tBegin); elapsed > 10*time.Second {
 			err := errors.Errorf("health check against node %d took %s", nodeIdx, elapsed)
-			logger.Printf(err.Error() + "\n")
+			logger.Printf("%+v", err)
 			// TODO(tschottdorf): see method comment.
 			// return err
 		}
@@ -191,7 +186,7 @@ func (dul *DiskUsageLogger) Runner(ctx context.Context) error {
 		}
 
 		var bytesUsed []usage
-		for i := 1; i <= dul.c.nodes; i++ {
+		for i := 1; i <= dul.c.spec.NodeCount; i++ {
 			cur, err := getDiskUsageInBytes(ctx, dul.c, quietLogger, i)
 			if err != nil {
 				// This can trigger spuriously as compactions remove files out from under `du`.
@@ -214,7 +209,7 @@ func (dul *DiskUsageLogger) Runner(ctx context.Context) error {
 	}
 }
 
-func registerRestore(r *registry) {
+func registerRestore(r *testRegistry) {
 	for _, item := range []struct {
 		nodes   int
 		timeout time.Duration
@@ -224,7 +219,8 @@ func registerRestore(r *registry) {
 	} {
 		r.Add(testSpec{
 			Name:    fmt.Sprintf("restore2TB/nodes=%d", item.nodes),
-			Nodes:   nodes(item.nodes),
+			Owner:   OwnerBulkIO,
+			Cluster: makeClusterSpec(item.nodes),
 			Timeout: item.timeout,
 			Run: func(ctx context.Context, t *test, c *cluster) {
 				c.Put(ctx, cockroach, "./cockroach")

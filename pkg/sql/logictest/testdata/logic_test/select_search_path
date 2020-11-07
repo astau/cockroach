@@ -1,9 +1,7 @@
-# LogicTest: local local-opt fakedist fakedist-opt fakedist-metadata
-
 # Test that pg_catalog tables are accessible without qualifying table/view
 # names.
 
-query T
+query TTTTI
 SHOW TABLES
 ----
 

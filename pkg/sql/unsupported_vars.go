@@ -1,18 +1,43 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
+
+import "github.com/cockroachdb/cockroach/pkg/settings"
+
+// DummyVars contains a list of dummy vars we do not support that
+// PostgreSQL does, but are required as an easy fix to make certain
+// tooling/ORMs work. These vars should not affect the correctness
+// of results.
+var DummyVars = map[string]sessionVar{
+	"enable_seqscan": makeDummyBooleanSessionVar(
+		"enable_seqscan",
+		func(evalCtx *extendedEvalContext) string {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData.EnableSeqScan)
+		},
+		func(m *sessionDataMutator, v bool) {
+			m.SetEnableSeqScan(v)
+		},
+		func(sv *settings.Values) string { return "on" },
+	),
+	"synchronous_commit": makeDummyBooleanSessionVar(
+		"synchronous_commit",
+		func(evalCtx *extendedEvalContext) string {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData.SynchronousCommit)
+		},
+		func(m *sessionDataMutator, v bool) {
+			m.SetSynchronousCommit(v)
+		},
+		func(sv *settings.Values) string { return "on" },
+	),
+}
 
 // UnsupportedVars contains the set of PostgreSQL session variables
 // and client parameters that are not supported in CockroachDB.
@@ -58,7 +83,6 @@ var UnsupportedVars = func(ss ...string) map[string]struct{} {
 	"debug_print_plan",
 	"debug_print_rewritten",
 	"default_statistics_target",
-	"default_tablespace",
 	"default_text_search_config",
 	"default_transaction_deferrable",
 	// "default_transaction_isolation",
@@ -75,7 +99,7 @@ var UnsupportedVars = func(ss ...string) map[string]struct{} {
 	"enable_material",
 	"enable_mergejoin",
 	"enable_nestloop",
-	"enable_seqscan",
+	// "enable_seqscan",
 	"enable_sort",
 	"enable_tidscan",
 	"escape_string_warning",
@@ -92,7 +116,7 @@ var UnsupportedVars = func(ss ...string) map[string]struct{} {
 	"geqo_threshold",
 	"gin_fuzzy_search_limit",
 	"gin_pending_list_limit",
-	"idle_in_transaction_session_timeout",
+	// "idle_in_transaction_session_timeout",
 	"ignore_checksum_failure",
 	"join_collapse_limit",
 	"lc_messages",
@@ -101,7 +125,7 @@ var UnsupportedVars = func(ss ...string) map[string]struct{} {
 	"lc_time",
 	"lo_compat_privileges",
 	"local_preload_libraries",
-	"lock_timeout",
+	// "lock_timeout",
 	"log_btree_build_stats",
 	"log_duration",
 	"log_error_verbosity",
@@ -130,7 +154,7 @@ var UnsupportedVars = func(ss ...string) map[string]struct{} {
 	"random_page_cost",
 	"replacement_sort_tuples",
 	"role",
-	"row_security",
+	// "row_security",
 	// "search_path",
 	"seed",
 	"seq_page_cost",
@@ -140,8 +164,8 @@ var UnsupportedVars = func(ss ...string) map[string]struct{} {
 	// "ssl_renegotiation_limit",
 	// "standard_conforming_strings",
 	// "statement_timeout",
-	"synchronize_seqscans",
-	"synchronous_commit",
+	// "synchronize_seqscans",
+	// "synchronous_commit",
 	"tcp_keepalives_count",
 	"tcp_keepalives_idle",
 	"tcp_keepalives_interval",

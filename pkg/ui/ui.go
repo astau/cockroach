@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 // Package ui embeds the assets for the web UI into the Cockroach binary.
 //
@@ -31,8 +27,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 	assetfs "github.com/elazarl/go-bindata-assetfs"
-	"github.com/pkg/errors"
 )
 
 // Asset loads and returns the asset for the given name. It returns an error if
@@ -97,6 +93,26 @@ type indexHTMLArgs struct {
 	Tag                  string
 	Version              string
 	NodeID               string
+	PasswordLoginEnabled bool
+	OIDCLoginEnabled     bool
+	OIDCButtonText       string
+}
+
+// OIDCUIConf is a variable that stores data required by the
+// Admin UI to display and manage the OIDC login flow. It is
+// provided by the `oidcAuthenticationServer` at runtime
+// since that's where all the OIDC configuration is centralized.
+type OIDCUIConf struct {
+	ButtonText string
+	Enabled    bool
+}
+
+// OIDCUI is an interface that our OIDC configuration must implement in order to be able
+// to pass relevant configuration info to the ui module. This is to pass through variables that
+// are necessary to render an appropriate user interface for OIDC support and to set the state
+// cookie that OIDC requires for securing auth requests.
+type OIDCUI interface {
+	GetOIDCConf() OIDCUIConf
 }
 
 // bareIndexHTML is used in place of indexHTMLTemplate when the binary is built
@@ -113,6 +129,7 @@ type Config struct {
 	LoginEnabled         bool
 	NodeID               *base.NodeIDContainer
 	GetUser              func(ctx context.Context) *string
+	OIDC                 OIDCUI
 }
 
 // Handler returns an http.Handler that serves the UI,
@@ -137,6 +154,8 @@ func Handler(cfg Config) http.Handler {
 			return
 		}
 
+		oidcConf := cfg.OIDC.GetOIDCConf()
+
 		if err := indexHTMLTemplate.Execute(w, indexHTMLArgs{
 			ExperimentalUseLogin: cfg.ExperimentalUseLogin,
 			LoginEnabled:         cfg.LoginEnabled,
@@ -144,10 +163,13 @@ func Handler(cfg Config) http.Handler {
 			Tag:                  buildInfo.Tag,
 			Version:              build.VersionPrefix(),
 			NodeID:               cfg.NodeID.String(),
+			PasswordLoginEnabled: true,
+			OIDCLoginEnabled:     oidcConf.Enabled,
+			OIDCButtonText:       oidcConf.ButtonText,
 		}); err != nil {
 			err = errors.Wrap(err, "templating index.html")
 			http.Error(w, err.Error(), 500)
-			log.Error(r.Context(), err)
+			log.Errorf(r.Context(), "%v", err)
 		}
 	})
 }

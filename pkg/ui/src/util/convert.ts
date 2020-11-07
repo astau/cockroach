@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 import moment from "moment";
 
@@ -31,12 +27,23 @@ export function MilliToNano(milli: number): number {
 }
 
 /**
- * TimestampToMoment converts a Timestamp$Properties object, as seen in wire.proto, to
- * a Moment object. If timestamp is null, it returns the current time.
+ * SecondsToNano converts a second value into nanoseconds.
  */
-export function TimestampToMoment(timestamp?: protos.google.protobuf.ITimestamp): moment.Moment {
+export function SecondsToNano(sec: number): number {
+  return sec * 1.0e9;
+}
+
+/**
+ * TimestampToMoment converts a Timestamp$Properties object, as seen in wire.proto, to
+ * a Moment object. If timestamp is null, it returns the `defaultsIfNull` value which is
+ * by default is current time.
+ */
+export function TimestampToMoment(
+  timestamp?: protos.google.protobuf.ITimestamp,
+  defaultsIfNull = moment.utc(),
+): moment.Moment {
   if (!timestamp) {
-    return moment.utc();
+    return defaultsIfNull;
   }
   return moment.utc((timestamp.seconds.toNumber() * 1e3) + NanoToMilli(timestamp.nanos));
 }

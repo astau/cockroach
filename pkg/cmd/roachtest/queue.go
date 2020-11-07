@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -24,13 +19,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
-func registerQueue(r *registry) {
+func registerQueue(r *testRegistry) {
 	// One node runs the workload generator, all other nodes host CockroachDB.
 	const numNodes = 2
 	r.Add(testSpec{
-		Skip:  "https://github.com/cockroachdb/cockroach/issues/17229",
-		Name:  fmt.Sprintf("queue/nodes=%d", numNodes-1),
-		Nodes: nodes(numNodes),
+		Skip:    "https://github.com/cockroachdb/cockroach/issues/17229",
+		Name:    fmt.Sprintf("queue/nodes=%d", numNodes-1),
+		Owner:   OwnerKV,
+		Cluster: makeClusterSpec(numNodes),
 		Run: func(ctx context.Context, t *test, c *cluster) {
 			runQueue(ctx, t, c)
 		},
@@ -38,8 +34,8 @@ func registerQueue(r *registry) {
 }
 
 func runQueue(ctx context.Context, t *test, c *cluster) {
-	dbNodeCount := c.nodes - 1
-	workloadNode := c.nodes
+	dbNodeCount := c.spec.NodeCount - 1
+	workloadNode := c.spec.NodeCount
 
 	// Distribute programs to the correct nodes and start CockroachDB.
 	c.Put(ctx, cockroach, "./cockroach", c.Range(1, dbNodeCount))
@@ -57,7 +53,7 @@ func runQueue(ctx context.Context, t *test, c *cluster) {
 				init = " --init"
 			}
 			cmd := fmt.Sprintf(
-				"./workload run queue --histograms=logs/stats.json"+
+				"./workload run queue --histograms="+perfArtifactsDir+"/stats.json"+
 					init+
 					concurrency+
 					duration+

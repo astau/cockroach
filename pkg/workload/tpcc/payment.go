@@ -1,31 +1,27 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tpcc
 
 import (
 	"context"
 	"fmt"
-	"math/rand"
 	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/cockroach-go/crdb"
+	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
+	"golang.org/x/exp/rand"
 )
 
 // Section 2.5:
@@ -85,6 +81,8 @@ type payment struct {
 	selectByLastName  workload.StmtHandle
 	updateWithPayment workload.StmtHandle
 	insertHistory     workload.StmtHandle
+
+	a bufalloc.ByteAllocator
 }
 
 var _ tpccTx = &payment{}
@@ -111,20 +109,12 @@ func createPayment(ctx context.Context, config *tpcc, mcp *workload.MultiConnPoo
 		RETURNING d_name, d_street_1, d_street_2, d_city, d_state, d_zip`,
 	)
 
-	// TODD(radu): this is no longer necessary with the optimizer. Keep it for now
-	// for comparisons against the heuristic planner.
-	custIndexStr := "@customer_idx"
-	if config.usePostgres {
-		custIndexStr = ""
-	}
-
 	// 2.5.2.2 Case 2: Pick the middle row, rounded up, from the selection by last name.
-	p.selectByLastName = p.sr.Define(fmt.Sprintf(`
+	p.selectByLastName = p.sr.Define(`
 		SELECT c_id
-		FROM customer%s
+		FROM customer
 		WHERE c_w_id = $1 AND c_d_id = $2 AND c_last = $3
 		ORDER BY c_first ASC`,
-		custIndexStr),
 	)
 
 	// Update customer with payment.
@@ -161,7 +151,7 @@ func createPayment(ctx context.Context, config *tpcc, mcp *workload.MultiConnPoo
 func (p *payment) run(ctx context.Context, wID int) (interface{}, error) {
 	atomic.AddUint64(&p.config.auditor.paymentTransactions, 1)
 
-	rng := rand.New(rand.NewSource(timeutil.Now().UnixNano()))
+	rng := rand.New(rand.NewSource(uint64(timeutil.Now().UnixNano())))
 
 	d := paymentData{
 		dID: rng.Intn(10) + 1,
@@ -190,10 +180,10 @@ func (p *payment) run(ctx context.Context, wID int) (interface{}, error) {
 	// 2.5.1.2: The customer is randomly selected 60% of the time by last name
 	// and 40% by number.
 	if rng.Intn(100) < 60 {
-		d.cLast = randCLast(rng)
+		d.cLast = string(p.config.randCLast(rng, &p.a))
 		atomic.AddUint64(&p.config.auditor.paymentsByLastName, 1)
 	} else {
-		d.cID = randCustomerID(rng)
+		d.cID = p.config.randCustomerID(rng)
 	}
 
 	tx, err := p.mcp.Get().BeginEx(ctx, p.config.txOpts)

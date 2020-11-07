@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -19,13 +14,14 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"math/rand"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -36,6 +32,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 )
 
 var (
@@ -57,7 +54,7 @@ func roundToSeconds(d time.Duration) time.Duration {
 
 func run() error {
 	flags.Usage = func() {
-		fmt.Fprintf(flags.Output(), "usage: %s <cluster> [<flags>] <test> [<args>]\n", flags.Name())
+		fmt.Fprintf(flags.Output(), "usage: %s <cluster> <pkg> [<flags>] -- [<args>]\n", flags.Name())
 		flags.PrintDefaults()
 	}
 
@@ -65,7 +62,7 @@ func run() error {
 		var b bytes.Buffer
 		flags.SetOutput(&b)
 		flags.Usage()
-		return errors.New(b.String())
+		return errors.Newf("%s", b.String())
 	}
 
 	cluster := os.Args[1]
@@ -77,11 +74,42 @@ func run() error {
 		return errors.New("-stderr=false is unsupported, please tee to a file (or implement the feature)")
 	}
 
+	pkg := os.Args[2]
+	localTestBin := filepath.Base(pkg) + ".test"
+	{
+		fi, err := os.Stat(pkg)
+		if err != nil {
+			return fmt.Errorf("the pkg flag %q is not a directory relative to the current working directory: %v", pkg, err)
+		}
+		if !fi.Mode().IsDir() {
+			return fmt.Errorf("the pkg flag %q is not a directory relative to the current working directory", pkg)
+		}
+
+		// Verify that the test binary exists.
+		fi, err = os.Stat(localTestBin)
+		if err != nil {
+			return fmt.Errorf("test binary %q does not exist: %v", localTestBin, err)
+		}
+		if !fi.Mode().IsRegular() {
+			return fmt.Errorf("test binary %q is not a file", localTestBin)
+		}
+	}
+	flagsAndArgs := os.Args[3:]
+	stressArgs := flagsAndArgs
+	var testArgs []string
+	for i, arg := range flagsAndArgs {
+		if arg == "--" {
+			stressArgs = flagsAndArgs[:i]
+			testArgs = flagsAndArgs[i+1:]
+			break
+		}
+	}
+
 	if *flagP <= 0 || *flagTimeout < 0 || len(flags.Args()) == 0 {
 		var b bytes.Buffer
 		flags.SetOutput(&b)
 		flags.Usage()
-		return errors.New(b.String())
+		return errors.Newf("%s", b.String())
 	}
 	if *flagFailure != "" {
 		if _, err := regexp.Compile(*flagFailure); err != nil {
@@ -102,6 +130,7 @@ func run() error {
 	nodes := strings.Count(string(out), "\n") - 1
 
 	const stressBin = "bin.docker_amd64/stress"
+
 	cmd = exec.Command("roachprod", "put", cluster, stressBin)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -109,8 +138,41 @@ func run() error {
 		return err
 	}
 
-	testBin := flags.Args()[0]
-	cmd = exec.Command("roachprod", "put", cluster, testBin)
+	const localLibDir = "lib.docker_amd64/"
+	if fi, err := os.Stat(localLibDir); err == nil && fi.IsDir() {
+		cmd = exec.Command("roachprod", "put", cluster, localLibDir, "lib")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return err
+		}
+	}
+
+	cmd = exec.Command("roachprod", "run", cluster, "mkdir -p "+pkg)
+	if err := cmd.Run(); err != nil {
+		return err
+	}
+	testdataPath := filepath.Join(pkg, "testdata")
+	if _, err := os.Stat(testdataPath); err == nil {
+		// roachprod put has bizarre semantics for putting directories anywhere
+		// other than the home directory. To deal with this we put the directory
+		// in the home directory and then move it.
+		tmpPath := "testdata" + strconv.Itoa(rand.Int())
+		cmd = exec.Command("roachprod", "run", cluster, "--", "rm", "-rf", testdataPath)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to remove old testdata: %v:\n%s", err, output)
+		}
+		cmd = exec.Command("roachprod", "put", cluster, testdataPath, tmpPath)
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("failed to copy testdata: %v", err)
+		}
+		cmd = exec.Command("roachprod", "run", cluster, "mv", tmpPath, testdataPath)
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("failed to move testdata: %v", err)
+		}
+	}
+	testBin := filepath.Join(pkg, localTestBin)
+	cmd = exec.Command("roachprod", "put", cluster, localTestBin, testBin)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
@@ -205,11 +267,14 @@ func run() error {
 					}
 				}
 			}()
-
 			var stderr bytes.Buffer
 			cmd := exec.Command("roachprod",
 				"ssh", fmt.Sprintf("%s:%d", cluster, i), "--",
-				fmt.Sprintf("GOTRACEBACK=all ./stress %s", strings.Join(os.Args[2:], " ")))
+				fmt.Sprintf("cd %s; GOTRACEBACK=all ~/stress %s ./%s %s",
+					pkg,
+					strings.Join(stressArgs, " "),
+					filepath.Base(testBin),
+					strings.Join(testArgs, " ")))
 			cmd.Stdout = stdoutW
 			cmd.Stderr = &stderr
 			if err := cmd.Run(); err != nil {
@@ -233,12 +298,13 @@ func run() error {
 				atomic.LoadInt32(&runs), atomic.LoadInt32(&fails),
 				roundToSeconds(timeutil.Since(startTime)))
 
-			switch err := ctx.Err(); err {
+			err := ctx.Err()
+			switch {
 			// A context timeout in this case is indicative of no failures
 			// being detected in the allotted duration.
-			case context.DeadlineExceeded:
+			case errors.Is(err, context.DeadlineExceeded):
 				return nil
-			case context.Canceled:
+			case errors.Is(err, context.Canceled):
 				if *flagMaxRuns > 0 && int(atomic.LoadInt32(&runs)) >= *flagMaxRuns {
 					return nil
 				}

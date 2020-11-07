@@ -1,22 +1,17 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
 import (
 	"bytes"
-	"errors"
 	"flag"
 	"fmt"
 	"go/format"
@@ -26,6 +21,7 @@ import (
 	"sort"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/optgen/lang"
+	"github.com/cockroachdb/errors"
 )
 
 type globResolver func(pattern string) (matches []string, err error)
@@ -93,6 +89,7 @@ func (g *optgen) run(args ...string) bool {
 	cmd := args[0]
 	sources := g.cmdLine.Args()[1:]
 
+	runValidate := true
 	switch cmd {
 	case "compile":
 	case "explorer":
@@ -100,6 +97,9 @@ func (g *optgen) run(args ...string) bool {
 	case "factory":
 	case "ops":
 	case "rulenames":
+
+	case "execfactory", "execexplain":
+		runValidate = false
 
 	default:
 		g.cmdLine.Usage()
@@ -137,7 +137,7 @@ func (g *optgen) run(args ...string) bool {
 	compiled := compiler.Compile()
 	if compiled == nil {
 		errors = compiler.Errors()
-	} else {
+	} else if runValidate {
 		// Do additional validation checks.
 		var v validator
 		errors = v.validate(compiled)
@@ -181,6 +181,14 @@ func (g *optgen) run(args ...string) bool {
 	case "rulenames":
 		var gen ruleNamesGen
 		err = g.generate(compiled, gen.generate)
+
+	case "execfactory":
+		var gen execFactoryGen
+		err = g.generate(compiled, gen.generate)
+
+	case "execexplain":
+		var gen execExplainGen
+		err = g.generate(compiled, gen.generate)
 	}
 
 	if err != nil {
@@ -206,7 +214,7 @@ func (g *optgen) generate(compiled *lang.CompiledExpr, genFunc genFunc) error {
 			// Write out incorrect source for easier debugging.
 			b = buf.Bytes()
 			out := g.cmdLine.Lookup("out").Value.String()
-			err = fmt.Errorf("Code formatting failed with Go parse error\n%s:%s", out, err)
+			err = fmt.Errorf("code formatting failed with Go parse error\n%s:%s", out, err)
 		}
 	} else {
 		b = buf.Bytes()

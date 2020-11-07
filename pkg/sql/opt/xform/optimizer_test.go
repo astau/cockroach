@@ -1,60 +1,47 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package xform_test
 
 import (
-	"context"
 	"flag"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
-	"github.com/cockroachdb/cockroach/pkg/sql/opt/optbuilder"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/opttester"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/testcat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/xform"
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/testutils/datadriven"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/datadriven"
 )
 
 func TestDetachMemo(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	catalog := testcat.New()
-	_, err := catalog.ExecuteDDL("CREATE TABLE abc (a INT PRIMARY KEY, b INT, c STRING, INDEX (c))")
-	if err != nil {
+	if _, err := catalog.ExecuteDDL("CREATE TABLE abc (a INT PRIMARY KEY, b INT, c STRING, INDEX (c))"); err != nil {
 		t.Fatal(err)
 	}
-
-	stmt, err := parser.ParseOne("SELECT * FROM abc WHERE c=$1")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	ctx := context.Background()
-	semaCtx := tree.MakeSemaContext(false /* privileged */)
-	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 
 	var o xform.Optimizer
-	o.Init(&evalCtx)
-	err = optbuilder.New(ctx, &semaCtx, &evalCtx, catalog, o.Factory(), stmt.AST).Build()
-	if err != nil {
-		t.Fatal(err)
-	}
+	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	testutils.BuildQuery(t, &o, catalog, &evalCtx, "SELECT * FROM abc WHERE c=$1")
 
 	before := o.DetachMemo()
 
@@ -62,25 +49,14 @@ func TestDetachMemo(t *testing.T) {
 		t.Error("memo expression should be reinitialized by DetachMemo")
 	}
 
-	semaCtx.Placeholders.Clear()
-	o.Init(&evalCtx)
-
-	stmt2, err := parser.ParseOne("SELECT a=$1 FROM abc")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	err = optbuilder.New(ctx, &semaCtx, &evalCtx, catalog, o.Factory(), stmt2.AST).Build()
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutils.BuildQuery(t, &o, catalog, &evalCtx, "SELECT a=$1 FROM abc")
 
 	after := o.Memo()
 	if after == before {
 		t.Error("after memo cannot be the same as the detached memo")
 	}
 
-	if !strings.Contains(after.RootExpr().String(), "variable: a [type=int]") {
+	if !strings.Contains(after.RootExpr().String(), "variable: a:1 [type=int]") {
 		t.Error("after memo did not contain expected operator")
 	}
 
@@ -96,9 +72,62 @@ func TestDetachMemo(t *testing.T) {
 		t.Error("detached memo expression does not reference the detached memo")
 	}
 
-	if !strings.Contains(before.RootExpr().String(), "variable: c [type=string]") {
+	if !strings.Contains(before.RootExpr().String(), "variable: c:3 [type=string]") {
 		t.Error("detached memo did not contain expected operator")
 	}
+}
+
+// TestDetachMemoRace reproduces the condition in #34904: a detached memo still
+// aliases table annotations in the metadata. The problematic annotation is a
+// statistics object. Construction of new expression can trigger calculation of
+// new statistics.
+func TestDetachMemoRace(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	catalog := testcat.New()
+
+	_, err := catalog.ExecuteDDL("CREATE TABLE abc (a INT, b INT, c INT, d INT)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var o xform.Optimizer
+	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	testutils.BuildQuery(t, &o, catalog, &evalCtx, "SELECT * FROM abc WHERE a = $1")
+	mem := o.DetachMemo()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		col := opt.ColumnID(i + 1)
+		wg.Add(1)
+		go func() {
+			var o xform.Optimizer
+			evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+			o.Init(&evalCtx, catalog)
+			f := o.Factory()
+			var replaceFn norm.ReplaceFunc
+			replaceFn = func(e opt.Expr) opt.Expr {
+				if sel, ok := e.(*memo.SelectExpr); ok {
+					return f.ConstructSelect(
+						f.CopyAndReplaceDefault(sel.Input, replaceFn).(memo.RelExpr),
+						memo.FiltersExpr{f.ConstructFiltersItem(
+							f.ConstructEq(
+								f.ConstructVariable(col),
+								f.ConstructConst(tree.NewDInt(10), types.Int),
+							),
+						)},
+					)
+				}
+				return f.CopyAndReplaceDefault(e, replaceFn)
+			}
+			// Rewrite the filter to use a different column, which will trigger creation
+			// of new table statistics. If the statistics object is aliased, this will
+			// be racy.
+			f.CopyAndReplace(mem.RootExpr().(memo.RelExpr), mem.RootProps(), replaceFn)
+			wg.Done()
+		}()
+	}
+	wg.Wait()
 }
 
 // TestCoster files can be run separately like this:
@@ -107,9 +136,11 @@ func TestDetachMemo(t *testing.T) {
 //   ...
 func TestCoster(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	runDataDrivenTest(
 		t, "testdata/coster/",
-		memo.ExprFmtHideRuleProps|memo.ExprFmtHideQualifications|memo.ExprFmtHideScalars,
+		memo.ExprFmtHideRuleProps|memo.ExprFmtHideQualifications|memo.ExprFmtHideScalars|
+			memo.ExprFmtHideTypes,
 	)
 }
 
@@ -119,7 +150,17 @@ func TestCoster(t *testing.T) {
 //   ...
 func TestPhysicalProps(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	runDataDrivenTest(t, "testdata/physprops/", memo.ExprFmtHideAll)
+	defer log.Scope(t).Close(t)
+	runDataDrivenTest(
+		t, "testdata/physprops/",
+		memo.ExprFmtHideConstraints|
+			memo.ExprFmtHideRuleProps|
+			memo.ExprFmtHideStats|
+			memo.ExprFmtHideCost|
+			memo.ExprFmtHideQualifications|
+			memo.ExprFmtHideScalars|
+			memo.ExprFmtHideTypes,
+	)
 }
 
 // TestRuleProps files can be run separately like this:
@@ -127,15 +168,13 @@ func TestPhysicalProps(t *testing.T) {
 //   ...
 func TestRuleProps(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	datadriven.Walk(t, "testdata/ruleprops", func(t *testing.T, path string) {
-		catalog := testcat.New()
-		datadriven.RunTest(t, path, func(d *datadriven.TestData) string {
-			tester := testutils.NewOptTester(catalog, d.Input)
-			tester.Flags.ExprFormat = memo.ExprFmtHideStats | memo.ExprFmtHideCost |
-				memo.ExprFmtHideQualifications | memo.ExprFmtHideScalars
-			return tester.RunCommand(t, d)
-		})
-	})
+	defer log.Scope(t).Close(t)
+	runDataDrivenTest(
+		t,
+		"testdata/ruleprops/",
+		memo.ExprFmtHideStats|memo.ExprFmtHideCost|memo.ExprFmtHideQualifications|
+			memo.ExprFmtHideScalars|memo.ExprFmtHideTypes,
+	)
 }
 
 // TestRules files can be run separately like this:
@@ -144,11 +183,12 @@ func TestRuleProps(t *testing.T) {
 //   ...
 func TestRules(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	runDataDrivenTest(
 		t,
 		"testdata/rules/",
 		memo.ExprFmtHideStats|memo.ExprFmtHideCost|memo.ExprFmtHideRuleProps|
-			memo.ExprFmtHideQualifications|memo.ExprFmtHideScalars,
+			memo.ExprFmtHideQualifications|memo.ExprFmtHideScalars|memo.ExprFmtHideTypes,
 	)
 }
 
@@ -169,11 +209,12 @@ var externalTestData = flag.String(
 //
 func TestExternal(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	runDataDrivenTest(
 		t,
 		*externalTestData,
 		memo.ExprFmtHideStats|memo.ExprFmtHideCost|memo.ExprFmtHideRuleProps|
-			memo.ExprFmtHideQualifications|memo.ExprFmtHideScalars,
+			memo.ExprFmtHideQualifications|memo.ExprFmtHideScalars|memo.ExprFmtHideTypes,
 	)
 }
 
@@ -187,8 +228,8 @@ func TestExternal(t *testing.T) {
 func runDataDrivenTest(t *testing.T, path string, fmtFlags memo.ExprFmtFlags) {
 	datadriven.Walk(t, path, func(t *testing.T, path string) {
 		catalog := testcat.New()
-		datadriven.RunTest(t, path, func(d *datadriven.TestData) string {
-			tester := testutils.NewOptTester(catalog, d.Input)
+		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
+			tester := opttester.New(catalog, d.Input)
 			tester.Flags.ExprFormat = fmtFlags
 			return tester.RunCommand(t, d)
 		})

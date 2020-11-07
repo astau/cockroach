@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql_test
 
@@ -19,99 +15,90 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/gogo/protobuf/proto"
 )
 
 func TestValidSetShowZones(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	sqlDB := sqlutils.MakeSQLRunner(db)
 	sqlDB.Exec(t, `CREATE DATABASE d; USE d; CREATE TABLE t ();`)
 
-	yamlDefault := fmt.Sprintf("gc: {ttlseconds: %d}", config.DefaultZoneConfig().GC.TTLSeconds)
+	yamlDefault := fmt.Sprintf("gc: {ttlseconds: %d}", s.(*server.TestServer).Cfg.DefaultZoneConfig.GC.TTLSeconds)
 	yamlOverride := "gc: {ttlseconds: 42}"
-	zoneOverride := config.DefaultZoneConfig()
-	zoneOverride.GC = &config.GCPolicy{TTLSeconds: 42}
-	partialZoneOverride := *config.NewZoneConfig()
-	partialZoneOverride.GC = &config.GCPolicy{TTLSeconds: 42}
+	zoneOverride := s.(*server.TestServer).Cfg.DefaultZoneConfig
+	zoneOverride.GC = &zonepb.GCPolicy{TTLSeconds: 42}
+	partialZoneOverride := *zonepb.NewZoneConfig()
+	partialZoneOverride.GC = &zonepb.GCPolicy{TTLSeconds: 42}
 
 	defaultRow := sqlutils.ZoneRow{
-		ID:           keys.RootNamespaceID,
-		CLISpecifier: ".default",
-		Config:       config.DefaultZoneConfig(),
+		ID:     keys.RootNamespaceID,
+		Config: s.(*server.TestServer).Cfg.DefaultZoneConfig,
 	}
 	defaultOverrideRow := sqlutils.ZoneRow{
-		ID:           keys.RootNamespaceID,
-		CLISpecifier: ".default",
-		Config:       zoneOverride,
+		ID:     keys.RootNamespaceID,
+		Config: zoneOverride,
 	}
 	metaRow := sqlutils.ZoneRow{
-		ID:           keys.MetaRangesID,
-		CLISpecifier: ".meta",
-		Config:       zoneOverride,
+		ID:     keys.MetaRangesID,
+		Config: zoneOverride,
 	}
 	systemRow := sqlutils.ZoneRow{
-		ID:           keys.SystemDatabaseID,
-		CLISpecifier: "system",
-		Config:       zoneOverride,
+		ID:     keys.SystemDatabaseID,
+		Config: zoneOverride,
 	}
 	jobsRow := sqlutils.ZoneRow{
-		ID:           keys.JobsTableID,
-		CLISpecifier: "system.jobs",
-		Config:       zoneOverride,
+		ID:     keys.JobsTableID,
+		Config: zoneOverride,
 	}
 
 	dbID := sqlutils.QueryDatabaseID(t, db, "d")
-	tableID := sqlutils.QueryTableID(t, db, "d", "t")
+	tableID := sqlutils.QueryTableID(t, db, "d", "public", "t")
 
 	dbRow := sqlutils.ZoneRow{
-		ID:           dbID,
-		CLISpecifier: "d",
-		Config:       zoneOverride,
+		ID:     dbID,
+		Config: zoneOverride,
 	}
 	tableRow := sqlutils.ZoneRow{
-		ID:           tableID,
-		CLISpecifier: "d.t",
-		Config:       zoneOverride,
+		ID:     tableID,
+		Config: zoneOverride,
 	}
 
 	// Partially filled config rows
 	partialMetaRow := sqlutils.ZoneRow{
-		ID:           keys.MetaRangesID,
-		CLISpecifier: ".meta",
-		Config:       partialZoneOverride,
+		ID:     keys.MetaRangesID,
+		Config: partialZoneOverride,
 	}
 	partialSystemRow := sqlutils.ZoneRow{
-		ID:           keys.SystemDatabaseID,
-		CLISpecifier: "system",
-		Config:       partialZoneOverride,
+		ID:     keys.SystemDatabaseID,
+		Config: partialZoneOverride,
 	}
 	partialJobsRow := sqlutils.ZoneRow{
-		ID:           keys.JobsTableID,
-		CLISpecifier: "system.jobs",
-		Config:       partialZoneOverride,
+		ID:     keys.JobsTableID,
+		Config: partialZoneOverride,
 	}
 	partialDbRow := sqlutils.ZoneRow{
-		ID:           dbID,
-		CLISpecifier: "d",
-		Config:       partialZoneOverride,
+		ID:     dbID,
+		Config: partialZoneOverride,
 	}
 	partialTableRow := sqlutils.ZoneRow{
-		ID:           tableID,
-		CLISpecifier: "d.t",
-		Config:       partialZoneOverride,
+		ID:     tableID,
+		Config: partialZoneOverride,
 	}
 
 	// Remove stock zone configs installed at cluster bootstrap. Otherwise this
@@ -246,36 +233,34 @@ func TestValidSetShowZones(t *testing.T) {
 
 func TestZoneInheritField(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	sqlDB := sqlutils.MakeSQLRunner(db)
 	sqlutils.RemoveAllZoneConfigs(t, sqlDB)
 	sqlDB.Exec(t, `CREATE DATABASE d; USE d; CREATE TABLE t ();`)
 
 	defaultRow := sqlutils.ZoneRow{
-		ID:           keys.RootNamespaceID,
-		CLISpecifier: ".default",
-		Config:       config.DefaultZoneConfig(),
+		ID:     keys.RootNamespaceID,
+		Config: s.(*server.TestServer).Cfg.DefaultZoneConfig,
 	}
 
 	newReplicationFactor := 10
-	tableID := sqlutils.QueryTableID(t, db, "d", "t")
-	newDefCfg := config.DefaultZoneConfig()
+	tableID := sqlutils.QueryTableID(t, db, "d", "public", "t")
+	newDefCfg := s.(*server.TestServer).Cfg.DefaultZoneConfig
 	newDefCfg.NumReplicas = proto.Int32(int32(newReplicationFactor))
 
 	newDefaultRow := sqlutils.ZoneRow{
-		ID:           keys.RootNamespaceID,
-		CLISpecifier: ".default",
-		Config:       newDefCfg,
+		ID:     keys.RootNamespaceID,
+		Config: newDefCfg,
 	}
 
 	newTableRow := sqlutils.ZoneRow{
-		ID:           tableID,
-		CLISpecifier: "d.t",
-		Config:       config.DefaultZoneConfig(), // Old value for Num Replicas.
+		ID:     tableID,
+		Config: s.(*server.TestServer).Cfg.DefaultZoneConfig,
 	}
 
 	// Doesn't have any values of its own.
@@ -295,10 +280,11 @@ func TestZoneInheritField(t *testing.T) {
 
 func TestInvalidSetShowZones(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	for i, tc := range []struct {
 		query string

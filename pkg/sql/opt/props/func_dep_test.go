@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package props_test
 
@@ -19,24 +15,39 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/stretchr/testify/require"
 )
+
+func TestFuncDeps_ConstCols(t *testing.T) {
+	fd := &props.FuncDepSet{}
+	require.Equal(t, "()", fd.ConstantCols().String())
+	fd.AddConstants(c(1, 2))
+	require.Equal(t, "(1,2)", fd.ConstantCols().String())
+
+	fd2 := makeAbcdeFD(t)
+	require.Equal(t, "()", fd2.ConstantCols().String())
+	fd2.AddConstants(c(1, 2))
+	require.Equal(t, "(1,2)", fd.ConstantCols().String())
+}
 
 // Other tests also exercise the ColsAreKey methods.
 func TestFuncDeps_ColsAreKey(t *testing.T) {
 	// CREATE TABLE abcde (a INT PRIMARY KEY, b INT, c INT, d INT, e INT)
 	// CREATE UNIQUE INDEX ON abcde (b, c)
 	// CREATE TABLE mnpq (m INT, n INT, p INT, q INT, PRIMARY KEY (m, n))
-	// SELECT * FROM abcde LEFT OUTER JOIN (SELECT *, p+q FROM mnpq) ON c=1 AND m=1 WHERE a=m
+	// This case wouldn't actually happen with a real world query.
+	var loj props.FuncDepSet
+	preservedCols := c(1, 2, 3, 4, 5)
 	nullExtendedCols := c(10, 11, 12, 13, 14)
-	loj := makeAbcdeFD(t)
+	abcde := makeAbcdeFD(t)
 	mnpq := makeMnpqFD(t)
 	mnpq.AddSynthesizedCol(c(12, 13), 14)
+	loj.CopyFrom(abcde)
 	loj.MakeProduct(mnpq)
 	loj.AddConstants(c(3))
-	loj.MakeOuter(nullExtendedCols, c(1, 10, 11))
+	loj.MakeLeftOuter(abcde, &props.FuncDepSet{}, preservedCols, nullExtendedCols, c(1, 10, 11))
 	loj.AddEquivalency(1, 10)
-	verifyFD(t, loj, "key(10,11); ()-->(3), (1)-->(2,4,5), (2,3)~~>(1,4,5), (10,11)-->(12,13), (12,13)~~>(14), (1,10,11)-->(14), (1)==(10), (10)==(1)")
+	verifyFD(t, &loj, "key(10,11); ()-->(3), (1)-->(2,4,5), (2,3)~~>(1,4,5), (10,11)-->(12,13), (12,13)~~>(14), (1,10,11)-->(14), (1)==(10), (10)==(1)")
 
 	testcases := []struct {
 		cols   opt.ColSet
@@ -51,12 +62,18 @@ func TestFuncDeps_ColsAreKey(t *testing.T) {
 		{cols: c(10), strict: false, lax: false},
 		{cols: c(11), strict: false, lax: false},
 		{cols: c(), strict: false, lax: false},
-		{cols: c(2, 11), strict: false, lax: true},
+
+		// This case is interesting: if we take into account that 3 is a constant,
+		// we could put 2 and 3 together and use (2,3)~~>(1,4,5) and (1)==(10) to
+		// prove that (2,3) is a lax key. But this is only true when that constant
+		// value for 3 is not NULL. We would have to pass non-null information to
+		// the check. See #42731.
+		{cols: c(2, 11), strict: false, lax: false},
 	}
 
 	for _, tc := range testcases {
-		testColsAreStrictKey(t, loj, tc.cols, tc.strict)
-		testColsAreLaxKey(t, loj, tc.cols, tc.lax)
+		testColsAreStrictKey(t, &loj, tc.cols, tc.strict)
+		testColsAreLaxKey(t, &loj, tc.cols, tc.lax)
 	}
 }
 
@@ -73,19 +90,18 @@ func TestFuncDeps_ComputeClosure(t *testing.T) {
 	fd1.AddEquivalency(4, 5)
 	verifyFD(t, fd1, "(1)-->(2-4), (2,3,5)-->(6), (4)==(5), (5)==(4)")
 
-	// ()~~>(a)
 	// (a)~~>(d)
 	// ()-->(b)
 	// (b)==(c)
 	// (c)==(b)
 	// (d)-->(e)
 	fd2 := &props.FuncDepSet{}
-	fd2.AddConstants(c(1, 2))
-	fd2.AddSynthesizedCol(c(1), 4)
-	fd2.MakeOuter(c(1, 4), c())
+	// This isn't intended to create a real lax key; just a lax dependency.
+	fd2.AddLaxKey(c(1), c(1, 4))
+	fd2.AddConstants(c(2))
 	fd2.AddEquivalency(2, 3)
 	fd2.AddSynthesizedCol(c(4), 5)
-	verifyFD(t, fd2, "()-->(2,3), ()~~>(1), (1)~~>(4), (2)==(3), (3)==(2), (4)-->(5)")
+	verifyFD(t, fd2, "lax-key(1); ()-->(2,3), (1)~~>(4), (2)==(3), (3)==(2), (4)-->(5)")
 
 	testcases := []struct {
 		fd       *props.FuncDepSet
@@ -112,35 +128,34 @@ func TestFuncDeps_ComputeClosure(t *testing.T) {
 }
 
 func TestFuncDeps_InClosureOf(t *testing.T) {
-	// ()~~>(a)
 	// (a)~~>(d)
 	// ()-->(b)
 	// (b)==(c)
 	// (c)==(b)
 	// (d)-->(e)
 	fd := &props.FuncDepSet{}
-	fd.AddConstants(c(1, 2))
-	fd.AddSynthesizedCol(c(1), 4)
-	fd.MakeOuter(c(1, 4), c())
+	fd.AddConstants(c(2))
+	// This isn't intended to create a real lax key; just a lax dependency.
+	fd.AddLaxKey(c(1), c(1, 4))
 	fd.AddEquivalency(2, 3)
 	fd.AddSynthesizedCol(c(4), 5)
-	verifyFD(t, fd, "()-->(2,3), ()~~>(1), (1)~~>(4), (2)==(3), (3)==(2), (4)-->(5)")
+	verifyFD(t, fd, "lax-key(1); ()-->(2,3), (1)~~>(4), (2)==(3), (3)==(2), (4)-->(5)")
 
 	testcases := []struct {
-		cols     []int
-		in       []int
+		cols     []opt.ColumnID
+		in       []opt.ColumnID
 		expected bool
 	}{
-		{cols: []int{}, in: []int{}, expected: true},
-		{cols: []int{}, in: []int{1}, expected: true},
-		{cols: []int{2, 3}, in: []int{}, expected: true},
-		{cols: []int{2}, in: []int{3}, expected: true},
-		{cols: []int{3}, in: []int{2}, expected: true},
-		{cols: []int{3, 5}, in: []int{2, 4}, expected: true},
+		{cols: []opt.ColumnID{}, in: []opt.ColumnID{}, expected: true},
+		{cols: []opt.ColumnID{}, in: []opt.ColumnID{1}, expected: true},
+		{cols: []opt.ColumnID{2, 3}, in: []opt.ColumnID{}, expected: true},
+		{cols: []opt.ColumnID{2}, in: []opt.ColumnID{3}, expected: true},
+		{cols: []opt.ColumnID{3}, in: []opt.ColumnID{2}, expected: true},
+		{cols: []opt.ColumnID{3, 5}, in: []opt.ColumnID{2, 4}, expected: true},
 
-		{cols: []int{1}, in: []int{}, expected: false},
-		{cols: []int{4}, in: []int{5}, expected: false},
-		{cols: []int{2, 3, 4}, in: []int{1, 2, 3}, expected: false},
+		{cols: []opt.ColumnID{1}, in: []opt.ColumnID{}, expected: false},
+		{cols: []opt.ColumnID{4}, in: []opt.ColumnID{5}, expected: false},
+		{cols: []opt.ColumnID{2, 3, 4}, in: []opt.ColumnID{1, 2, 3}, expected: false},
 	}
 
 	for _, tc := range testcases {
@@ -157,6 +172,46 @@ func TestFuncDeps_InClosureOf(t *testing.T) {
 	}
 }
 
+func TestFuncDepSet_AreColsEquiv(t *testing.T) {
+	fd := &props.FuncDepSet{}
+
+	// (a) == (b)
+	// (b) == (c)
+	// (d) == (e)
+	// (a) --> (f)
+	// (e) == (g)
+	fd.AddEquivalency(1, 2)
+	fd.AddEquivalency(2, 3)
+	fd.AddEquivalency(4, 5)
+	fd.AddSynthesizedCol(c(1), 6)
+
+	testcases := []struct {
+		col1, col2 opt.ColumnID
+		expected   bool
+	}{
+		{col1: 1, col2: 2, expected: true},
+		{col1: 2, col2: 3, expected: true},
+		{col1: 2, col2: 1, expected: true},
+		{col1: 1, col2: 3, expected: true},
+		{col1: 3, col2: 2, expected: true},
+		{col1: 1, col2: 4, expected: false},
+		{col1: 1, col2: 6, expected: false},
+	}
+
+	for _, tc := range testcases {
+		col1 := tc.col1
+		col2 := tc.col2
+		actual := fd.AreColsEquiv(col1, col2)
+		if actual != tc.expected {
+			if tc.expected {
+				t.Errorf("expected %v to be equal to %v", col1, col2)
+			} else {
+				t.Errorf("expected %v to not be equal to %v", col1, col2)
+			}
+		}
+	}
+}
+
 func TestFuncDeps_ComputeEquivClosure(t *testing.T) {
 	// (a)==(b,d)
 	// (b)==(a,c)
@@ -165,13 +220,13 @@ func TestFuncDeps_ComputeEquivClosure(t *testing.T) {
 	// (a)~~>(e)
 	// (a)-->(f)
 	fd1 := &props.FuncDepSet{}
-	fd1.AddSynthesizedCol(c(1), 5)
-	fd1.MakeOuter(c(1, 5), c())
+	// This isn't intended to create a real lax key; just a lax dependency.
+	fd1.AddLaxKey(c(1), c(1, 5))
 	fd1.AddSynthesizedCol(c(1), 6)
 	fd1.AddEquivalency(1, 2)
 	fd1.AddEquivalency(2, 3)
 	fd1.AddEquivalency(1, 4)
-	verifyFD(t, fd1, "(1)~~>(5), (1)-->(6), (1)==(2-4), (2)==(1,3,4), (3)==(1,2,4), (4)==(1-3)")
+	verifyFD(t, fd1, "lax-key(1); (1)~~>(5), (1)-->(6), (1)==(2-4), (2)==(1,3,4), (3)==(1,2,4), (4)==(1-3)")
 
 	testcases := []struct {
 		fd       *props.FuncDepSet
@@ -201,12 +256,12 @@ func TestFuncDeps_EquivReps(t *testing.T) {
 	// (a)~~>(e)
 	// (a)-->(f)
 	fd1 := &props.FuncDepSet{}
-	fd1.AddSynthesizedCol(c(1), 5)
-	fd1.MakeOuter(c(1, 5), c())
+	// This isn't intended to create a real lax key; just a lax dependency.
+	fd1.AddLaxKey(c(1), c(1, 5))
 	fd1.AddSynthesizedCol(c(1), 6)
 	fd1.AddEquivalency(1, 2)
 	fd1.AddEquivalency(2, 3)
-	verifyFD(t, fd1, "(1)~~>(5), (1)-->(6), (1)==(2,3), (2)==(1,3), (3)==(1,2)")
+	verifyFD(t, fd1, "lax-key(1); (1)~~>(5), (1)-->(6), (1)==(2,3), (2)==(1,3), (3)==(1,2)")
 
 	// (a)==(b,d)
 	// (b)==(a,c)
@@ -217,7 +272,7 @@ func TestFuncDeps_EquivReps(t *testing.T) {
 	fd2 := &props.FuncDepSet{}
 	fd2.CopyFrom(fd1)
 	fd2.AddEquivalency(1, 4)
-	verifyFD(t, fd2, "(1)~~>(5), (1)-->(6), (1)==(2-4), (2)==(1,3,4), (3)==(1,2,4), (4)==(1-3)")
+	verifyFD(t, fd2, "lax-key(1); (1)~~>(5), (1)-->(6), (1)==(2-4), (2)==(1,3,4), (3)==(1,2,4), (4)==(1-3)")
 
 	// (a)==(b,d)
 	// (b)==(a,c)
@@ -228,7 +283,7 @@ func TestFuncDeps_EquivReps(t *testing.T) {
 	fd3 := &props.FuncDepSet{}
 	fd3.CopyFrom(fd1)
 	fd3.AddEquivalency(4, 5)
-	verifyFD(t, fd3, "(1)~~>(5), (1)-->(6), (1)==(2,3), (2)==(1,3), (3)==(1,2), (4)==(5), (5)==(4)")
+	verifyFD(t, fd3, "lax-key(1); (1)~~>(5), (1)-->(6), (1)==(2,3), (2)==(1,3), (3)==(1,2), (4)==(5), (5)==(4)")
 
 	testcases := []struct {
 		fd       *props.FuncDepSet
@@ -309,13 +364,6 @@ func TestFuncDeps_AddLaxKey(t *testing.T) {
 	testColsAreLaxKey(t, mnpq, c(10, 11), true)
 	testColsAreLaxKey(t, mnpq, c(10, 11, 12), true)
 
-	// Empty key.
-	empty := &props.FuncDepSet{}
-	empty.AddLaxKey(opt.ColSet{}, c(1))
-	verifyFD(t, empty, "lax-key(); ()~~>(1)")
-	testColsAreStrictKey(t, empty, c(), false)
-	testColsAreLaxKey(t, empty, c(), true)
-
 	// Verify that a shorter lax key overwrites a longer lax key (but not
 	// vice-versa).
 	abcde := &props.FuncDepSet{}
@@ -358,15 +406,18 @@ func TestFuncDeps_MakeNotNull(t *testing.T) {
 	// CREATE TABLE abcde (a INT PRIMARY KEY, b INT, c INT, d INT, e INT)
 	// CREATE UNIQUE INDEX ON abcde (b, c)
 	// CREATE TABLE mnpq (m INT, n INT, p INT, q INT, PRIMARY KEY (m, n))
-	// SELECT * FROM abcde LEFT OUTER JOIN mnpq ON a=1 AND b=1 AND m=1 AND p=1 WHERE p IS NOT NULL
+	// SELECT * FROM (SELECT * FROM abcde WHERE a=1 AND b=1)
+	//   LEFT OUTER JOIN (SELECT * FROM mnpq WHERE m=1 AND p=1) ON True
+	//   WHERE p IS NOT NULL
+	preservedCols := c(1, 2, 3, 4, 5)
 	nullExtendedCols := c(10, 11, 12, 13)
 	loj := makeProductFD(t)
 	loj.AddConstants(c(1, 2, 10, 12))
 	verifyFD(t, loj, "key(11); ()-->(1-5,10,12), (11)-->(13)")
-	loj.MakeOuter(nullExtendedCols, c(1, 2, 10, 11, 12))
-	verifyFD(t, loj, "key(11); ()-->(1-5), (11)-->(10,12,13), ()~~>(10,12)")
+	loj.MakeLeftOuter(abcde, &props.FuncDepSet{}, preservedCols, nullExtendedCols, c(1, 2, 10, 11, 12))
+	verifyFD(t, loj, "key(11); ()-->(1-5), (11)-->(10,12,13)")
 	loj.MakeNotNull(c(1, 2, 12))
-	verifyFD(t, loj, "key(11); ()-->(1-5,12), (11)-->(10,13), ()~~>(10)")
+	verifyFD(t, loj, "key(11); ()-->(1-5), (11)-->(10,12,13)")
 
 	// Test MakeNotNull triggering key reduction.
 	//   SELECT * FROM (SELECT DISTINCT b, c, d, e FROM abcde) WHERE b IS NOT NULL AND c IS NOT NULL
@@ -443,7 +494,7 @@ func TestFuncDeps_AddConstants(t *testing.T) {
 	abcde.AddConstants(c(2))
 	verifyFD(t, abcde, "key(1); ()-->(2), (1)-->(3-5), (2,3)~~>(1,4,5)")
 	abcde.MakeNotNull(c(2, 3))
-	verifyFD(t, abcde, "key(1); ()-->(2), (1)-->(3-5), (2,3)-->(1,4,5)")
+	verifyFD(t, abcde, "key(1); ()-->(2), (1)-->(3-5), (3)-->(1,4,5)")
 	testColsAreStrictKey(t, abcde, c(3), true)
 
 	// CREATE TABLE wxyz (w INT, x INT, y INT, z INT, PRIMARY KEY(w, x, y, z))
@@ -538,6 +589,12 @@ func TestFuncDeps_AddSynthesizedCol(t *testing.T) {
 	anb1.ProjectCols(c(1, 11, 100))
 	verifyFD(t, &anb1, "key(1,11); (1)-->(100)")
 	testColsAreStrictKey(t, &anb1, c(1, 11, 100), true)
+
+	// Test that we are reducing the "from" columns.
+	fd := &props.FuncDepSet{}
+	fd.AddStrictKey(opt.MakeColSet(1), opt.MakeColSet(1, 2))
+	fd.AddSynthesizedCol(opt.MakeColSet(1, 2), 3)
+	verifyFD(t, fd, "key(1); (1)-->(2,3)")
 }
 
 func TestFuncDeps_ProjectCols(t *testing.T) {
@@ -585,7 +642,7 @@ func TestFuncDeps_ProjectCols(t *testing.T) {
 	abcde := makeAbcdeFD(t)
 	abcde.AddConstants(c(2))
 	abcde.MakeNotNull(c(2, 3))
-	verifyFD(t, abcde, "key(1); ()-->(2), (1)-->(3-5), (2,3)-->(1,4,5)")
+	verifyFD(t, abcde, "key(1); ()-->(2), (1)-->(3-5), (3)-->(1,4,5)")
 	abcde.ProjectCols(c(1, 3, 4, 5))
 	verifyFD(t, abcde, "key(1); (1)-->(3-5), (3)-->(1,4,5)")
 
@@ -668,39 +725,17 @@ func TestFuncDeps_ProjectCols(t *testing.T) {
 	verifyFD(t, abcde, "key(1); (1)-->(2-5), (2)~~>(1,3-5), (3,4)~~>(1,2,5)")
 	abcde.ProjectCols(c(2, 3, 4, 5))
 	verifyFD(t, abcde, "lax-key(2-5); (2)~~>(3-5), (3,4)~~>(2,5)")
-	testColsAreLaxKey(t, abcde, c(2), true)
-	testColsAreLaxKey(t, abcde, c(3, 4), true)
+	// 2 on its own is not necessarily a lax key: even if it determines the other
+	// columns, any of them can still be NULL.
+	testColsAreLaxKey(t, abcde, c(2), false)
+	testColsAreLaxKey(t, abcde, c(3, 4), false)
 
 	copy := &props.FuncDepSet{}
 	copy.CopyFrom(abcde)
 
 	// Verify that lax keys convert to strong keys.
-	abcde.MakeNotNull(c(2))
-	verifyFD(t, abcde, "key(2); (2)-->(3-5), (3,4)~~>(2,5)")
-
-	abcde.CopyFrom(copy)
-	abcde.MakeNotNull(c(3, 4))
-	verifyFD(t, abcde, "key(3,4); (2)~~>(3-5), (3,4)-->(2,5)")
-
-	abcde.CopyFrom(copy)
-	abcde.MakeNotNull(c(3))
-	verifyFD(t, abcde, "lax-key(2-5); (2)~~>(3-5), (3,4)~~>(2,5)")
-
-	// Verify that lax keys are retained after we project more columns away.
-	abcde.CopyFrom(copy)
-	abcde.ProjectCols(c(2, 3))
-	verifyFD(t, abcde, "lax-key(2,3); (2)~~>(3)")
-	testColsAreLaxKey(t, abcde, c(2), true)
-	abcde.MakeNotNull(c(2))
-	verifyFD(t, abcde, "key(2); (2)-->(3)")
-
-	abcde.CopyFrom(copy)
-	abcde.ProjectCols(c(3, 4, 5))
-	verifyFD(t, abcde, "lax-key(3-5); (3,4)~~>(5)")
-	testColsAreLaxKey(t, abcde, c(3, 4), true)
-	abcde.MakeNotNull(c(3, 4))
-	verifyFD(t, abcde, "key(3,4); (3,4)-->(5)")
-	testColsAreStrictKey(t, abcde, c(3, 4), true)
+	abcde.MakeNotNull(c(2, 3, 4, 5))
+	verifyFD(t, abcde, "key(3,4); (2)-->(3-5), (3,4)-->(2,5)")
 }
 
 func TestFuncDeps_AddFrom(t *testing.T) {
@@ -799,7 +834,7 @@ func TestFuncDeps_MakeProduct(t *testing.T) {
 	product.MakeProduct(mnpq)
 	verifyFD(t, product, "lax-key(1,12,13); (1)-->(2-5), (2,3)~~>(1,4,5), (12)~~>(13)")
 	testColsAreStrictKey(t, product, c(1, 2, 3, 4, 5, 12, 13), false)
-	testColsAreLaxKey(t, product, c(1, 12), true)
+	testColsAreLaxKey(t, product, c(1, 12, 13), true)
 
 	// Lax key on left side, strict key on right side:
 	//   SELECT * FROM (SELECT b, c, d, e FROM abcde), mnpq
@@ -809,7 +844,7 @@ func TestFuncDeps_MakeProduct(t *testing.T) {
 	product.MakeProduct(mnpq)
 	verifyFD(t, product, "lax-key(2-5,10,11); (2,3)~~>(4,5), (10,11)-->(12,13)")
 	testColsAreStrictKey(t, product, c(1, 2, 3, 4, 5, 10, 11, 12, 13), false)
-	testColsAreLaxKey(t, product, c(2, 3, 10, 11), true)
+	testColsAreLaxKey(t, product, c(2, 3, 4, 5, 10, 11), true)
 
 	// Lax key on left side, lax key on right side:
 	//   CREATE UNIQUE INDEX ON mnpq (p)
@@ -822,7 +857,6 @@ func TestFuncDeps_MakeProduct(t *testing.T) {
 	product.MakeProduct(mnpq)
 	verifyFD(t, product, "lax-key(2-5,12,13); (2,3)~~>(4,5), (12)~~>(13)")
 	testColsAreStrictKey(t, product, c(2, 3, 4, 5, 12, 13), false)
-	testColsAreLaxKey(t, product, c(2, 3, 12), true)
 
 	// Lax key on left side, no key on right side:
 	//   SELECT * FROM (SELECT b, c, d, e FROM abcde), (SELECT p, q FROM mnpq)
@@ -915,132 +949,243 @@ func TestFuncDeps_MakeApply(t *testing.T) {
 	verifyFD(t, abcde, "(1)-->(2-5), (2,3)~~>(1,4,5)")
 }
 
-func TestFuncDeps_MakeOuter(t *testing.T) {
-	// All determinant columns in null-supplying side are nullable.
+func TestFuncDeps_MakeLeftOuter(t *testing.T) {
+	// All determinant columns in null-extended side are nullable.
 	//   CREATE TABLE abcde (a INT PRIMARY KEY, b INT, c INT, d INT, e INT)
 	//   CREATE UNIQUE INDEX ON abcde (b, c)
 	//   CREATE TABLE mnpq (m INT, n INT, p INT, q INT, PRIMARY KEY (m, n))
 	//   SELECT * FROM abcde LEFT OUTER JOIN (SELECT *, p+q FROM mnpq) ON True
+	var loj props.FuncDepSet
+	preservedCols := c(1, 2, 3, 4, 5)
 	nullExtendedCols := c(10, 11, 12, 13, 14)
-	loj := makeAbcdeFD(t)
+	abcde := makeAbcdeFD(t)
 	mnpq := makeMnpqFD(t)
 	mnpq.AddSynthesizedCol(c(12, 13), 14)
+	loj.CopyFrom(abcde)
 	loj.MakeProduct(mnpq)
-	verifyFD(t, loj, "key(1,10,11); (1)-->(2-5), (2,3)~~>(1,4,5), (10,11)-->(12,13), (12,13)-->(14)")
-	loj.MakeOuter(nullExtendedCols, c(1, 10, 11))
-	verifyFD(t, loj, "key(1,10,11); (1)-->(2-5), (2,3)~~>(1,4,5), (10,11)-->(12,13), (12,13)~~>(14), (1,10,11)-->(14)")
+	verifyFD(t, &loj, "key(1,10,11); (1)-->(2-5), (2,3)~~>(1,4,5), (10,11)-->(12,13), (12,13)-->(14)")
+	loj.MakeLeftOuter(abcde, &props.FuncDepSet{}, preservedCols, nullExtendedCols, c(1, 10, 11))
+	verifyFD(t, &loj, "key(1,10,11); (1)-->(2-5), (2,3)~~>(1,4,5), (10,11)-->(12,13), (12,13)~~>(14), (1,10,11)-->(14)")
 
-	// One determinant column in null-supplying side is not null.
+	// One determinant column in null-extended side is not null.
 	//   SELECT * FROM abcde LEFT OUTER JOIN (SELECT *, m+q FROM mnpq) ON True
+	preservedCols = c(1, 2, 3, 4, 5)
 	nullExtendedCols = c(10, 11, 12, 13, 14)
-	loj = makeAbcdeFD(t)
+	abcde = makeAbcdeFD(t)
 	mnpq = makeMnpqFD(t)
 	mnpq.AddSynthesizedCol(c(10, 13), 14)
+	loj.CopyFrom(abcde)
 	loj.MakeProduct(mnpq)
-	verifyFD(t, loj, "key(1,10,11); (1)-->(2-5), (2,3)~~>(1,4,5), (10,11)-->(12,13), (10,13)-->(14)")
-	loj.MakeOuter(nullExtendedCols, c(1, 10, 11))
-	verifyFD(t, loj, "key(1,10,11); (1)-->(2-5), (2,3)~~>(1,4,5), (10,11)-->(12,13), (10,13)-->(14)")
+	verifyFD(t, &loj, "key(1,10,11); (1)-->(2-5), (2,3)~~>(1,4,5), (10,11)-->(12,13), (10,13)-->(14)")
+	loj.MakeLeftOuter(abcde, &props.FuncDepSet{}, preservedCols, nullExtendedCols, c(1, 10, 11))
+	verifyFD(t, &loj, "key(1,10,11); (1)-->(2-5), (2,3)~~>(1,4,5), (10,11)-->(12,13), (10,13)-->(14)")
 
-	// Add constants on both sides of outer join.
-	//   SELECT * FROM abcde RIGHT OUTER JOIN mnpq ON b=1 AND c=1 AND p=1
+	// Inputs have constant columns. Constant columns on the row-supplying side
+	// stay constant, while constant columns on the null-supplying side are not
+	// constant after null-extension.
+	var roj props.FuncDepSet
+	preservedCols = c(10, 11, 12, 13)
 	nullExtendedCols = c(1, 2, 3, 4, 5)
-	roj := makeAbcdeFD(t)
+	abcde = makeAbcdeFD(t)
+	roj.CopyFrom(abcde)
 	roj.MakeProduct(makeMnpqFD(t))
 	roj.AddConstants(c(2, 3, 12))
 	roj.MakeNotNull(c(2, 3, 12))
-	verifyFD(t, roj, "key(10,11); ()-->(2,3,12), (1)-->(4,5), (2,3)-->(1,4,5), (10,11)-->(13)")
-	roj.MakeOuter(nullExtendedCols, c(1, 2, 3, 10, 11, 12))
-	verifyFD(t, roj, "key(10,11); ()-->(12), (1)-->(4,5), (2,3)-->(1,4,5), (10,11)-->(1-5,13), ()~~>(2,3)")
+	verifyFD(t, &roj, "key(10,11); ()-->(1-5,12), (10,11)-->(13)")
+	roj.MakeLeftOuter(mnpq, &props.FuncDepSet{}, preservedCols, nullExtendedCols, c(1, 2, 3, 10, 11, 12))
+	verifyFD(t, &roj, "key(10,11); ()-->(12), (10,11)-->(1-5,13)")
+
+	// Add constants on both sides of outer join. None of the resulting columns
+	// are constant, because rows are added back after filtering on the
+	// row-supplying side, and the null-supplying side is null-extended.
+	//   SELECT * FROM abcde RIGHT OUTER JOIN mnpq ON b=1 AND c=1 AND p=1
+	filters := props.FuncDepSet{}
+	preservedCols = c(10, 11, 12, 13)
+	nullExtendedCols = c(1, 2, 3, 4, 5)
+	abcde = makeAbcdeFD(t)
+	roj.CopyFrom(abcde)
+	roj.MakeProduct(makeMnpqFD(t))
+	filters.AddConstants(c(2, 3, 12))
+	filters.MakeNotNull(c(2, 3, 12))
+	verifyFD(t, &roj, "key(1,10,11); (1)-->(2-5), (2,3)~~>(1,4,5), (10,11)-->(12,13)")
+	roj.MakeLeftOuter(mnpq, &filters, preservedCols, nullExtendedCols, c(1, 2, 3, 10, 11, 12))
+	verifyFD(t, &roj, "key(1,10,11); (1)-->(2-5), (2,3)~~>(1,4,5), (10,11)-->(12,13)")
 
 	// Test equivalency on both sides of outer join.
-	//   SELECT * FROM abcde RIGHT OUTER JOIN mnpq ON b=c AND c=d AND m=p AND m=q
+	preservedCols = c(10, 11, 12, 13)
 	nullExtendedCols = c(1, 2, 3, 4, 5)
-	roj = makeAbcdeFD(t)
+	abcde = makeAbcdeFD(t)
+	roj.CopyFrom(abcde)
 	roj.MakeProduct(makeMnpqFD(t))
 	roj.AddEquivalency(2, 3)
 	roj.AddEquivalency(3, 4)
 	roj.AddEquivalency(10, 12)
 	roj.AddEquivalency(10, 13)
-	verifyFD(t, roj, "key(1,10,11); (1)-->(2-5), (2,3)~~>(1,5), (10,11)-->(12,13), (2)==(3,4), (3)==(2,4), (4)==(2,3), (10)==(12,13), (12)==(10,13), (13)==(10,12)")
-	roj.MakeOuter(nullExtendedCols, c(1, 2, 3, 10, 11, 13))
-	verifyFD(t, roj, "key(1,10,11); (1)-->(2-5), (2,3)~~>(1,5), (10,11)-->(12,13), (2)==(3,4), (3)==(2,4), (4)==(2,3), (10)==(12,13), (12)==(10,13), (13)==(10,12)")
+	verifyFD(t, &roj, "key(1,10,11); (1)-->(2-5), (2,3)~~>(1,5), (10,11)-->(12,13), (2)==(3,4), (3)==(2,4), (4)==(2,3), (10)==(12,13), (12)==(10,13), (13)==(10,12)")
+	roj.MakeLeftOuter(mnpq, &props.FuncDepSet{}, preservedCols, nullExtendedCols, c(1, 2, 3, 10, 11, 13))
+	verifyFD(t, &roj, "key(1,10,11); (1)-->(2-5), (2,3)~~>(1,5), (10,11)-->(12,13), (2)==(3,4), (3)==(2,4), (4)==(2,3), (10)==(12,13), (12)==(10,13), (13)==(10,12)")
+
+	// Test equivalencies on both sides of outer join in filters.
+	//   SELECT * FROM abcde RIGHT OUTER JOIN mnpq ON b=c AND c=d AND m=p AND m=q
+	filters = props.FuncDepSet{}
+	preservedCols = c(10, 11, 12, 13)
+	nullExtendedCols = c(1, 2, 3, 4, 5)
+	abcde = makeAbcdeFD(t)
+	roj.CopyFrom(abcde)
+	roj.MakeProduct(makeMnpqFD(t))
+	filters.AddEquivalency(2, 3)
+	filters.AddEquivalency(3, 4)
+	filters.AddEquivalency(10, 12)
+	filters.AddEquivalency(10, 13)
+	verifyFD(t, &roj, "key(1,10,11); (1)-->(2-5), (2,3)~~>(1,4,5), (10,11)-->(12,13)")
+	roj.MakeLeftOuter(mnpq, &filters, preservedCols, nullExtendedCols, c(1, 2, 3, 10, 11, 13))
+	verifyFD(t, &roj, "key(1,10,11); (1)-->(2-5), (2,3)~~>(1,4,5), (10,11)-->(12,13)")
 
 	// Test equivalency that crosses join boundary.
-	//   SELECT * FROM abcde RIGHT OUTER JOIN mnpq ON a=m
+	preservedCols = c(10, 11, 12, 13)
 	nullExtendedCols = c(1, 2, 3, 4, 5)
-	roj = makeAbcdeFD(t)
+	abcde = makeAbcdeFD(t)
+	roj.CopyFrom(abcde)
 	roj.MakeProduct(makeMnpqFD(t))
 	roj.AddEquivalency(1, 10)
-	verifyFD(t, roj, "key(10,11); (1)-->(2-5), (2,3)~~>(1,4,5), (10,11)-->(12,13), (1)==(10), (10)==(1)")
-	roj.MakeOuter(nullExtendedCols, c(1, 10, 11))
-	verifyFD(t, roj, "key(10,11); (1)-->(2-5), (2,3)~~>(1,4,5), (10,11)-->(1-5,12,13), (1)~~>(10)")
+	verifyFD(t, &roj, "key(10,11); (1)-->(2-5), (2,3)~~>(1,4,5), (10,11)-->(12,13), (1)==(10), (10)==(1)")
+	roj.MakeLeftOuter(mnpq, &props.FuncDepSet{}, preservedCols, nullExtendedCols, c(1, 10, 11))
+	verifyFD(t, &roj, "key(10,11); (1)-->(2-5), (2,3)~~>(1,4,5), (10,11)-->(1-5,12,13), (1)~~>(10)")
+
+	// Test filter equivalency that crosses join boundary.
+	//   SELECT * FROM abcde RIGHT OUTER JOIN mnpq ON a=m
+	filters = props.FuncDepSet{}
+	preservedCols = c(10, 11, 12, 13)
+	nullExtendedCols = c(1, 2, 3, 4, 5)
+	abcde = makeAbcdeFD(t)
+	roj.CopyFrom(abcde)
+	roj.MakeProduct(makeMnpqFD(t))
+	filters.AddEquivalency(1, 10)
+	verifyFD(t, &roj, "key(1,10,11); (1)-->(2-5), (2,3)~~>(1,4,5), (10,11)-->(12,13)")
+	roj.MakeLeftOuter(mnpq, &filters, preservedCols, nullExtendedCols, c(1, 10, 11))
+	verifyFD(t, &roj, "key(10,11); (1)-->(2-5), (2,3)~~>(1,4,5), (10,11)-->(1-5,12,13)")
 
 	// Test equivalency that includes columns from both sides of join boundary.
-	//   SELECT * FROM abcde RIGHT OUTER JOIN mnpq ON a=m AND a=b
+	preservedCols = c(10, 11, 12, 13)
 	nullExtendedCols = c(1, 2, 3, 4, 5)
-	roj = makeAbcdeFD(t)
+	abcde = makeAbcdeFD(t)
+	roj.CopyFrom(abcde)
 	roj.MakeProduct(makeMnpqFD(t))
 	roj.AddEquivalency(1, 10)
 	roj.AddEquivalency(1, 2)
-	verifyFD(t, roj, "key(10,11); (1)-->(3-5), (2,3)~~>(1,4,5), (10,11)-->(12,13), (1)==(2,10), (10)==(1,2), (2)==(1,10)")
-	roj.MakeOuter(nullExtendedCols, c(1, 2, 10, 11))
-	verifyFD(t, roj, "key(10,11); (1)-->(3-5), (2,3)~~>(1,4,5), (10,11)-->(1-5,12,13), (1)==(2), (2)==(1), (1)~~>(10), (2)~~>(10)")
+	verifyFD(t, &roj, "key(10,11); (1)-->(3-5), (2,3)~~>(1,4,5), (10,11)-->(12,13), (1)==(2,10), (10)==(1,2), (2)==(1,10)")
+	roj.MakeLeftOuter(mnpq, &props.FuncDepSet{}, preservedCols, nullExtendedCols, c(1, 2, 10, 11))
+	verifyFD(t, &roj, "key(10,11); (1)-->(3-5), (2,3)~~>(1,4,5), (10,11)-->(1-5,12,13), (1)==(2), (2)==(1), (1)~~>(10), (2)~~>(10)")
 
-	// Test multiple calls to MakeOuter, where the first creates determinant with
+	// Test filter equivalency that includes columns from both sides of join
+	// boundary.
+	//   SELECT * FROM abcde RIGHT OUTER JOIN mnpq ON a=m AND a=b
+	filters = props.FuncDepSet{}
+	preservedCols = c(10, 11, 12, 13)
+	nullExtendedCols = c(1, 2, 3, 4, 5)
+	abcde = makeAbcdeFD(t)
+	roj.CopyFrom(abcde)
+	roj.MakeProduct(makeMnpqFD(t))
+	filters.AddEquivalency(1, 10)
+	filters.AddEquivalency(1, 2)
+	verifyFD(t, &roj, "key(1,10,11); (1)-->(2-5), (2,3)~~>(1,4,5), (10,11)-->(12,13)")
+	roj.MakeLeftOuter(mnpq, &filters, preservedCols, nullExtendedCols, c(1, 2, 10, 11))
+	verifyFD(t, &roj, "key(10,11); (1)-->(2-5), (2,3)~~>(1,4,5), (10,11)-->(1-5,12,13)")
+
+	// Test multiple calls to MakeLeftOuter, where the first creates determinant with
 	// columns from both sides of join.
 	//   SELECT * FROM (SELECT * FROM abcde WHERE b=1) FULL JOIN mnpq ON True
+	preservedCols = c(10, 11, 12, 13)
+	preservedCols2 := c(1, 2, 3, 4, 5)
 	nullExtendedCols = c(1, 2, 3, 4, 5)
 	nullExtendedCols2 := c(10, 11, 12, 13)
-	roj = makeAbcdeFD(t)
+	abcde = makeAbcdeFD(t)
+	roj.CopyFrom(abcde)
 	roj.AddConstants(c(2))
 	roj.MakeProduct(makeMnpqFD(t))
-	verifyFD(t, roj, "key(1,10,11); ()-->(2), (1)-->(3-5), (2,3)~~>(1,4,5), (10,11)-->(12,13)")
-	roj.MakeOuter(nullExtendedCols, c(1, 2, 10, 11))
-	verifyFD(t, roj, "key(1,10,11); (1)-->(3-5), (2,3)~~>(1,4,5), (10,11)-->(12,13), ()~~>(2), (1,10,11)-->(2)")
-	roj.MakeOuter(nullExtendedCols2, c(1, 2, 10, 11))
-	verifyFD(t, roj, "key(1,10,11); (1)-->(3-5), (2,3)~~>(1,4,5), (10,11)-->(12,13), ()~~>(2), (1,10,11)-->(2)")
+	verifyFD(t, &roj, "key(1,10,11); ()-->(2), (1)-->(3-5), (2,3)~~>(1,4,5), (10,11)-->(12,13)")
+	roj.MakeLeftOuter(mnpq, &props.FuncDepSet{}, preservedCols, nullExtendedCols, c(1, 2, 10, 11))
+	verifyFD(t, &roj, "key(1,10,11); (1)-->(3-5), (2,3)~~>(1,4,5), (10,11)-->(12,13), (1,10,11)-->(2)")
+	roj.MakeLeftOuter(abcde, &props.FuncDepSet{}, preservedCols2, nullExtendedCols2, c(1, 2, 10, 11))
+	verifyFD(t, &roj, "key(1,10,11); (1)-->(3-5), (2,3)~~>(1,4,5), (10,11)-->(12,13), (1,10,11)-->(2)")
 
 	// Join keyless relations with nullable columns.
 	//   SELECT * FROM (SELECT d, e, d+e FROM abcde) LEFT JOIN (SELECT p, q, p+q FROM mnpq) ON True
+	preservedCols = c(4, 5, 6)
 	nullExtendedCols = c(12, 13, 14)
-	loj = makeAbcdeFD(t)
-	loj.AddSynthesizedCol(c(4, 5), 6)
-	loj.ProjectCols(c(4, 5, 6))
+	abcde = makeAbcdeFD(t)
 	mnpq = makeMnpqFD(t)
 	mnpq.AddSynthesizedCol(c(12, 13), 14)
 	mnpq.ProjectCols(c(12, 13, 14))
+	loj.CopyFrom(abcde)
+	loj.AddSynthesizedCol(c(4, 5), 6)
+	loj.ProjectCols(c(4, 5, 6))
 	loj.MakeProduct(mnpq)
-	verifyFD(t, loj, "(4,5)-->(6), (12,13)-->(14)")
-	loj.MakeOuter(nullExtendedCols, c())
-	verifyFD(t, loj, "(4,5)-->(6), (12,13)~~>(14)")
-	testColsAreStrictKey(t, loj, c(4, 5, 6, 12, 13, 14), false)
+	verifyFD(t, &loj, "(4,5)-->(6), (12,13)-->(14)")
+	loj.MakeLeftOuter(abcde, &props.FuncDepSet{}, preservedCols, nullExtendedCols, c())
+	verifyFD(t, &loj, "(4,5)-->(6), (12,13)~~>(14)")
+	testColsAreStrictKey(t, &loj, c(4, 5, 6, 12, 13, 14), false)
 
 	// Join keyless relations with not-null columns.
 	//   SELECT * FROM (SELECT d, e, d+e FROM abcde WHERE d>e) LEFT JOIN (SELECT p, q, p+q FROM mnpq WHERE p>q) ON True
+	preservedCols = c(4, 5, 6)
 	nullExtendedCols = c(12, 13, 14)
-	loj = makeAbcdeFD(t)
+	abcde = makeAbcdeFD(t)
+	mnpq = makeMnpqFD(t)
+	mnpq.AddSynthesizedCol(c(12, 13), 14)
+	mnpq.ProjectCols(c(12, 13, 14))
+	loj.CopyFrom(abcde)
 	loj.AddSynthesizedCol(c(4, 5), 6)
 	loj.ProjectCols(c(4, 5, 6))
-	mnpq = makeMnpqFD(t)
-	mnpq.AddSynthesizedCol(c(12, 13), 14)
-	mnpq.ProjectCols(c(12, 13, 14))
 	loj.MakeProduct(mnpq)
-	verifyFD(t, loj, "(4,5)-->(6), (12,13)-->(14)")
-	loj.MakeOuter(nullExtendedCols, c(4, 5, 12, 13))
-	verifyFD(t, loj, "(4,5)-->(6), (12,13)-->(14)")
-	testColsAreStrictKey(t, loj, c(4, 5, 6, 12, 13, 14), false)
+	verifyFD(t, &loj, "(4,5)-->(6), (12,13)-->(14)")
+	loj.MakeLeftOuter(abcde, &props.FuncDepSet{}, preservedCols, nullExtendedCols, c(4, 5, 12, 13))
+	verifyFD(t, &loj, "(4,5)-->(6), (12,13)-->(14)")
+	testColsAreStrictKey(t, &loj, c(4, 5, 6, 12, 13, 14), false)
 
 	// SELECT * FROM abcde LEFT JOIN LATERAL (SELECT p, q, p+q FROM mnpq) ON True
+	preservedCols = c(1, 2, 3, 4, 5)
 	nullExtendedCols = c(12, 13, 14)
-	loj = makeAbcdeFD(t)
+	abcde = makeAbcdeFD(t)
 	mnpq = makeMnpqFD(t)
 	mnpq.AddSynthesizedCol(c(12, 13), 14)
 	mnpq.ProjectCols(c(12, 13, 14))
+	loj.CopyFrom(abcde)
 	verifyFD(t, mnpq, "(12,13)-->(14)")
 	loj.MakeApply(mnpq)
-	verifyFD(t, loj, "(1)-->(2-5), (2,3)~~>(1,4,5), (1,12,13)-->(14)")
-	loj.MakeOuter(nullExtendedCols, c(1))
-	verifyFD(t, loj, "(1)-->(2-5), (2,3)~~>(1,4,5)")
+	verifyFD(t, &loj, "(1)-->(2-5), (2,3)~~>(1,4,5), (1,12,13)-->(14)")
+	loj.MakeLeftOuter(abcde, &props.FuncDepSet{}, preservedCols, nullExtendedCols, c(1))
+	verifyFD(t, &loj, "(1)-->(2-5), (2,3)~~>(1,4,5)")
+}
+
+func TestFuncDeps_MakeFullOuter(t *testing.T) {
+	mk := func(left, right *props.FuncDepSet, notNullInputCols opt.ColSet) *props.FuncDepSet {
+		var outer props.FuncDepSet
+		outer.CopyFrom(left)
+		outer.MakeProduct(right)
+		outer.MakeFullOuter(left.ColSet(), right.ColSet(), notNullInputCols)
+		return &outer
+	}
+
+	abcde := makeAbcdeFD(t)
+	mnpq := makeMnpqFD(t)
+
+	outer := mk(abcde, mnpq, c(1, 10, 11))
+	verifyFD(t, outer, "key(1,10,11); (1)-->(2-5), (2,3)~~>(1,4,5), (10,11)-->(12,13)")
+
+	// With partial null column info, some FDs become lax.
+	outer = mk(abcde, mnpq, c(1))
+	verifyFD(t, outer, "key(1,10,11); (1)-->(2-5), (2,3)~~>(1,4,5), (10,11)~~>(12,13), (1,10,11)-->(12,13)")
+
+	// Without null column info, the key becomes lax.
+	outer = mk(abcde, mnpq, c())
+	verifyFD(t, outer, "lax-key(1,10,11); (2,3)~~>(1,4,5), (1)~~>(2-5), (10,11)~~>(12,13), (1,10,11)~~>(2-5,12,13)")
+
+	// Test case with empty key on both sides; the result should not have a key.
+	abcde.MakeMax1Row(abcde.ColSet())
+	mnpq.MakeMax1Row(mnpq.ColSet())
+	outer = mk(abcde, mnpq, c())
+	verifyFD(t, outer, "")
 }
 
 // Construct base table FD from figure 3.3, page 114:
@@ -1163,6 +1308,6 @@ func testColsAreLaxKey(t *testing.T, f *props.FuncDepSet, cols opt.ColSet, expec
 	}
 }
 
-func c(cols ...int) opt.ColSet {
-	return util.MakeFastIntSet(cols...)
+func c(cols ...opt.ColumnID) opt.ColSet {
+	return opt.MakeColSet(cols...)
 }

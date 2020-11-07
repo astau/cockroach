@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package constraint
 
@@ -19,6 +15,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/errors"
 )
 
 // Unconstrained is an empty constraint set which does not impose any
@@ -292,6 +289,45 @@ func (s *Set) ExtractConstCols(evalCtx *tree.EvalContext) opt.ColSet {
 	return res
 }
 
+// ExtractValueForConstCol extracts the value for a constant column returned
+// by ExtractConstCols.
+func (s *Set) ExtractValueForConstCol(evalCtx *tree.EvalContext, col opt.ColumnID) tree.Datum {
+	if s == Unconstrained || s == Contradiction {
+		return nil
+	}
+	for i := 0; i < s.Length(); i++ {
+		c := s.Constraint(i)
+		colOrd := -1
+		for j := 0; j < c.Columns.Count(); j++ {
+			if c.Columns.Get(j).ID() == col {
+				colOrd = j
+				break
+			}
+		}
+		// The column must be part of the constraint's "exact prefix".
+		if colOrd != -1 && c.ExactPrefix(evalCtx) > colOrd {
+			return c.Spans.Get(0).StartKey().Value(colOrd)
+		}
+	}
+	return nil
+}
+
+// IsSingleColumnConstValue returns true if the Set contains a single constraint
+// on a single column which allows for a single constant value. On success,
+// returns the column and the constant value.
+func (s *Set) IsSingleColumnConstValue(
+	evalCtx *tree.EvalContext,
+) (col opt.ColumnID, constValue tree.Datum, ok bool) {
+	if s.Length() != 1 {
+		return 0, nil, false
+	}
+	c := s.Constraint(0)
+	if c.Columns.Count() != 1 || c.ExactPrefix(evalCtx) != 1 {
+		return 0, nil, false
+	}
+	return c.Columns.Get(0).ID(), c.Spans.Get(0).StartKey().Value(0), true
+}
+
 // allocConstraint allocates space for a new constraint in the set and returns
 // a pointer to it. The first constraint is stored inline, and subsequent
 // constraints are stored in the otherConstraints slice.
@@ -311,7 +347,8 @@ func (s *Set) allocConstraint(capacity int) *Constraint {
 
 	// Subsequent constraints extend slice.
 	if cap(s.otherConstraints) < capacity {
-		panic("correct capacity should have been set when otherConstraints was allocated")
+		panic(errors.AssertionFailedf(
+			"correct capacity should have been set when otherConstraints was allocated"))
 	}
 
 	// Remember that otherConstraints' length is one less than the set length.

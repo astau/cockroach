@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -34,9 +29,11 @@ var jepsenNemeses = []struct {
 	{"start-kill-2", "--nemesis start-kill-2"},
 	{"start-stop-2", "--nemesis start-stop-2"},
 	{"strobe-skews", "--nemesis strobe-skews"},
-	{"subcritical-skews", "--nemesis subcritical-skews"},
-	{"majority-ring-subcritical-skews", "--nemesis majority-ring --nemesis2 subcritical-skews"},
-	{"subcritical-skews-start-kill-2", "--nemesis subcritical-skews --nemesis2 start-kill-2"},
+	// TODO(bdarnell): subcritical-skews nemesis is currently flaky due to ntp rate limiting.
+	// https://github.com/cockroachdb/cockroach/issues/35599
+	//{"subcritical-skews", "--nemesis subcritical-skews"},
+	//{"majority-ring-subcritical-skews", "--nemesis majority-ring --nemesis2 subcritical-skews"},
+	//{"subcritical-skews-start-kill-2", "--nemesis subcritical-skews --nemesis2 start-kill-2"},
 	{"majority-ring-start-kill-2", "--nemesis majority-ring --nemesis2 start-kill-2"},
 	{"parts-start-kill-2", "--nemesis parts --nemesis2 start-kill-2"},
 }
@@ -54,12 +51,17 @@ func initJepsen(ctx context.Context, t *test, c *cluster) {
 		return
 	}
 
-	controller := c.Node(c.nodes)
-	workers := c.Range(1, c.nodes-1)
+	controller := c.Node(c.spec.NodeCount)
+	workers := c.Range(1, c.spec.NodeCount-1)
 
 	// Install jepsen. This part is fast if the repo is already there,
 	// so do it before the initialization check for ease of iteration.
-	c.GitClone(ctx, "https://github.com/cockroachdb/jepsen", "/mnt/data1/jepsen", "tc-nightly", controller)
+	if err := c.GitClone(
+		ctx, t.l,
+		"https://github.com/cockroachdb/jepsen", "/mnt/data1/jepsen", "tc-nightly", controller,
+	); err != nil {
+		t.Fatal(err)
+	}
 
 	// Check to see if the cluster has already been initialized.
 	if err := c.RunE(ctx, c.Node(1), "test -e jepsen_initialized"); err == nil {
@@ -68,9 +70,6 @@ func initJepsen(ctx context.Context, t *test, c *cluster) {
 	}
 	t.l.Printf("initializing cluster\n")
 	t.Status("initializing cluster")
-	defer func() {
-		c.Run(ctx, c.Node(1), "touch jepsen_initialized")
-	}()
 
 	// Roachprod collects this directory by default. If we fail early,
 	// this is the only log collection that is done. Otherwise, we
@@ -78,10 +77,12 @@ func initJepsen(ctx context.Context, t *test, c *cluster) {
 	// depending on whether the test passed or not.
 	c.Run(ctx, c.All(), "mkdir", "-p", "logs")
 
-	// TODO(bdarnell): Does this blanket apt update matter? I just
-	// copied it from the old jepsen scripts. It's slow, so we should
-	// probably either remove it or use a new base image with more of
-	// these preinstalled.
+	// `apt-get update` is slow but necessary: the base image has
+	// outdated information and refers to package versions that are no
+	// longer retrievable.
+	//
+	// TODO(bdarnell): Create a new base image with the packages we need
+	// instead of installing them on every run.
 	c.Run(ctx, c.All(), "sh", "-c", `"sudo apt-get -y update > logs/apt-upgrade.log 2>&1"`)
 	c.Run(ctx, c.All(), "sh", "-c", `"sudo apt-get -y upgrade -o Dpkg::Options::='--force-confold' > logs/apt-upgrade.log 2>&1"`)
 
@@ -97,7 +98,16 @@ func initJepsen(ctx context.Context, t *test, c *cluster) {
 	c.Run(ctx, c.All(), "tar --transform s,^,cockroach/, -c -z -f cockroach.tgz cockroach")
 
 	// Install Jepsen's prereqs on the controller.
-	c.Run(ctx, controller, "sh", "-c", `"sudo apt-get -qqy install openjdk-8-jre openjdk-8-jre-headless libjna-java gnuplot > /dev/null 2>&1"`)
+	if out, err := c.RunWithBuffer(
+		ctx, t.l, controller, "sh", "-c",
+		`"sudo apt-get -qqy install openjdk-8-jre openjdk-8-jre-headless libjna-java gnuplot > /dev/null 2>&1"`,
+	); err != nil {
+		if strings.Contains(string(out), "exit status 100") {
+			t.Skip("apt-get failure (#31944)", string(out))
+		}
+		t.Fatal(err)
+	}
+
 	c.Run(ctx, controller, "test -x lein || (curl -o lein https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein && chmod +x lein)")
 
 	// SSH setup: create a key on the controller.
@@ -119,16 +129,19 @@ func initJepsen(ctx context.Context, t *test, c *cluster) {
 	for _, ip := range c.InternalIP(ctx, workers) {
 		c.Run(ctx, controller, "sh", "-c", fmt.Sprintf(`"ssh-keyscan -t rsa %s >> .ssh/known_hosts"`, ip))
 	}
+
+	t.l.Printf("cluster initialization complete\n")
+	c.Run(ctx, c.Node(1), "touch jepsen_initialized")
 }
 
 func runJepsen(ctx context.Context, t *test, c *cluster, testName, nemesis string) {
 	initJepsen(ctx, t, c)
 
-	controller := c.Node(c.nodes)
+	controller := c.Node(c.spec.NodeCount)
 
 	// Get the IP addresses for all our workers.
 	var nodeFlags []string
-	for _, ip := range c.InternalIP(ctx, c.Range(1, c.nodes-1)) {
+	for _, ip := range c.InternalIP(ctx, c.Range(1, c.spec.NodeCount-1)) {
 		nodeFlags = append(nodeFlags, "-n "+ip)
 	}
 	nodesStr := strings.Join(nodeFlags, " ")
@@ -158,7 +171,9 @@ func runJepsen(ctx context.Context, t *test, c *cluster, testName, nemesis strin
 	// the cockroach package. Clojure doesn't really understand
 	// monorepos so steps like this are necessary for one package to
 	// depend on an unreleased package in the same repo.
-	run(c, ctx, controller, "bash", "-e", "-c", `"cd /mnt/data1/jepsen/jepsen && ~/lein install"`)
+	// Also remove the invoke.log from a previous test, if any.
+	run(c, ctx, controller, "bash", "-e", "-c",
+		`"cd /mnt/data1/jepsen/jepsen && ~/lein install && rm -f /mnt/data1/jepsen/cockroachdb/invoke.log"`)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -192,7 +207,7 @@ cd /mnt/data1/jepsen/cockroachdb && set -eo pipefail && \
 			t.l.Printf("failed: %s", testErr)
 		}
 
-	case <-time.After(20 * time.Minute):
+	case <-time.After(40 * time.Minute):
 		// Although we run tests of 6 minutes each, we use a timeout
 		// much larger than that. This is because Jepsen for some
 		// tests (e.g. register) runs a potentially long analysis
@@ -220,11 +235,14 @@ cd /mnt/data1/jepsen/cockroachdb && set -eo pipefail && \
 		// once the respective issues are fixed.
 		ignoreErr := false
 		if err := runE(c, ctx, controller,
-			`grep "Oh jeez, I'm sorry, Jepsen broke. Here's why" /mnt/data1/jepsen/cockroachdb/invoke.log -A1 `+
+			`grep -E "(Oh jeez, I'm sorry, Jepsen broke. Here's why|Caused by)" /mnt/data1/jepsen/cockroachdb/invoke.log -A1 `+
 				`| grep -e BrokenBarrierException -e InterruptedException -e com.jcraft.jsch.JSchException `+
 				// And one more ssh failure we've seen, apparently encountered when
 				// downloading logs.
-				`-e "clojure.lang.ExceptionInfo: clj-ssh scp failure"`,
+				`-e "clojure.lang.ExceptionInfo: clj-ssh scp failure" `+
+				// And sometimes the analysis succeeds and yet we still get an error code for some reason.
+				`-e "Everything looks good" `+
+				`-e "RuntimeException: Connection to"`, // timeout
 		); err == nil {
 			t.l.Printf("Recognized BrokenBarrier or other known exceptions (see grep output above). " +
 				"Ignoring it and considering the test successful. " +
@@ -235,17 +253,18 @@ cd /mnt/data1/jepsen/cockroachdb && set -eo pipefail && \
 		cmd := exec.CommandContext(ctx, roachprod, "run", c.makeNodes(controller),
 			// -h causes tar to follow symlinks; needed by the "latest" symlink.
 			// -f- sends the output to stdout, we read it and save it to a local file.
-			"tar -chj --ignore-failed-read -f- /mnt/data1/jepsen/cockroachdb/store/latest /mnt/data1/jepsen/cockroachdb/invoke.log /var/log/")
-		output, err := cmd.Output()
-		if err != nil {
+			"tar -chj --ignore-failed-read -C /mnt/data1/jepsen/cockroachdb -f- store/latest invoke.log")
+		if output, err := cmd.Output(); err != nil {
+			t.l.Printf("failed to retrieve jepsen artifacts and invoke.log: %s", err)
+		} else if err := ioutil.WriteFile(filepath.Join(outputDir, "failure-logs.tbz"), output, 0666); err != nil {
 			t.Fatal(err)
+		} else {
+			t.l.Printf("downloaded jepsen logs in failure-logs.tbz")
 		}
-		if err := ioutil.WriteFile(filepath.Join(outputDir, "failure-logs.tbz"), output, 0666); err != nil {
-			t.Fatal(err)
+		if ignoreErr {
+			t.Skip("recognized known error", testErr.Error())
 		}
-		if !ignoreErr {
-			t.Fatal(testErr)
-		}
+		t.Fatal(testErr)
 	} else {
 		collectFiles := []string{
 			"test.fressian", "results.edn", "latency-quantiles.png", "latency-raw.png", "rate.png",
@@ -275,43 +294,41 @@ cd /mnt/data1/jepsen/cockroachdb && set -eo pipefail && \
 	}
 }
 
-func registerJepsen(r *registry) {
-	// We're splitting the tests arbitrarily into a number of "batches" - top
-	// level tests. We do this so that we can different groups can run in parallel
-	// (as subtests don't run concurrently with each other). We put more than one
-	// test in a group so that Jepsen's lengthy cluster initialization step can be
-	// amortized (the individual tests are smart enough to not do it if it has
-	// been done already).
-	//
+func registerJepsen(r *testRegistry) {
 	// NB: the "comments" test is not included because it requires
 	// linearizability.
-	groups := [][]string{
-		{"bank", "bank-multitable"},
-		{"g2", "monotonic"},
-		{"register", "sequential", "sets"},
+	tests := []string{
+		"bank",
+		"bank-multitable",
+		"g2",
+		"monotonic",
+		"register",
+		"sequential",
+		"sets",
+		"multi-register",
 	}
-
-	for i := range groups {
-		spec := testSpec{
-			Name:  fmt.Sprintf("jepsen-batch%d", i+1),
-			Nodes: nodes(6),
-		}
-
-		for _, testName := range groups[i] {
-			testName := testName
-			sub := testSpec{Name: testName}
-			for _, nemesis := range jepsenNemeses {
-				nemesis := nemesis
-				sub.SubTests = append(sub.SubTests, testSpec{
-					Name: nemesis.name,
-					Run: func(ctx context.Context, t *test, c *cluster) {
-						runJepsen(ctx, t, c, testName, nemesis.config)
-					},
-				})
+	for _, testName := range tests {
+		testName := testName
+		for _, nemesis := range jepsenNemeses {
+			nemesis := nemesis // copy for closure
+			spec := testSpec{
+				Name: fmt.Sprintf("jepsen/%s/%s", testName, nemesis.name),
+				// We don't run jepsen on older releases due to the high rate of flakes.
+				MinVersion: "v20.1.0",
+				Owner:      OwnerKV,
+				// The Jepsen tests do funky things to machines, like muck with the
+				// system clock; therefore, their clusters cannot be reused other tests
+				// except the Jepsen ones themselves which reset all this state when
+				// they start. It is important, however, that the Jepsen tests reuses
+				// clusters because they have a lengthy setup step, but avoid doing it
+				// if they detect that the machines have already been properly
+				// initialized.
+				Cluster: makeClusterSpec(6, reuseTagged("jepsen")),
+				Run: func(ctx context.Context, t *test, c *cluster) {
+					runJepsen(ctx, t, c, testName, nemesis.config)
+				},
 			}
-			spec.SubTests = append(spec.SubTests, sub)
+			r.Add(spec)
 		}
-
-		r.Add(spec)
 	}
 }

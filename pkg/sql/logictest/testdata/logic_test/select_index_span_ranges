@@ -1,4 +1,4 @@
-# LogicTest: local local-opt local-parallel-stmts fakedist fakedist-opt fakedist-metadata
+# LogicTest: !3node-tenant
 
 # This test verifies that we correctly perform an index join when the KV
 # batches span ranges. This is testing that SQL disables batch limits for index
@@ -34,10 +34,6 @@ INSERT INTO t VALUES
 (11, 0, 12, 0),
 (12, 0, 88, 0),
 (13, 0, 13, 0)
-
-# Prevent the merge queue from immediately discarding our splits.
-statement ok
-SET CLUSTER SETTING kv.range_merge.queue_enabled = false;
 
 # Split the table across multiple ranges.
 statement ok

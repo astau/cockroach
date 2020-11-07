@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package server
 
@@ -24,29 +20,32 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
+	"github.com/cockroachdb/cockroach/pkg/docs"
 	"github.com/cockroachdb/cockroach/pkg/gossip/resolver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
+	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/ts"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/pebble"
 	"github.com/elastic/gosigar"
-	"github.com/pkg/errors"
 )
 
 // Context defaults.
 const (
-	// DefaultCacheSize is the default size of the RocksDB cache. We default the
-	// cache size and SQL memory pool size to 128 MiB. Larger values might
-	// provide significantly better performance, but we're not sure what type of
-	// system we're running on (development or production or some shared
+	// DefaultCacheSize is the default size of the RocksDB and Pebble caches. We
+	// default the cache size and SQL memory pool size to 128 MiB. Larger values
+	// might provide significantly better performance, but we're not sure what
+	// type of system we're running on (development or production or some shared
 	// environment). Production users should almost certainly override these
 	// settings and we'll warn in the logs about doing so.
 	DefaultCacheSize         = 128 << 20 // 128 MB
@@ -54,11 +53,8 @@ const (
 	defaultScanInterval      = 10 * time.Minute
 	defaultScanMinIdleTime   = 10 * time.Millisecond
 	defaultScanMaxIdleTime   = 1 * time.Second
-	// NB: this can't easily become a variable as the UI hard-codes it to 10s.
-	// See https://github.com/cockroachdb/cockroach/issues/20310.
-	DefaultMetricsSampleInterval   = 10 * time.Second
-	DefaultHistogramWindowInterval = 6 * DefaultMetricsSampleInterval
-	defaultStorePath               = "cockroach-data"
+
+	DefaultStorePath = "cockroach-data"
 	// TempDirPrefix is the filename prefix of any temporary subdirectory
 	// created.
 	TempDirPrefix = "cockroach-temp"
@@ -80,7 +76,7 @@ const (
 
 var productionSettingsWebpage = fmt.Sprintf(
 	"please see %s for more details",
-	base.DocsURL("recommended-production-settings.html"),
+	docs.URL("recommended-production-settings.html"),
 )
 
 // MaxOffsetType stores the configured MaxOffset.
@@ -93,10 +89,6 @@ func (mo *MaxOffsetType) Type() string {
 
 // Set implements the pflag.Value interface.
 func (mo *MaxOffsetType) Set(v string) error {
-	if v == "experimental-clockless" {
-		*mo = MaxOffsetType(timeutil.ClocklessMaxOffset)
-		return nil
-	}
 	nanos, err := time.ParseDuration(v)
 	if err != nil {
 		return err
@@ -110,45 +102,97 @@ func (mo *MaxOffsetType) Set(v string) error {
 
 // String implements the pflag.Value interface.
 func (mo *MaxOffsetType) String() string {
-	if *mo == timeutil.ClocklessMaxOffset {
-		return "experimental-clockless"
-	}
 	return time.Duration(*mo).String()
 }
 
-// Config holds parameters needed to setup a server.
-type Config struct {
-	// Embed the base context.
+// BaseConfig holds parameters that are needed to setup either a KV or a SQL
+// server.
+type BaseConfig struct {
+	Settings *cluster.Settings
 	*base.Config
 
-	Settings *cluster.Settings
+	// AmbientCtx is used to annotate contexts used inside the server.
+	AmbientCtx log.AmbientContext
 
+	// Maximum allowed clock offset for the cluster. If observed clock
+	// offsets exceed this limit, inconsistency may result, and servers
+	// will panic to minimize the likelihood of inconsistent data.
+	// Increasing this value will increase time to recovery after
+	// failures, and increase the frequency and impact of
+	// ReadWithinUncertaintyIntervalError.
+	MaxOffset MaxOffsetType
+
+	// GoroutineDumpDirName is the directory name for goroutine dumps using
+	// goroutinedumper.
+	GoroutineDumpDirName string
+
+	// HeapProfileDirName is the directory name for heap profiles using
+	// heapprofiler. If empty, no heap profiles will be collected.
+	HeapProfileDirName string
+
+	// DefaultZoneConfig is used to set the default zone config inside the server.
+	// It can be overridden during tests by setting the DefaultZoneConfigOverride
+	// server testing knob.
+	DefaultZoneConfig zonepb.ZoneConfig
+
+	// Locality is a description of the topography of the server.
+	Locality roachpb.Locality
+
+	// StorageEngine specifies the engine type (eg. rocksdb, pebble) to use to
+	// instantiate stores.
+	StorageEngine enginepb.EngineType
+
+	// TestingKnobs is used for internal test controls only.
+	TestingKnobs base.TestingKnobs
+}
+
+// MakeBaseConfig returns a BaseConfig with default values.
+func MakeBaseConfig(st *cluster.Settings) BaseConfig {
+	baseCfg := BaseConfig{
+		AmbientCtx:        log.AmbientContext{Tracer: st.Tracer},
+		Config:            new(base.Config),
+		Settings:          st,
+		MaxOffset:         MaxOffsetType(base.DefaultMaxClockOffset),
+		DefaultZoneConfig: zonepb.DefaultZoneConfig(),
+		StorageEngine:     storage.DefaultStorageEngine,
+	}
+	baseCfg.InitDefaults()
+	return baseCfg
+}
+
+// Config holds the parameters needed to set up a combined KV and SQL server.
+type Config struct {
+	BaseConfig
+	KVConfig
+	SQLConfig
+}
+
+// KVConfig holds the parameters that (together with a BaseConfig) allow setting
+// up a KV server.
+type KVConfig struct {
 	base.RaftConfig
-
-	// LeaseManagerConfig holds configuration values specific to the LeaseManager.
-	LeaseManagerConfig *base.LeaseManagerConfig
-
-	// Unix socket: for postgres only.
-	SocketFile string
 
 	// Stores is specified to enable durable key-value storage.
 	Stores base.StoreSpecList
-
-	// TempStorageConfig is used to configure temp storage, which stores
-	// ephemeral data when processing large queries.
-	TempStorageConfig base.TempStorageConfig
 
 	// Attrs specifies a colon-separated list of node topography or machine
 	// capabilities, used to match capabilities or location preferences specified
 	// in zone configs.
 	Attrs string
 
-	// JoinList is a list of node addresses that act as bootstrap hosts for
-	// connecting to the gossip network. Each item in the list can actually be
-	// multiple comma-separated addresses, kept for backward-compatibility.
+	// JoinList is a list of node addresses that is used to form a network of KV
+	// servers. Assuming a connected graph, it suffices to initialize any server
+	// in the network.
 	JoinList base.JoinListType
 
+	// JoinPreferSRVRecords, if set, causes the lookup logic for the
+	// names in JoinList to prefer SRV records from DNS, if available,
+	// to A/AAAA records.
+	JoinPreferSRVRecords bool
+
 	// RetryOptions controls the retry behavior of the server.
+	//
+	// TODO(tbg): this is only ever used in one test. Make it a testing knob.
 	RetryOptions retry.Options
 
 	// CacheSize is the amount of memory in bytes to use for caching data.
@@ -159,23 +203,6 @@ type Config struct {
 	// server.
 	TimeSeriesServerConfig ts.ServerConfig
 
-	// SQLMemoryPoolSize is the amount of memory in bytes that can be
-	// used by SQL clients to store row data in server RAM.
-	SQLMemoryPoolSize int64
-
-	// SQLAuditLogDirName is the target directory name for SQL audit logs.
-	SQLAuditLogDirName *log.DirName
-
-	// SQLTableStatCacheSize is the size (number of tables) of the table
-	// statistics cache.
-	SQLTableStatCacheSize int
-
-	// SQLQueryCacheSize is the memory size (in bytes) of the query plan cache.
-	SQLQueryCacheSize int
-
-	// HeapProfileDirName is the directory name for heap profiles using
-	// heapprofiler.
-	HeapProfileDirName string
 	// Parsed values.
 
 	// NodeAttributes is the parsed representation of Attrs.
@@ -194,18 +221,6 @@ type Config struct {
 	// Environment Variable: COCKROACH_EXPERIMENTAL_LINEARIZABLE
 	Linearizable bool
 
-	// Maximum allowed clock offset for the cluster. If observed clock
-	// offsets exceed this limit, inconsistency may result, and servers
-	// will panic to minimize the likelihood of inconsistent data.
-	// Increasing this value will increase time to recovery after
-	// failures, and increase the frequency and impact of
-	// ReadWithinUncertaintyIntervalError.
-	MaxOffset MaxOffsetType
-
-	// TimestampCachePageSize is the size in bytes of the pages in the
-	// timestamp cache held by each store.
-	TimestampCachePageSize uint32
-
 	// ScanInterval determines a duration during which each range should be
 	// visited approximately once by the range scanner. Set to 0 to disable.
 	// Environment Variable: COCKROACH_SCAN_INTERVAL
@@ -223,14 +238,10 @@ type Config struct {
 	// Environment Variable: COCKROACH_SCAN_MAX_IDLE_TIME
 	ScanMaxIdleTime time.Duration
 
-	// TestingKnobs is used for internal test controls only.
-	TestingKnobs base.TestingKnobs
-
-	// AmbientCtx is used to annotate contexts used inside the server.
-	AmbientCtx log.AmbientContext
-
-	// Locality is a description of the topography of the server.
-	Locality roachpb.Locality
+	// DefaultSystemZoneConfig is used to set the default system zone config
+	// inside the server. It can be overridden during tests by setting the
+	// DefaultSystemZoneConfigOverride server testing knob.
+	DefaultSystemZoneConfig zonepb.ZoneConfig
 
 	// LocalityAddresses contains private IP addresses the can only be accessed
 	// in the corresponding locality.
@@ -243,10 +254,14 @@ type Config struct {
 	EventLogEnabled bool
 
 	// ReadyFn is called when the server has started listening on its
-	// sockets. The boolean argument indicates (iff true) that the
-	// server is not bootstrapped yet, will not bootstrap itself and
-	// will be waiting for an `init` command. This can be used to inform
-	// the user.
+	// sockets.
+	//
+	// The bool parameter is true if the server is not bootstrapped yet, will not
+	// bootstrap itself and will be waiting for an `init` command or accept
+	// bootstrapping from a joined node.
+	//
+	// This method is invoked from the main start goroutine, so it should not
+	// do nontrivial work.
 	ReadyFn func(waitForInit bool)
 
 	// DelayedBootstrapFn is called if the boostrap process does not complete
@@ -260,31 +275,83 @@ type Config struct {
 	enginesCreated bool
 }
 
-// HistogramWindowInterval is used to determine the approximate length of time
-// that individual samples are retained in in-memory histograms. Currently,
-// it is set to the arbitrary length of six times the Metrics sample interval.
-//
-// The length of the window must be longer than the sampling interval due to
-// issue #12998, which was causing histograms to return zero values when sampled
-// because all samples had been evicted.
-//
-// Note that this is only intended to be a temporary fix for the above issue,
-// as our current handling of metric histograms have numerous additional
-// problems. These are tracked in github issue #7896, which has been given
-// a relatively high priority in light of recent confusion around histogram
-// metrics. For more information on the issues underlying our histogram system
-// and the proposed fixes, please see issue #7896.
-func (cfg Config) HistogramWindowInterval() time.Duration {
-	hwi := DefaultHistogramWindowInterval
-
-	// Rudimentary overflow detection; this can result if
-	// DefaultMetricsSampleInterval is set to an extremely large number, likely
-	// in the context of a test or an intentional attempt to disable metrics
-	// collection. Just return the default in this case.
-	if hwi < DefaultMetricsSampleInterval {
-		return DefaultMetricsSampleInterval
+// MakeKVConfig returns a KVConfig with default values.
+func MakeKVConfig(storeSpec base.StoreSpec) KVConfig {
+	disableWebLogin := envutil.EnvOrDefaultBool("COCKROACH_DISABLE_WEB_LOGIN", false)
+	kvCfg := KVConfig{
+		DefaultSystemZoneConfig:        zonepb.DefaultSystemZoneConfig(),
+		CacheSize:                      DefaultCacheSize,
+		ScanInterval:                   defaultScanInterval,
+		ScanMinIdleTime:                defaultScanMinIdleTime,
+		ScanMaxIdleTime:                defaultScanMaxIdleTime,
+		EventLogEnabled:                defaultEventLogEnabled,
+		EnableWebSessionAuthentication: !disableWebLogin,
+		Stores: base.StoreSpecList{
+			Specs: []base.StoreSpec{storeSpec},
+		},
 	}
-	return hwi
+	kvCfg.RaftConfig.SetDefaults()
+	return kvCfg
+}
+
+// SQLConfig holds the parameters that (together with a BaseConfig) allow
+// setting up a SQL server.
+type SQLConfig struct {
+	// The tenant that the SQL server runs on the behalf of.
+	TenantID roachpb.TenantID
+
+	// LeaseManagerConfig holds configuration values specific to the LeaseManager.
+	LeaseManagerConfig *base.LeaseManagerConfig
+
+	// SocketFile, if non-empty, sets up a TLS-free local listener using
+	// a unix datagram socket at the specified path.
+	SocketFile string
+
+	// TempStorageConfig is used to configure temp storage, which stores
+	// ephemeral data when processing large queries.
+	TempStorageConfig base.TempStorageConfig
+
+	// ExternalIODirConfig is used to configure external storage
+	// access (http://, nodelocal://, etc)
+	ExternalIODirConfig base.ExternalIODirConfig
+
+	// MemoryPoolSize is the amount of memory in bytes that can be
+	// used by SQL clients to store row data in server RAM.
+	MemoryPoolSize int64
+
+	// AuditLogDirName is the target directory name for SQL audit logs.
+	AuditLogDirName *log.DirName
+
+	// TableStatCacheSize is the size (number of tables) of the table
+	// statistics cache.
+	TableStatCacheSize int
+
+	// QueryCacheSize is the memory size (in bytes) of the query plan cache.
+	QueryCacheSize int64
+
+	// TenantKVAddrs are the entry points to the KV layer.
+	//
+	// Only applies when the SQL server is deployed individually.
+	TenantKVAddrs []string
+
+	// TenantIDCodecOverride overrides the tenant ID used to construct the SQL
+	// server's codec, but nothing else (e.g. its certs). Used for testing.
+	//
+	// Only applies when the SQL server is deployed individually.
+	TenantIDCodecOverride roachpb.TenantID
+}
+
+// MakeSQLConfig returns a SQLConfig with default values.
+func MakeSQLConfig(tenID roachpb.TenantID, tempStorageCfg base.TempStorageConfig) SQLConfig {
+	sqlCfg := SQLConfig{
+		TenantID:           tenID,
+		MemoryPoolSize:     defaultSQLMemoryPoolSize,
+		TableStatCacheSize: defaultSQLTableStatCacheSize,
+		QueryCacheSize:     defaultSQLQueryCacheSize,
+		TempStorageConfig:  tempStorageCfg,
+		LeaseManagerConfig: base.NewLeaseManagerConfig(),
+	}
+	return sqlCfg
 }
 
 // setOpenFileLimit sets the soft limit for open file descriptors to the hard
@@ -315,39 +382,24 @@ func SetOpenFileLimitForOneStore() (uint64, error) {
 	return setOpenFileLimit(1)
 }
 
-// MakeConfig returns a Context with default values.
+// MakeConfig returns a Config for the system tenant with default values.
 func MakeConfig(ctx context.Context, st *cluster.Settings) Config {
-	storeSpec, err := base.NewStoreSpec(defaultStorePath)
+	storeSpec, err := base.NewStoreSpec(DefaultStorePath)
 	if err != nil {
 		panic(err)
 	}
+	tempStorageCfg := base.TempStorageConfigFromEnv(
+		ctx, st, storeSpec, "" /* parentDir */, base.DefaultTempStorageMaxSizeBytes)
 
-	disableWebLogin := envutil.EnvOrDefaultBool("COCKROACH_DISABLE_WEB_LOGIN", false)
+	sqlCfg := MakeSQLConfig(roachpb.SystemTenantID, tempStorageCfg)
+	baseCfg := MakeBaseConfig(st)
+	kvCfg := MakeKVConfig(storeSpec)
 
 	cfg := Config{
-		Config:                         new(base.Config),
-		MaxOffset:                      MaxOffsetType(base.DefaultMaxClockOffset),
-		Settings:                       st,
-		CacheSize:                      DefaultCacheSize,
-		SQLMemoryPoolSize:              defaultSQLMemoryPoolSize,
-		SQLTableStatCacheSize:          defaultSQLTableStatCacheSize,
-		SQLQueryCacheSize:              defaultSQLQueryCacheSize,
-		ScanInterval:                   defaultScanInterval,
-		ScanMinIdleTime:                defaultScanMinIdleTime,
-		ScanMaxIdleTime:                defaultScanMaxIdleTime,
-		EventLogEnabled:                defaultEventLogEnabled,
-		EnableWebSessionAuthentication: !disableWebLogin,
-		Stores: base.StoreSpecList{
-			Specs: []base.StoreSpec{storeSpec},
-		},
-		TempStorageConfig: base.TempStorageConfigFromEnv(
-			ctx, st, storeSpec, "" /* parentDir */, base.DefaultTempStorageMaxSizeBytes, 0),
+		BaseConfig: baseCfg,
+		KVConfig:   kvCfg,
+		SQLConfig:  sqlCfg,
 	}
-	cfg.AmbientCtx.Tracer = st.Tracer
-
-	cfg.Config.InitDefaults()
-	cfg.RaftConfig.SetDefaults()
-	cfg.LeaseManagerConfig = base.NewLeaseManagerConfig()
 
 	return cfg
 }
@@ -359,7 +411,7 @@ func (cfg *Config) String() string {
 	w := tabwriter.NewWriter(&buf, 2, 1, 2, ' ', 0)
 	fmt.Fprintln(w, "max offset\t", cfg.MaxOffset)
 	fmt.Fprintln(w, "cache size\t", humanizeutil.IBytes(cfg.CacheSize))
-	fmt.Fprintln(w, "SQL memory pool size\t", humanizeutil.IBytes(cfg.SQLMemoryPoolSize))
+	fmt.Fprintln(w, "SQL memory pool size\t", humanizeutil.IBytes(cfg.MemoryPoolSize))
 	fmt.Fprintln(w, "scan interval\t", cfg.ScanInterval)
 	fmt.Fprintln(w, "scan min idle time\t", cfg.ScanMinIdleTime)
 	fmt.Fprintln(w, "scan max idle time\t", cfg.ScanMaxIdleTime)
@@ -380,11 +432,11 @@ func (cfg *Config) Report(ctx context.Context) {
 	} else {
 		log.Infof(ctx, "system total memory: %s", humanizeutil.IBytes(memSize))
 	}
-	log.Info(ctx, "server configuration:\n", cfg)
+	log.Infof(ctx, "server configuration:\n%s", cfg)
 }
 
 // Engines is a container of engines, allowing convenient closing.
-type Engines []engine.Engine
+type Engines []storage.Engine
 
 // Close closes all the Engines.
 // This method has a pointer receiver so that the following pattern works:
@@ -411,12 +463,9 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 		return Engines{}, errors.Errorf("engines already created")
 	}
 	cfg.enginesCreated = true
-
-	var details []string
-
-	details = append(details, fmt.Sprintf("RocksDB cache size: %s", humanizeutil.IBytes(cfg.CacheSize)))
-	cache := engine.NewRocksDBCache(cfg.CacheSize)
-	defer cache.Release()
+	details := []string{fmt.Sprintf("Pebble cache size: %s", humanizeutil.IBytes(cfg.CacheSize))}
+	pebbleCache := pebble.NewCache(cfg.CacheSize)
+	defer pebbleCache.Unref()
 
 	var physicalStores int
 	for _, spec := range cfg.Stores.Specs {
@@ -432,7 +481,7 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 	log.Event(ctx, "initializing engines")
 
 	skipSizeCheck := cfg.TestingKnobs.Store != nil &&
-		cfg.TestingKnobs.Store.(*storage.StoreTestingKnobs).SkipMinSizeCheck
+		cfg.TestingKnobs.Store.(*kvserver.StoreTestingKnobs).SkipMinSizeCheck
 	for i, spec := range cfg.Stores.Specs {
 		log.Eventf(ctx, "initializing %+v", spec)
 		var sizeInBytes = spec.Size.InBytes
@@ -450,7 +499,15 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 			}
 			details = append(details, fmt.Sprintf("store %d: in-memory, size %s",
 				i, humanizeutil.IBytes(sizeInBytes)))
-			engines = append(engines, engine.NewInMem(spec.Attributes, sizeInBytes))
+			if spec.StickyInMemoryEngineID != "" {
+				e, err := getOrCreateStickyInMemEngine(ctx, spec.StickyInMemoryEngineID, spec.Attributes, sizeInBytes)
+				if err != nil {
+					return Engines{}, err
+				}
+				engines = append(engines, e)
+			} else {
+				engines = append(engines, storage.NewInMem(ctx, spec.Attributes, sizeInBytes))
+			}
 		} else {
 			if spec.Size.Percent > 0 {
 				fileSystemUsage := gosigar.FileSystemUsage{}
@@ -466,19 +523,32 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 
 			details = append(details, fmt.Sprintf("store %d: RocksDB, max size %s, max open file limit %d",
 				i, humanizeutil.IBytes(sizeInBytes), openFileLimitPerStore))
-			rocksDBConfig := engine.RocksDBConfig{
-				Attrs:                   spec.Attributes,
-				Dir:                     spec.Path,
-				MaxSizeBytes:            sizeInBytes,
-				MaxOpenFiles:            openFileLimitPerStore,
-				WarnLargeBatchThreshold: 500 * time.Millisecond,
-				Settings:                cfg.Settings,
-				UseFileRegistry:         spec.UseFileRegistry,
-				RocksDBOptions:          spec.RocksDBOptions,
-				ExtraOptions:            spec.ExtraOptions,
-			}
 
-			eng, err := engine.NewRocksDB(rocksDBConfig, cache)
+			storageConfig := base.StorageConfig{
+				Attrs:           spec.Attributes,
+				Dir:             spec.Path,
+				MaxSize:         sizeInBytes,
+				Settings:        cfg.Settings,
+				UseFileRegistry: spec.UseFileRegistry,
+				ExtraOptions:    spec.ExtraOptions,
+			}
+			pebbleConfig := storage.PebbleConfig{
+				StorageConfig: storageConfig,
+				Opts:          storage.DefaultPebbleOptions(),
+			}
+			pebbleConfig.Opts.Cache = pebbleCache
+			pebbleConfig.Opts.MaxOpenFiles = int(openFileLimitPerStore)
+			// If the spec contains Pebble options, set those too.
+			if len(spec.PebbleOptions) > 0 {
+				err := pebbleConfig.Opts.Parse(spec.PebbleOptions, &pebble.ParseHooks{})
+				if err != nil {
+					return nil, err
+				}
+			}
+			if len(spec.RocksDBOptions) > 0 {
+				return nil, errors.Errorf("store %d: using Pebble storage engine but StoreSpec provides RocksDB options", i)
+			}
+			eng, err := storage.NewPebble(ctx, pebbleConfig)
 			if err != nil {
 				return Engines{}, err
 			}
@@ -489,7 +559,7 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 	log.Infof(ctx, "%d storage engine%s initialized",
 		len(engines), util.Pluralize(int64(len(engines))))
 	for _, s := range details {
-		log.Info(ctx, s)
+		log.Infof(ctx, "%v", s)
 	}
 	enginesCopy := engines
 	engines = nil
@@ -498,18 +568,14 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 
 // InitNode parses node attributes and initializes the gossip bootstrap
 // resolvers.
-func (cfg *Config) InitNode() error {
+func (cfg *Config) InitNode(ctx context.Context) error {
 	cfg.readEnvironmentVariables()
 
 	// Initialize attributes.
 	cfg.NodeAttributes = parseAttributes(cfg.Attrs)
 
-	// Expose HistogramWindowInterval to parts of the code that can't import the
-	// server package. This code should be cleaned up within a month or two.
-	cfg.Config.HistogramWindowInterval = cfg.HistogramWindowInterval()
-
 	// Get the gossip bootstrap resolvers.
-	resolvers, err := cfg.parseGossipBootstrapResolvers()
+	resolvers, err := cfg.parseGossipBootstrapResolvers(ctx)
 	if err != nil {
 		return err
 	}
@@ -522,11 +588,13 @@ func (cfg *Config) InitNode() error {
 
 // FilterGossipBootstrapResolvers removes any gossip bootstrap resolvers which
 // match either this node's listen address or its advertised host address.
-func (cfg *Config) FilterGossipBootstrapResolvers(
-	ctx context.Context, listen, advert net.Addr,
-) []resolver.Resolver {
+func (cfg *Config) FilterGossipBootstrapResolvers(ctx context.Context) []resolver.Resolver {
+	var listen, advert net.Addr
+	listen = util.NewUnresolvedAddr("tcp", cfg.Addr)
+	advert = util.NewUnresolvedAddr("tcp", cfg.AdvertiseAddr)
 	filtered := make([]resolver.Resolver, 0, len(cfg.GossipBootstrapResolvers))
 	addrs := make([]string, 0, len(cfg.GossipBootstrapResolvers))
+
 	for _, r := range cfg.GossipBootstrapResolvers {
 		if r.Addr() == advert.String() || r.Addr() == listen.String() {
 			if log.V(1) {
@@ -560,20 +628,43 @@ func (cfg *Config) readEnvironmentVariables() {
 }
 
 // parseGossipBootstrapResolvers parses list of gossip bootstrap resolvers.
-func (cfg *Config) parseGossipBootstrapResolvers() ([]resolver.Resolver, error) {
+func (cfg *Config) parseGossipBootstrapResolvers(ctx context.Context) ([]resolver.Resolver, error) {
 	var bootstrapResolvers []resolver.Resolver
-	for _, commaSeparatedAddresses := range cfg.JoinList {
-		addresses := strings.Split(commaSeparatedAddresses, ",")
-		for _, address := range addresses {
-			if len(address) == 0 {
-				continue
-			}
-			resolver, err := resolver.NewResolver(address)
+	for _, address := range cfg.JoinList {
+		if cfg.JoinPreferSRVRecords {
+			// The following code substitutes the entry in --join by the
+			// result of SRV resolution, if suitable SRV records are found
+			// for that name.
+			//
+			// TODO(knz): Delay this lookup. The logic for "regular" resolvers
+			// is delayed until the point the connection is attempted, so that
+			// fresh DNS records are used for a new connection. This makes
+			// it possible to update DNS records without restarting the node.
+			// The SRV logic here does not have this property (yet).
+			srvAddrs, err := resolver.SRV(ctx, address)
 			if err != nil {
 				return nil, err
 			}
-			bootstrapResolvers = append(bootstrapResolvers, resolver)
+
+			if len(srvAddrs) > 0 {
+				for _, sa := range srvAddrs {
+					resolver, err := resolver.NewResolver(sa)
+					if err != nil {
+						return nil, err
+					}
+					bootstrapResolvers = append(bootstrapResolvers, resolver)
+				}
+
+				continue
+			}
 		}
+
+		// Otherwise, use the address.
+		resolver, err := resolver.NewResolver(address)
+		if err != nil {
+			return nil, err
+		}
+		bootstrapResolvers = append(bootstrapResolvers, resolver)
 	}
 
 	return bootstrapResolvers, nil

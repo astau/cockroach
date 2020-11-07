@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package ordering
 
@@ -24,9 +20,16 @@ import (
 func lookupOrIndexJoinCanProvideOrdering(
 	expr memo.RelExpr, required *physical.OrderingChoice,
 ) bool {
+	if lookupJoin, ok := expr.(*memo.LookupJoinExpr); ok && lookupJoin.IsSecondJoinInPairedJoiner {
+		// Can only pass through ordering if the ordering can be provided by the
+		// child, since we don't want a sort to be interposed between the child
+		// and this join.
+		return CanProvide(expr.Child(0).(memo.RelExpr), required)
+	}
 	// LookupJoin and IndexJoin can pass through their ordering if the ordering
 	// depends only on columns present in the input.
-	return isOrderingBoundBy(expr.Child(0).(memo.RelExpr), required)
+	inputCols := expr.Child(0).(memo.RelExpr).Relational().OutputCols
+	return required.CanProjectCols(inputCols)
 }
 
 func lookupOrIndexJoinBuildChildReqOrdering(
@@ -38,7 +41,16 @@ func lookupOrIndexJoinBuildChildReqOrdering(
 
 	// We may need to remove ordering columns that are not output by the input
 	// expression.
-	return projectOrderingToInput(parent.Child(0).(memo.RelExpr), required)
+	child := parent.Child(0).(memo.RelExpr)
+	res := projectOrderingToInput(child, required)
+	// It is in principle possible that the lookup join has an ON condition that
+	// forces an equality on two columns in the input. In this case we need to
+	// trim the column groups to keep the ordering valid w.r.t the child FDs
+	// (similar to Select).
+	//
+	// This case indicates that we didn't do a good job pushing down equalities
+	// (see #36219), but it should be handled correctly here nevertheless.
+	return trimColumnGroups(&res, &child.Relational().FuncDeps)
 }
 
 func indexJoinBuildProvided(expr memo.RelExpr, required *physical.OrderingChoice) opt.Ordering {
@@ -59,7 +71,7 @@ func lookupJoinBuildProvided(expr memo.RelExpr, required *physical.OrderingChoic
 	// First check if we need to.
 	needsRemap := false
 	for i := range childProvided {
-		if !lookupJoin.Cols.Contains(int(childProvided[i].ID())) {
+		if !lookupJoin.Cols.Contains(childProvided[i].ID()) {
 			needsRemap = true
 			break
 		}
@@ -79,7 +91,7 @@ func lookupJoinBuildProvided(expr memo.RelExpr, required *physical.OrderingChoic
 	md := lookupJoin.Memo().Metadata()
 	index := md.Table(lookupJoin.Table).Index(lookupJoin.Index)
 	for i, colID := range lookupJoin.KeyCols {
-		indexColID := lookupJoin.Table.ColumnID(index.Column(i).Ordinal)
+		indexColID := lookupJoin.Table.ColumnID(index.Column(i).Ordinal())
 		fds.AddEquivalency(colID, indexColID)
 	}
 

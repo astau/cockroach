@@ -1,4 +1,4 @@
-# LogicTest: local-opt
+# LogicTest: local
 
 # Use multiple column families.
 
@@ -17,46 +17,68 @@ CREATE TABLE t9 (
   CHECK (d IS NULL)
 )
 
-# TODO(andyk): Add optimizations to CBO to fetch only needed columns.
 # Only column families that are needed to validate check constraints are fetched.
-query TTTTT
-EXPLAIN (VERBOSE) UPDATE t9 SET b = 2 WHERE a = 5
+query T
+EXPLAIN (VERBOSE) UPDATE t9 SET b = b + 1 WHERE a = 5
 ----
-count                ·         ·             ()                         ·
- └── update          ·         ·             ()                         ·
-      │              table     t9            ·                          ·
-      │              set       b             ·                          ·
-      │              strategy  updater       ·                          ·
-      │              check 0   t9.a > t9.b   ·                          ·
-      │              check 1   t9.d IS NULL  ·                          ·
-      └── render     ·         ·             (a, b, c, d, e, column11)  ·
-           │         render 0  a             ·                          ·
-           │         render 1  b             ·                          ·
-           │         render 2  c             ·                          ·
-           │         render 3  d             ·                          ·
-           │         render 4  e             ·                          ·
-           │         render 5  2             ·                          ·
-           └── scan  ·         ·             (a, b, c, d, e)            ·
-·                    table     t9@primary    ·                          ·
-·                    spans     /5-/5/#       ·                          ·
+distribution: local
+vectorized: false
+·
+• update
+│ columns: ()
+│ estimated row count: 0 (missing stats)
+│ table: t9
+│ set: b
+│ auto commit
+│
+└── • render
+    │ columns: (a, b, b_new, check1)
+    │ estimated row count: 1 (missing stats)
+    │ render 0: a > b_new
+    │ render 1: a
+    │ render 2: b
+    │ render 3: b_new
+    │
+    └── • render
+        │ columns: (b_new, a, b)
+        │ estimated row count: 1 (missing stats)
+        │ render 0: b + 1
+        │ render 1: a
+        │ render 2: b
+        │
+        └── • scan
+              columns: (a, b)
+              estimated row count: 1 (missing stats)
+              table: t9@primary
+              spans: /5/0-/5/1/2
 
-query TTTTT
+query T
 EXPLAIN (VERBOSE) UPDATE t9 SET a = 2 WHERE a = 5
 ----
-count                ·         ·             ()                         ·
- └── update          ·         ·             ()                         ·
-      │              table     t9            ·                          ·
-      │              set       a             ·                          ·
-      │              strategy  updater       ·                          ·
-      │              check 0   t9.a > t9.b   ·                          ·
-      │              check 1   t9.d IS NULL  ·                          ·
-      └── render     ·         ·             (a, b, c, d, e, column11)  ·
-           │         render 0  a             ·                          ·
-           │         render 1  b             ·                          ·
-           │         render 2  c             ·                          ·
-           │         render 3  d             ·                          ·
-           │         render 4  e             ·                          ·
-           │         render 5  2             ·                          ·
-           └── scan  ·         ·             (a, b, c, d, e)            ·
-·                    table     t9@primary    ·                          ·
-·                    spans     /5-/5/#       ·                          ·
+distribution: local
+vectorized: false
+·
+• update
+│ columns: ()
+│ estimated row count: 0 (missing stats)
+│ table: t9
+│ set: a
+│ auto commit
+│
+└── • render
+    │ columns: (a, b, c, d, e, a_new, check1)
+    │ estimated row count: 1 (missing stats)
+    │ render 0: b < 2
+    │ render 1: 2
+    │ render 2: a
+    │ render 3: b
+    │ render 4: c
+    │ render 5: d
+    │ render 6: e
+    │
+    └── • scan
+          columns: (a, b, c, d, e)
+          estimated row count: 1 (missing stats)
+          table: t9@primary
+          spans: /5-/5/#
+          locking strength: for update

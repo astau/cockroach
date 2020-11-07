@@ -1,22 +1,19 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 import _ from "lodash";
 import React from "react";
 import { createSelector } from "reselect";
 import { connect } from "react-redux";
 import Helmet from "react-helmet";
+import { withRouter } from "react-router-dom";
 
 import Loading from "src/views/shared/components/loading";
 import { ToolTipWrapper } from "src/views/shared/components/toolTip";
@@ -61,7 +58,7 @@ class DataDistribution extends React.Component<DataDistributionProps> {
       <div className="zone-config-list">
         <ul>
           {this.props.sortedZoneConfigs.map((zoneConfig) => (
-            <li key={zoneConfig.zone_name} className="zone-config">
+            <li key={zoneConfig.target} className="zone-config">
               <pre className="zone-config__raw-sql">
                 {zoneConfig.config_sql}
               </pre>
@@ -113,7 +110,7 @@ class DataDistribution extends React.Component<DataDistributionProps> {
     return (
       <div className="data-distribution">
         <div className="data-distribution__zone-config-sidebar">
-          <h2>
+          <h2 className="base-heading">
             Zone Configs{" "}
             <div className="section-heading__tooltip">
               <ToolTipWrapper text={ZONE_CONFIG_TEXT}>
@@ -152,7 +149,7 @@ interface DataDistributionPageProps {
   refreshLiveness: typeof refreshLiveness;
 }
 
-class DataDistributionPage extends React.Component<DataDistributionPageProps> {
+export class DataDistributionPage extends React.Component<DataDistributionPageProps> {
 
   componentDidMount() {
     this.props.refreshDataDistribution();
@@ -160,7 +157,7 @@ class DataDistributionPage extends React.Component<DataDistributionPageProps> {
     this.props.refreshLiveness();
   }
 
-  componentWillReceiveProps() {
+  componentDidUpdate() {
     this.props.refreshDataDistribution();
     this.props.refreshNodes();
     this.props.refreshLiveness();
@@ -169,11 +166,9 @@ class DataDistributionPage extends React.Component<DataDistributionPageProps> {
   render() {
     return (
       <div>
-        <Helmet>
-          <title>Data Distribution</title>
-        </Helmet>
+        <Helmet title="Data Distribution" />
         <section className="section">
-          <h1>Data Distribution</h1>
+          <h1 className="base-heading">Data Distribution</h1>
         </section>
         <section className="section">
           <Loading
@@ -199,7 +194,7 @@ const sortedZoneConfigs = createSelector(
     if (!dataDistributionState.data) {
       return null;
     }
-    return _.sortBy(dataDistributionState.data.zone_configs, (zc) => zc.zone_name);
+    return _.sortBy(dataDistributionState.data.zone_configs, (zc) => zc.target);
   },
 );
 
@@ -210,7 +205,7 @@ const localityTreeErrors = createSelector(
 );
 
 // tslint:disable-next-line:variable-name
-const DataDistributionPageConnected = connect(
+const DataDistributionPageConnected = withRouter(connect(
   (state: AdminUIState) => ({
     dataDistribution: state.cachedData.dataDistribution,
     sortedZoneConfigs: sortedZoneConfigs(state),
@@ -222,7 +217,7 @@ const DataDistributionPageConnected = connect(
     refreshNodes,
     refreshLiveness,
   },
-)(DataDistributionPage);
+)(DataDistributionPage));
 
 export default DataDistributionPageConnected;
 

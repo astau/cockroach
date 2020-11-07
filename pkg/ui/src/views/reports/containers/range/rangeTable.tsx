@@ -1,26 +1,22 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 import classNames from "classnames";
 import _ from "lodash";
 import Long from "long";
 import moment from "moment";
 import React from "react";
-
 import * as protos from "src/js/protos";
+import { cockroach } from "src/js/protos";
+import { LongToMoment, NanoToMilli, SecondsToNano } from "src/util/convert";
 import { FixLong } from "src/util/fixLong";
-import { LongToMoment, NanoToMilli } from "src/util/convert";
 import { Bytes } from "src/util/format";
 import Lease from "src/views/reports/containers/range/lease";
 import Print from "src/views/reports/containers/range/print";
@@ -78,8 +74,11 @@ const rangeTableDisplayList: RangeTableRow[] = [
   { variable: "truncatedIndex", display: "Truncated Index", compareToLeader: true },
   { variable: "truncatedTerm", display: "Truncated Term", compareToLeader: true },
   { variable: "mvccLastUpdate", display: "MVCC Last Update", compareToLeader: true },
-  { variable: "mvccIntentAge", display: "MVCC Intent Age", compareToLeader: true },
-  { variable: "mvccGGBytesAge", display: "MVCC GG Bytes Age", compareToLeader: true },
+  { variable: "GCAvgAge", display: "Dead Value average age", compareToLeader: true},
+  { variable: "GCBytesAge", display: "GC Bytes Age (score)", compareToLeader: true},
+  { variable: "NumIntents", display: "Intents", compareToLeader: true},
+  { variable: "IntentAvgAge", display: "Intent Average Age", compareToLeader: true},
+  { variable: "IntentAge", display: "Intent Age (score)", compareToLeader: true },
   { variable: "mvccLiveBytesCount", display: "MVCC Live Bytes/Count", compareToLeader: true },
   { variable: "mvccKeyBytesCount", display: "MVCC Key Bytes/Count", compareToLeader: true },
   { variable: "mvccValueBytesCount", display: "MVCC Value Bytes/Count", compareToLeader: true },
@@ -104,8 +103,8 @@ const rangeTableQuiescent: RangeTableCellContent = {
   className: ["range-table__cell--quiescent"],
 };
 
-function convertLeaseState(leaseState: protos.cockroach.storage.LeaseState) {
-  return protos.cockroach.storage.LeaseState[leaseState].toLowerCase();
+function convertLeaseState(leaseState: protos.cockroach.kv.kvserver.storagepb.LeaseState) {
+  return protos.cockroach.kv.kvserver.storagepb.LeaseState[leaseState].toLowerCase();
 }
 
 export default class RangeTable extends React.Component<RangeTableProps, {}> {
@@ -153,12 +152,44 @@ export default class RangeTable extends React.Component<RangeTableProps, {}> {
     };
   }
 
-  contentBytes(bytes: Long): RangeTableCellContent {
+  contentBytes(bytes: Long, className: string = null, toolTip: string = null): RangeTableCellContent {
     const humanized = Bytes(bytes.toNumber());
+    if (_.isNull(className)) {
+      return {
+        value: [humanized],
+        title: [humanized, bytes.toString()],
+      };
+    }
     return {
       value: [humanized],
-      title: [humanized, bytes.toString()],
+      title: [humanized, bytes.toString(), toolTip],
+      className: [className],
     };
+  }
+
+  contentGCAvgAge(mvcc: cockroach.storage.enginepb.IMVCCStats): RangeTableCellContent {
+    if (mvcc === null) {
+      return this.contentDuration(Long.fromNumber(0));
+    }
+    const deadBytes = mvcc.key_bytes.add(mvcc.val_bytes).sub(mvcc.live_bytes);
+    if (!deadBytes.eq(0)) {
+      const avgDeadByteAgeSec = mvcc.gc_bytes_age.div(deadBytes);
+      return this.contentDuration(Long.fromNumber(SecondsToNano(avgDeadByteAgeSec.toNumber())));
+    } else {
+      return this.contentDuration(Long.fromNumber(0));
+    }
+  }
+
+  createContentIntentAvgAge(mvcc: cockroach.storage.enginepb.IMVCCStats): RangeTableCellContent {
+    if (mvcc === null) {
+      return this.contentDuration(Long.fromNumber(0));
+    }
+    if (!mvcc.intent_count.eq(0)) {
+      const avgIntentAgeSec = mvcc.intent_age.div(mvcc.intent_count);
+      return this.contentDuration(Long.fromNumber(SecondsToNano(avgIntentAgeSec.toNumber())));
+    } else {
+      return this.contentDuration(Long.fromNumber(0));
+    }
   }
 
   createContent(value: string | Long | number, className: string = null): RangeTableCellContent {
@@ -215,6 +246,9 @@ export default class RangeTable extends React.Component<RangeTableProps, {}> {
     }
     if (problems.underreplicated) {
       results = _.concat(results, "Underreplicated (or slow)");
+    }
+    if (problems.overreplicated) {
+      results = _.concat(results, "Overreplicated");
     }
     if (problems.no_raft_leader) {
       results = _.concat(results, "No Raft Leader");
@@ -399,9 +433,10 @@ export default class RangeTable extends React.Component<RangeTableProps, {}> {
     const { infos, replicas } = this.props;
     const leader = _.head(infos);
     const rangeID = leader.state.state.desc.range_id;
+    const data = _.chain(infos);
 
     // We want to display ordered by store ID.
-    const sortedStoreIDs = _.chain(infos)
+    const sortedStoreIDs = data
       .map(info => info.source_store_id)
       .sortBy(id => id)
       .value();
@@ -427,7 +462,7 @@ export default class RangeTable extends React.Component<RangeTableProps, {}> {
       } else {
         leaseState = this.createContent(
           convertLeaseState(info.lease_status.state),
-          info.lease_status.state === protos.cockroach.storage.LeaseState.VALID ? "" :
+          info.lease_status.state === protos.cockroach.kv.kvserver.storagepb.LeaseState.VALID ? "" :
             "range-table__cell--warning",
         );
       }
@@ -470,7 +505,14 @@ export default class RangeTable extends React.Component<RangeTableProps, {}> {
         applied: this.contentIf(!dormant, () => this.createContent(FixLong(info.raft_state.applied))),
         commit: this.contentIf(!dormant, () => this.createContent(FixLong(info.raft_state.hard_state.commit))),
         lastIndex: this.createContent(FixLong(info.state.last_index)),
-        logSize: this.contentBytes(FixLong(info.state.raft_log_size)),
+        logSize: this.contentBytes(
+          FixLong(info.state.raft_log_size),
+          info.state.raft_log_size_trusted ? "" : "range-table__cell--dormant",
+          "Log size is known to not be correct. This isn't an error condition. " +
+            "The log size will became exact the next time it is recomputed. " +
+            "This replica does not perform log truncation (because the log might already " +
+            "be truncated sufficiently).",
+        ),
         leaseHolderQPS: leaseHolder ? this.createContent(info.stats.queries_per_second.toFixed(4)) : rangeTableEmptyContent,
         keysWrittenPS: this.createContent(info.stats.writes_per_second.toFixed(4)),
         approxProposalQuota: raftLeader ? this.createContent(FixLong(info.state.approximate_proposal_quota)) : rangeTableEmptyContent,
@@ -482,14 +524,21 @@ export default class RangeTable extends React.Component<RangeTableProps, {}> {
         truncatedIndex: this.createContent(FixLong(info.state.state.truncated_state.index)),
         truncatedTerm: this.createContent(FixLong(info.state.state.truncated_state.term)),
         mvccLastUpdate: this.contentNanos(FixLong(mvcc.last_update_nanos)),
-        mvccIntentAge: this.contentDuration(FixLong(mvcc.intent_age)),
-        mvccGGBytesAge: this.contentDuration(FixLong(mvcc.gc_bytes_age)),
         mvccLiveBytesCount: this.contentMVCC(FixLong(mvcc.live_bytes), FixLong(mvcc.live_count)),
         mvccKeyBytesCount: this.contentMVCC(FixLong(mvcc.key_bytes), FixLong(mvcc.key_count)),
         mvccValueBytesCount: this.contentMVCC(FixLong(mvcc.val_bytes), FixLong(mvcc.val_count)),
         mvccIntentBytesCount: this.contentMVCC(FixLong(mvcc.intent_bytes), FixLong(mvcc.intent_count)),
         mvccSystemBytesCount: this.contentMVCC(FixLong(mvcc.sys_bytes), FixLong(mvcc.sys_count)),
         rangeMaxBytes: this.contentBytes(FixLong(info.state.range_max_bytes)),
+        mvccIntentAge: this.contentDuration(FixLong(mvcc.intent_age)),
+
+        GCAvgAge: this.contentGCAvgAge(mvcc),
+        GCBytesAge: this.createContent(FixLong(mvcc.gc_bytes_age)),
+
+        NumIntents: this.createContent(FixLong(mvcc.intent_count)),
+        IntentAvgAge: this.createContentIntentAvgAge(mvcc),
+        IntentAge: this.createContent(FixLong(mvcc.intent_age)),
+
         writeLatches: this.contentLatchInfo(
           FixLong(info.latches_local.write_count),
           FixLong(info.latches_global.write_count),
@@ -503,13 +552,13 @@ export default class RangeTable extends React.Component<RangeTableProps, {}> {
       });
     });
 
-    const leaderReplicaIDs = new Set(_.map(leader.state.state.desc.replicas, rep => rep.replica_id));
+    const leaderReplicaIDs = new Set(_.map(leader.state.state.desc.internal_replicas, rep => rep.replica_id));
 
     // Go through all the replicas and add them to map for easy printing.
     const replicasByReplicaIDByStoreID: Map<number, Map<number, protos.cockroach.roachpb.IReplicaDescriptor>> = new Map();
     _.forEach(infos, info => {
       const replicasByReplicaID: Map<number, protos.cockroach.roachpb.IReplicaDescriptor> = new Map();
-      _.forEach(info.state.state.desc.replicas, rep => {
+      _.forEach(info.state.state.desc.internal_replicas, rep => {
         replicasByReplicaID.set(rep.replica_id, rep);
       });
       replicasByReplicaIDByStoreID.set(info.source_store_id, replicasByReplicaID);
@@ -517,7 +566,7 @@ export default class RangeTable extends React.Component<RangeTableProps, {}> {
 
     return (
       <div>
-        <h2>Range r{rangeID.toString()} at {Print.Time(moment().utc())} UTC</h2>
+        <h2 className="base-heading">Range r{rangeID.toString()} at {Print.Time(moment().utc())} UTC</h2>
         <table className="range-table">
           <tbody>
             {

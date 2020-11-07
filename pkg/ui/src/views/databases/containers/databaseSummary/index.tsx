@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 import _ from "lodash";
 import React from "react";
@@ -18,7 +14,7 @@ import React from "react";
 import * as protos from "src/js/protos";
 
 import { AdminUIState } from "src/redux/state";
-import { refreshDatabaseDetails, refreshTableDetails, refreshTableStats, generateTableID} from "src/redux/apiReducers";
+import { refreshDatabaseDetails, refreshTableDetails, refreshTableStats, generateTableID, KeyedCachedDataReducerState} from "src/redux/apiReducers";
 
 import { SortSetting } from "src/views/shared/components/sortabletable";
 
@@ -28,6 +24,7 @@ import { TableInfo } from "src/views/databases/data/tableInfo";
 // on a DatabaseSummary component.
 export interface DatabaseSummaryExplicitData {
   name: string;
+  updateOnLoad?: boolean;
 }
 
 // DatabaseSummaryConnectedData describes properties which are applied to a
@@ -35,7 +32,7 @@ export interface DatabaseSummaryExplicitData {
 interface DatabaseSummaryConnectedData {
   sortSetting: SortSetting;
   tableInfos: TableInfo[];
-  dbResponse: protos.cockroach.server.serverpb.DatabaseDetailsResponse;
+  dbResponse: KeyedCachedDataReducerState<protos.cockroach.server.serverpb.DatabaseDetailsResponse>;
   grants: protos.cockroach.server.serverpb.DatabaseDetailsResponse.Grant[];
 }
 
@@ -48,45 +45,53 @@ interface DatabaseSummaryActions {
   refreshTableStats: typeof refreshTableStats;
 }
 
-type DatabaseSummaryProps = DatabaseSummaryExplicitData & DatabaseSummaryConnectedData & DatabaseSummaryActions;
+export type DatabaseSummaryProps = DatabaseSummaryExplicitData & DatabaseSummaryConnectedData & DatabaseSummaryActions;
+
+interface DatabaseSummaryState {
+  finishedLoadingTableData: boolean;
+}
 
 // DatabaseSummaryBase implements common lifecycle methods for DatabaseSummary
 // components, which differ primarily by their render() method.
 // TODO(mrtracy): We need to find a better abstraction for the common
 // "refresh-on-mount-or-receiveProps" we have in many of our connected
 // components; that would allow us to avoid this inheritance.
-export class DatabaseSummaryBase extends React.Component<DatabaseSummaryProps, {}> {
+export class DatabaseSummaryBase extends React.Component<DatabaseSummaryProps, DatabaseSummaryState> {
   // loadTableDetails loads data for each table which have no info in the store.
   // TODO(mrtracy): Should this be refreshing data always? Not sure if there
   // is a performance concern with invalidation periods.
-  loadTableDetails(props = this.props) {
+  async loadTableDetails(props = this.props) {
     if (props.tableInfos && props.tableInfos.length > 0) {
-      _.each(props.tableInfos, (tblInfo) => {
-        if (_.isUndefined(tblInfo.numColumns)) {
-          props.refreshTableDetails(new protos.cockroach.server.serverpb.TableDetailsRequest({
+      for (const tblInfo of props.tableInfos) {
+        // TODO(davidh): this is a stopgap inserted to deal with DBs containing hundreds of tables
+        await Promise.all([
+        _.isUndefined(tblInfo.numColumns) ? props.refreshTableDetails(new protos.cockroach.server.serverpb.TableDetailsRequest({
             database: props.name,
             table: tblInfo.name,
-          }));
-        }
-        if (_.isUndefined(tblInfo.physicalSize)) {
-          props.refreshTableStats(new protos.cockroach.server.serverpb.TableStatsRequest({
+          })) : null,
+        _.isUndefined(tblInfo.physicalSize) ? props.refreshTableStats(new protos.cockroach.server.serverpb.TableStatsRequest({
             database: props.name,
             table: tblInfo.name,
-          }));
-        }
-      });
+          })) : null,
+        ]);
+      }
     }
+    this.setState({finishedLoadingTableData: true});
   }
 
   // Refresh when the component is mounted.
-  componentWillMount() {
+  async componentDidMount() {
     this.props.refreshDatabaseDetails(new protos.cockroach.server.serverpb.DatabaseDetailsRequest({ database: this.props.name }));
-    this.loadTableDetails();
+    if (this.props.updateOnLoad) {
+      await this.loadTableDetails();
+    }
   }
 
   // Refresh when the component receives properties.
-  componentWillReceiveProps(props: DatabaseSummaryProps) {
-    this.loadTableDetails(props);
+  async componentDidUpdate() {
+    if (this.props.updateOnLoad) {
+      await this.loadTableDetails(this.props);
+    }
   }
 
   render(): React.ReactElement<any> {

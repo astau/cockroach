@@ -1,20 +1,17 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package ledger
 
 import (
+	"context"
 	gosql "database/sql"
 	"hash/fnv"
 	"math/rand"
@@ -23,7 +20,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
+	"github.com/cockroachdb/errors"
 	"github.com/spf13/pflag"
 )
 
@@ -33,7 +31,6 @@ type ledger struct {
 
 	seed              int64
 	customers         int
-	parallelStmts     bool
 	interleaved       bool
 	inlineArgs        bool
 	splits            int
@@ -44,7 +41,7 @@ type ledger struct {
 	txs  []tx
 	deck []int // contains indexes into the txs slice
 
-	reg      *workload.HistogramRegistry
+	reg      *histogram.Registry
 	rngPool  *sync.Pool
 	hashPool *sync.Pool
 }
@@ -63,7 +60,6 @@ var ledgerMeta = workload.Meta{
 		g.connFlags = workload.NewConnFlags(&g.flags)
 		g.flags.Int64Var(&g.seed, `seed`, 1, `Random number generator seed`)
 		g.flags.IntVar(&g.customers, `customers`, 1000, `Number of customers`)
-		g.flags.BoolVar(&g.parallelStmts, `parallel-stmts`, false, `Use parallel statement execution`)
 		g.flags.BoolVar(&g.interleaved, `interleaved`, false, `Use interleaved tables`)
 		g.flags.BoolVar(&g.inlineArgs, `inline-args`, false, `Use inline query arguments`)
 		g.flags.IntVar(&g.splits, `splits`, 0, `Number of splits to perform before starting normal operations`)
@@ -74,6 +70,11 @@ var ledgerMeta = workload.Meta{
 			`Weights for the transaction mix.`)
 		return g
 	},
+}
+
+// FromFlags returns a new ledger Generator configured with the given flags.
+func FromFlags(flags ...string) workload.Generator {
+	return workload.FromFlags(ledgerMeta, flags...)
 }
 
 // Meta implements the Generator interface.
@@ -126,8 +127,9 @@ func (w *ledger) Tables() []workload.Table {
 	customer := workload.Table{
 		Name:   `customer`,
 		Schema: ledgerCustomerSchema,
-		InitialRows: workload.Tuples(
+		InitialRows: workload.TypedTuples(
 			w.customers,
+			ledgerCustomerTypes,
 			w.ledgerCustomerInitialRow,
 		),
 		Splits: workload.Tuples(
@@ -138,8 +140,9 @@ func (w *ledger) Tables() []workload.Table {
 	transaction := workload.Table{
 		Name:   `transaction`,
 		Schema: ledgerTransactionSchema,
-		InitialRows: workload.Tuples(
+		InitialRows: workload.TypedTuples(
 			numTxnsPerCustomer*w.customers,
+			ledgerTransactionColTypes,
 			w.ledgerTransactionInitialRow,
 		),
 		Splits: workload.Tuples(
@@ -177,7 +180,9 @@ func (w *ledger) Tables() []workload.Table {
 }
 
 // Ops implements the Opser interface.
-func (w *ledger) Ops(urls []string, reg *workload.HistogramRegistry) (workload.QueryLoad, error) {
+func (w *ledger) Ops(
+	ctx context.Context, urls []string, reg *histogram.Registry,
+) (workload.QueryLoad, error) {
 	sqlDatabase, err := workload.SanitizeUrls(w, w.connFlags.DBOverride, urls)
 	if err != nil {
 		return workload.QueryLoad{}, err

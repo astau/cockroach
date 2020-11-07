@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package ordering
 
@@ -21,7 +17,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
-	"github.com/cockroachdb/cockroach/pkg/util"
 )
 
 func TestTrimProvided(t *testing.T) {
@@ -59,7 +54,7 @@ func TestTrimProvided(t *testing.T) {
 	for tcIdx, tc := range testCases {
 		t.Run(fmt.Sprintf("case%d", tcIdx+1), func(t *testing.T) {
 			req := physical.ParseOrderingChoice(tc.req)
-			prov := parseOrdering(tc.prov)
+			prov := physical.ParseOrdering(tc.prov)
 			res := trimProvided(prov, &req, &tc.fds).String()
 			if res != tc.exp {
 				t.Errorf("expected %s, got %s", tc.exp, res)
@@ -70,8 +65,8 @@ func TestTrimProvided(t *testing.T) {
 
 func TestRemapProvided(t *testing.T) {
 	emptyFD, equivFD, constFD := testFDs()
-	c := func(cols ...int) opt.ColSet {
-		return util.MakeFastIntSet(cols...)
+	c := func(cols ...opt.ColumnID) opt.ColSet {
+		return opt.MakeColSet(cols...)
 	}
 	testCases := []struct {
 		prov string
@@ -112,27 +107,13 @@ func TestRemapProvided(t *testing.T) {
 	}
 	for tcIdx, tc := range testCases {
 		t.Run(fmt.Sprintf("case%d", tcIdx+1), func(t *testing.T) {
-			prov := parseOrdering(tc.prov)
+			prov := physical.ParseOrdering(tc.prov)
 			res := remapProvided(prov, &tc.fds, tc.cols).String()
 			if res != tc.exp {
 				t.Errorf("expected %s, got %s", tc.exp, res)
 			}
 		})
 	}
-}
-
-// parseOrdering parses a simple opt.Ordering.
-func parseOrdering(str string) opt.Ordering {
-	prov := physical.ParseOrderingChoice(str)
-	if !prov.Optional.Empty() {
-		panic(fmt.Sprintf("invalid ordering %s", str))
-	}
-	for i := range prov.Columns {
-		if prov.Columns[i].Group.Len() != 1 {
-			panic(fmt.Sprintf("invalid ordering %s", str))
-		}
-	}
-	return prov.ToOrdering()
 }
 
 // testFDs returns FDs that can be used for testing:
@@ -143,7 +124,7 @@ func testFDs() (emptyFD, equivFD, constFD props.FuncDepSet) {
 	equivFD.AddEquivalency(1, 2)
 	equivFD.AddEquivalency(3, 4)
 
-	constFD.AddConstants(util.MakeFastIntSet(1, 2))
+	constFD.AddConstants(opt.MakeColSet(1, 2))
 
 	return emptyFD, equivFD, constFD
 }

@@ -1,5 +1,3 @@
-# LogicTest: local local-opt fakedist fakedist-opt fakedist-metadata local-parallel-stmts
-
 ## json_typeof and jsonb_typeof
 
 query T
@@ -184,12 +182,17 @@ SELECT to_json(ARRAY[[1, 2], [3, 4]])
 query T
 SELECT to_json('2014-05-28 12:22:35.614298'::TIMESTAMP)
 ----
-"2014-05-28 12:22:35.614298+00:00"
+"2014-05-28T12:22:35.614298"
 
 query T
 SELECT to_json('2014-05-28 12:22:35.614298-04'::TIMESTAMPTZ)
 ----
-"2014-05-28 12:22:35.614298-04:00"
+"2014-05-28T16:22:35.614298Z"
+
+query T
+SELECT to_json('2014-05-28 12:22:35.614298-04'::TIMESTAMP)
+----
+"2014-05-28T12:22:35.614298"
 
 query T
 SELECT to_json('2014-05-28'::DATE)
@@ -279,12 +282,17 @@ SELECT to_jsonb(ARRAY[[1, 2], [3, 4]])
 query T
 SELECT to_jsonb('2014-05-28 12:22:35.614298'::TIMESTAMP)
 ----
-"2014-05-28 12:22:35.614298+00:00"
+"2014-05-28T12:22:35.614298"
 
 query T
 SELECT to_jsonb('2014-05-28 12:22:35.614298-04'::TIMESTAMPTZ)
 ----
-"2014-05-28 12:22:35.614298-04:00"
+"2014-05-28T16:22:35.614298Z"
+
+query T
+SELECT to_jsonb('2014-05-28 12:22:35.614298-04'::TIMESTAMP)
+----
+"2014-05-28T12:22:35.614298"
 
 query T
 SELECT to_jsonb('2014-05-28'::DATE)
@@ -306,25 +314,75 @@ SELECT to_jsonb((1, 2, 'hello', NULL, NULL))
 ----
 {"f1": 1, "f2": 2, "f3": "hello", "f4": null, "f5": null}
 
+query T
+SELECT to_json(x.*) FROM (VALUES (1,2)) AS x(a,b);
+----
+{"a": 1, "b": 2}
+
+query T
+SELECT to_json(x.*) FROM (VALUES (1,2)) AS x(a);
+----
+{"a": 1, "column2": 2}
+
+query T
+SELECT to_json(x.*) FROM (VALUES (1,2)) AS x(column2);
+----
+{"column2": 2}
+
+# Regression test for #39502.
+statement ok
+SELECT json_agg((3808362714,))
+
 ## json_array_elements and jsonb_array_elements
 
-query T
+query T colnames
 SELECT json_array_elements('[1, 2, 3]'::JSON)
 ----
+json_array_elements
 1
 2
 3
 
-query T
+query T colnames
+SELECT * FROM json_array_elements('[1, 2, 3]'::JSON)
+----
+value
+1
+2
+3
+
+query T colnames
 SELECT jsonb_array_elements('[1, 2, 3]'::JSON)
 ----
+jsonb_array_elements
 1
 2
 3
 
-query T
+query T colnames
+SELECT * FROM jsonb_array_elements('[1, 2, 3]'::JSON)
+----
+value
+1
+2
+3
+
+query T colnames
 SELECT json_array_elements('[1, true, null, "text", -1.234, {"2": 3, "4": "5"}, [1, 2, 3]]'::JSON)
 ----
+json_array_elements
+1
+true
+null
+"text"
+-1.234
+{"2": 3, "4": "5"}
+[1, 2, 3]
+
+query T colnames
+SELECT * FROM json_array_elements('[1, true, null, "text", -1.234, {"2": 3, "4": "5"}, [1, 2, 3]]'::JSON)
+----
+value
 1
 true
 null
@@ -347,16 +405,34 @@ SELECT jsonb_array_elements('{"1": 2}'::JSON)
 
 ## json_array_elements_text and jsonb_array_elements_text
 
-query T
+query T colnames
 SELECT json_array_elements_text('[1, 2, 3]'::JSON)
 ----
+json_array_elements_text
 1
 2
 3
 
-query T
+query T colnames
+SELECT * FROM json_array_elements_text('[1, 2, 3]'::JSON)
+----
+value
+1
+2
+3
+
+query T colnames
 SELECT json_array_elements_text('[1, 2, 3]'::JSON)
 ----
+json_array_elements_text
+1
+2
+3
+
+query T colnames
+SELECT * FROM json_array_elements_text('[1, 2, 3]'::JSON)
+----
+value
 1
 2
 3
@@ -407,9 +483,18 @@ SELECT json_object_keys('{"\"1\"": 2}'::JSON)
 "1"
 
 # Keys are sorted.
-query T
+query T colnames
 SELECT json_object_keys('{"a": 1, "1": 2, "3": {"4": 5, "6": 7}}'::JSON)
 ----
+json_object_keys
+1
+3
+a
+
+query T colnames
+SELECT * FROM json_object_keys('{"a": 1, "1": 2, "3": {"4": 5, "6": 7}}'::JSON)
+----
+json_object_keys
 1
 3
 a
@@ -433,9 +518,9 @@ SELECT json_build_object('a', 2, 'b', 4)
 {"a": 2, "b": 4}
 
 query T
-SELECT jsonb_build_object(true,'val',1, 0, 1.3, 2, date '2019-02-03' - date '2019-01-01', 4)
+SELECT jsonb_build_object(true,'val',1, 0, 1.3, 2, date '2019-02-03' - date '2019-01-01', 4, '2001-01-01 11:00+3'::timestamptz, '11:00+3'::timetz)
 ----
-{"1": 0, "1.3": 2, "33": 4, "true": "val"}
+{"1": 0, "1.3": 2, "2001-01-01 08:00:00+00:00": "11:00:00+03:00:00", "33": 4, "true": "val"}
 
 query T
 SELECT json_build_object('a',1,'b',1.2,'c',true,'d',null,'e','{"x": 3, "y": [1,2,3]}'::JSON)
@@ -470,6 +555,12 @@ SELECT json_build_object(json_object_keys('{"x":3, "y":4}'::JSON), 2)
 ----
 {"x": 2}
 {"y": 2}
+
+# Regression for panic when bit array is passed as argument.
+query T
+SELECT json_build_object('a', '0100110'::varbit)
+----
+{"a": "0100110"}
 
 # even number of arguments
 query error pq: json_build_object\(\): argument list must have even number of elements
@@ -572,6 +663,12 @@ query T
 SELECT jsonb_build_array(1, '1'::JSON, 1.2, NULL, ARRAY['x', 'y'])
 ----
 [1, 1, 1.2, null, ["x", "y"]]
+
+# Regression for #37318
+query T
+SELECT jsonb_build_array('+Inf'::FLOAT8, 'NaN'::FLOAT8)::STRING::JSONB
+----
+["Infinity", "NaN"]
 
 query error pq: json_object\(\): array must have even number of elements
 SELECT json_object('{a,b,c}'::TEXT[])
@@ -686,11 +783,21 @@ query error pq: cannot deconstruct a scalar
 SELECT json_each('null'::JSON)
 
 query TT
-SELECT * from json_each('{}') q
+SELECT * FROM json_each('{}') q
 ----
 
+query T colnames
+SELECT json_each('{"f1":[1,2,3],"f2":{"f3":1},"f4":null,"f5":99,"f6":"stringy"}')
+----
+json_each
+(f1,"[1, 2, 3]")
+(f2,"{""f3"": 1}")
+(f4,null)
+(f5,99)
+(f6,"""stringy""")
+
 query TT colnames
-SELECT * from json_each('{"f1":[1,2,3],"f2":{"f3":1},"f4":null,"f5":99,"f6":"stringy"}') q
+SELECT * FROM json_each('{"f1":[1,2,3],"f2":{"f3":1},"f4":null,"f5":99,"f6":"stringy"}') q
 ----
 key  value
 f1   [1, 2, 3]
@@ -706,11 +813,21 @@ query error pq: cannot deconstruct a scalar
 SELECT jsonb_each('null'::JSON)
 
 query TT
-SELECT * from jsonb_each('{}') q
+SELECT * FROM jsonb_each('{}') q
 ----
 
+query T colnames
+SELECT jsonb_each('{"f1":[1,2,3],"f2":{"f3":1},"f4":null,"f5":99,"f6":"stringy"}')
+----
+jsonb_each
+(f1,"[1, 2, 3]")
+(f2,"{""f3"": 1}")
+(f4,null)
+(f5,99)
+(f6,"""stringy""")
+
 query TT colnames
-SELECT * from jsonb_each('{"f1":[1,2,3],"f2":{"f3":1},"f4":null,"f5":99,"f6":"stringy"}') q
+SELECT * FROM jsonb_each('{"f1":[1,2,3],"f2":{"f3":1},"f4":null,"f5":99,"f6":"stringy"}') q
 ----
 key  value
 f1   [1, 2, 3]
@@ -726,15 +843,31 @@ query error pq: cannot deconstruct a scalar
 SELECT jsonb_each_text('null'::JSON)
 
 query TT
-SELECT * from jsonb_each_text('{}') q
+SELECT * FROM jsonb_each_text('{}') q
 ----
 
-query TT
-SELECT * from jsonb_each_text('{}') q
+query T colnames
+SELECT jsonb_each_text('{"f1":[1,2,3],"f2":{"f3":1},"f4":null,"f5":99,"f6":"stringy"}')
 ----
+jsonb_each_text
+(f1,"[1, 2, 3]")
+(f2,"{""f3"": 1}")
+(f4,)
+(f5,99)
+(f6,stringy)
+
+query T colnames
+SELECT jsonb_each_text('{"f1":[1,2,3],"f2":{"f3":1},"f4":null,"f5":99,"f6":"stringy"}') q
+----
+q
+(f1,"[1, 2, 3]")
+(f2,"{""f3"": 1}")
+(f4,)
+(f5,99)
+(f6,stringy)
 
 query TT colnames
-SELECT * from jsonb_each_text('{"f1":[1,2,3],"f2":{"f3":1},"f4":null,"f5":99,"f6":"stringy"}') q
+SELECT * FROM jsonb_each_text('{"f1":[1,2,3],"f2":{"f3":1},"f4":null,"f5":99,"f6":"stringy"}') q
 ----
 key  value
 f1   [1, 2, 3]
@@ -750,15 +883,35 @@ query error pq: cannot deconstruct a scalar
 SELECT json_each_text('null'::JSON)
 
 query TT
-SELECT * from json_each_text('{}') q
+SELECT * FROM json_each_text('{}') q
 ----
 
 query TT
-SELECT * from json_each_text('{}') q
+SELECT * FROM json_each_text('{}') q
 ----
 
+query T colnames
+SELECT json_each_text('{"f1":[1,2,3],"f2":{"f3":1},"f4":null,"f5":99,"f6":"stringy"}')
+----
+json_each_text
+(f1,"[1, 2, 3]")
+(f2,"{""f3"": 1}")
+(f4,)
+(f5,99)
+(f6,stringy)
+
+query T colnames
+SELECT json_each_text('{"f1":[1,2,3],"f2":{"f3":1},"f4":null,"f5":99,"f6":"stringy"}') q
+----
+q
+(f1,"[1, 2, 3]")
+(f2,"{""f3"": 1}")
+(f4,)
+(f5,99)
+(f6,stringy)
+
 query TT colnames
-SELECT * from json_each_text('{"f1":[1,2,3],"f2":{"f3":1},"f4":null,"f5":99,"f6":"stringy"}') q
+SELECT * FROM json_each_text('{"f1":[1,2,3],"f2":{"f3":1},"f4":null,"f5":99,"f6":"stringy"}') q
 ----
 key  value
 f1   [1, 2, 3]
@@ -974,3 +1127,44 @@ query I
 SELECT jsonb_array_length('[]')
 ----
 0
+
+query TTT
+SELECT row_to_json(row(1,'foo')), row_to_json(NULL), row_to_json(row())
+----
+{"f1": 1, "f2": "foo"}  NULL  {}
+
+
+# TODO(jordan,radu): this should also work without the .*.
+query T
+select row_to_json(t.*)
+from (
+  select 1 as a, 2 as b
+) t
+----
+{"a": 1, "b": 2}
+
+query T
+SELECT '["a", {"b":1}]'::jsonb #- '{1,b}'
+----
+["a", {}]
+
+query BBBBBBBB
+select
+       jsonb_exists_any('{"id":12,"name":"Michael","address": {"postcode":12,"state":"California"}}'::jsonb, array['id']),
+       jsonb_exists_any('{"id":12,"name":"Michael","address": {"postcode":12,"state":"California"}}'::jsonb->'address', array['state']),
+       jsonb_exists_any('{"id":12,"name":"Michael","address": {"postcode":12,"state":"California"}}'::jsonb, array[NULL,'id']),
+       jsonb_exists_any('{"id":12,"name":"Michael","address": {"postcode":12,"state":"California"}}'::jsonb, array[NULL,'ids']),
+       jsonb_exists_any('["a","b"]', array['a']),
+       jsonb_exists_any('["a", 10, 12]', '{"a"}'::text[]),
+       jsonb_exists_any('["a"]', '{"a"}'),
+       jsonb_exists_any('["a"]', '{}');
+----
+true	true	true	false	true	true	true	false
+
+query error pq: unknown signature: jsonb_exists_any\(jsonb, int\[\]\)
+select
+    jsonb_exists_any('{"id":12,"name":"Michael","address": {"postcode":12,"state":"California"}}'::jsonb, array[1]);
+
+query error pq: jsonb_exists_any\(\): could not parse "id" as type int: strconv\.ParseInt: parsing "id": invalid syntax
+select
+    jsonb_exists_any('{"id":12,"name":"Michael","address": {"postcode":12,"state":"California"}}'::jsonb, array['id',1]);

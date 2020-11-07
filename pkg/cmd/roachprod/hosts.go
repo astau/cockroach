@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -28,12 +23,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachprod/cloud"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachprod/config"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachprod/install"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
-func initHostDir() error {
+func initDirs() error {
 	hd := os.ExpandEnv(config.DefaultHostDir)
-	return os.MkdirAll(hd, 0755)
+	if err := os.MkdirAll(hd, 0755); err != nil {
+		return err
+	}
+	return os.MkdirAll(os.ExpandEnv(config.DefaultDebugDir), 0755)
 }
 
 func syncHosts(cloud *cloud.Cloud) error {
@@ -116,6 +114,8 @@ func loadClusters() error {
 		return err
 	}
 
+	debugDir := os.ExpandEnv(config.DefaultDebugDir)
+
 	for _, file := range files {
 		if !file.Mode().IsRegular() {
 			continue
@@ -132,7 +132,8 @@ func loadClusters() error {
 		lines := strings.Split(string(contents), "\n")
 
 		c := &install.SyncedCluster{
-			Name: file.Name(),
+			Name:     file.Name(),
+			DebugDir: debugDir,
 		}
 
 		for _, l := range lines {
@@ -159,6 +160,13 @@ func loadClusters() error {
 			} else {
 				return newInvalidHostsLineErr(l)
 			}
+			// NB: it turns out we do see empty hosts here if we are concurrently
+			// creating clusters and this sync is picking up a cluster that's not
+			// ready yet. See:
+			// https://github.com/cockroachdb/cockroach/issues/49542#issuecomment-634563130
+			// if n == "" {
+			// 	return newInvalidHostsLineErr(l)
+			// }
 
 			var locality string
 			if len(fields) > 0 {
@@ -180,6 +188,9 @@ func loadClusters() error {
 			c.Users = append(c.Users, u)
 			c.Localities = append(c.Localities, locality)
 			c.VPCs = append(c.VPCs, vpc)
+		}
+		if len(c.VMs) == 0 {
+			return errors.Errorf("found no VMs in %s", contents)
 		}
 		install.Clusters[file.Name()] = c
 	}

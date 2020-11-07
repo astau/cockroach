@@ -1,29 +1,27 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/opentracing/opentracing-go"
+	"github.com/cockroachdb/errors"
 )
 
 // explainDistSQLNode is a planNode that wraps a plan and returns
@@ -31,8 +29,8 @@ import (
 type explainDistSQLNode struct {
 	optColumnsSlot
 
-	plan          planNode
-	subqueryPlans []subquery
+	options *tree.ExplainOptions
+	plan    planComponents
 
 	stmtType tree.StatementType
 
@@ -40,10 +38,6 @@ type explainDistSQLNode struct {
 	// pointing to a visual query plan with statistics will be in the row
 	// returned by the node.
 	analyze bool
-
-	// optimizeSubqueries indicates whether to invoke optimizeSubquery and
-	// setUnlimited on the subqueries.
-	optimizeSubqueries bool
 
 	run explainDistSQLRun
 }
@@ -61,56 +55,67 @@ type explainDistSQLRun struct {
 	executedStatement bool
 }
 
-func (n *explainDistSQLNode) startExec(params runParams) error {
-	if n.analyze &&
-		(params.SessionData().DistSQLMode == sessiondata.DistSQLOff ||
-			params.SessionData().DistSQLMode == sessiondata.DistSQL2Dot0Off) {
-		return pgerror.NewErrorf(
-			pgerror.CodeObjectNotInPrerequisiteStateError,
-			"cannot run EXPLAIN ANALYZE while distsql is disabled",
-		)
+// distSQLExplainable is an interface used for local plan nodes that create
+// distributed jobs. The plan node should implement this interface so that
+// EXPLAIN (DISTSQL) will show the DistSQL plan instead of the local plan node.
+type distSQLExplainable interface {
+	// newPlanForExplainDistSQL returns the DistSQL physical plan that can be
+	// used by the explainDistSQLNode to generate flow specs (and run in the case
+	// of EXPLAIN ANALYZE).
+	newPlanForExplainDistSQL(*PlanningCtx, *DistSQLPlanner) (*PhysicalPlan, error)
+}
+
+// getPlanDistributionForExplainPurposes returns the PlanDistribution that plan
+// will have. It is similar to getPlanDistribution but also pays attention to
+// whether the logical plan will be handled as a distributed job. It should
+// *only* be used in EXPLAIN variants.
+func getPlanDistributionForExplainPurposes(
+	ctx context.Context,
+	p *planner,
+	nodeID *base.SQLIDContainer,
+	distSQLMode sessiondata.DistSQLExecMode,
+	plan planMaybePhysical,
+) physicalplan.PlanDistribution {
+	if plan.isPhysicalPlan() {
+		return plan.physPlan.Distribution
 	}
+	if _, ok := plan.planNode.(distSQLExplainable); ok {
+		// This is a special case for plans that will be actually distributed
+		// but are represented using local plan nodes (for example, "create
+		// statistics" is handled by the jobs framework which is responsible
+		// for setting up the correct DistSQL infrastructure).
+		return physicalplan.FullyDistributedPlan
+	}
+	return getPlanDistribution(ctx, p, nodeID, distSQLMode, plan)
+}
 
-	// Trigger limit propagation.
-	params.p.prepareForDistSQLSupportCheck()
-
+func (n *explainDistSQLNode) startExec(params runParams) error {
 	distSQLPlanner := params.extendedEvalCtx.DistSQLPlanner
-	recommendation, _ := distSQLPlanner.checkSupportForNode(n.plan)
-
-	planCtx := distSQLPlanner.NewPlanningCtx(params.ctx, params.extendedEvalCtx, params.p.txn)
-	planCtx.isLocal = !shouldDistributeGivenRecAndMode(recommendation, params.SessionData().DistSQLMode)
+	distribution := getPlanDistributionForExplainPurposes(
+		params.ctx, params.p, params.extendedEvalCtx.ExecCfg.NodeID,
+		params.extendedEvalCtx.SessionData.DistSQLMode, n.plan.main,
+	)
+	willDistribute := distribution.WillDistribute()
+	planCtx := distSQLPlanner.NewPlanningCtx(params.ctx, params.extendedEvalCtx, params.p, params.p.txn, willDistribute)
 	planCtx.ignoreClose = true
-	planCtx.planner = params.p
 	planCtx.stmtType = n.stmtType
+
+	if n.analyze && len(n.plan.cascades) > 0 {
+		return errors.New("running EXPLAIN ANALYZE (DISTSQL) on this query is " +
+			"unsupported because of the presence of cascades")
+	}
 
 	// In EXPLAIN ANALYZE mode, we need subqueries to be evaluated as normal.
 	// In EXPLAIN mode, we don't evaluate subqueries, and instead display their
 	// original text in the plan.
 	planCtx.noEvalSubqueries = !n.analyze
 
-	if n.analyze && len(n.subqueryPlans) > 0 {
+	if n.analyze && len(n.plan.subqueryPlans) > 0 {
 		outerSubqueries := planCtx.planner.curPlan.subqueryPlans
 		defer func() {
 			planCtx.planner.curPlan.subqueryPlans = outerSubqueries
 		}()
-		planCtx.planner.curPlan.subqueryPlans = n.subqueryPlans
-
-		if n.optimizeSubqueries {
-			// The sub-plan's subqueries have been captured local to the
-			// explainDistSQLNode node so that they would not be automatically
-			// started for execution by planTop.start(). But this also means
-			// they were not yet processed by makePlan()/optimizePlan(). Do it
-			// here.
-			for i := range n.subqueryPlans {
-				if err := params.p.optimizeSubquery(params.ctx, &n.subqueryPlans[i]); err != nil {
-					return err
-				}
-
-				// Trigger limit propagation. This would be done otherwise when
-				// starting the plan. However we do not want to start the plan.
-				params.p.setUnlimited(n.subqueryPlans[i].plan)
-			}
-		}
+		planCtx.planner.curPlan.subqueryPlans = n.plan.subqueryPlans
 
 		// Discard rows that are returned.
 		rw := newCallbackResultWriter(func(ctx context.Context, row tree.Datums) error {
@@ -122,23 +127,18 @@ func (n *explainDistSQLNode) startExec(params runParams) error {
 			rw,
 			tree.Rows,
 			execCfg.RangeDescriptorCache,
-			execCfg.LeaseHolderCache,
 			params.p.txn,
 			func(ts hlc.Timestamp) {
-				_ = execCfg.Clock.Update(ts)
+				execCfg.Clock.Update(ts)
 			},
 			params.extendedEvalCtx.Tracing,
 		)
 		if !distSQLPlanner.PlanAndRunSubqueries(
 			planCtx.ctx,
 			params.p,
-			func() *extendedEvalContext {
-				ret := *params.extendedEvalCtx
-				return &ret
-			},
-			n.subqueryPlans,
+			params.extendedEvalCtx.copy,
+			n.plan.subqueryPlans,
 			recv,
-			true,
 		) {
 			if err := rw.Err(); err != nil {
 				return err
@@ -147,46 +147,45 @@ func (n *explainDistSQLNode) startExec(params runParams) error {
 		}
 	}
 
-	plan, err := distSQLPlanner.createPlanForNode(planCtx, n.plan)
+	physPlan, err := newPhysPlanForExplainPurposes(planCtx, distSQLPlanner, n.plan.main)
 	if err != nil {
+		if len(n.plan.subqueryPlans) > 0 {
+			return errors.New("running EXPLAIN (DISTSQL) on this query is " +
+				"unsupported because of the presence of subqueries")
+		}
 		return err
 	}
-	distSQLPlanner.FinalizePlan(planCtx, &plan)
+	distSQLPlanner.FinalizePlan(planCtx, physPlan)
 
-	flows := plan.GenerateFlowSpecs(params.extendedEvalCtx.NodeID)
-	diagram, err := distsqlpb.GeneratePlanDiagram(flows)
-	if err != nil {
-		return err
-	}
-
+	var diagram execinfrapb.FlowDiagram
 	if n.analyze {
 		// TODO(andrei): We don't create a child span if the parent is already
 		// recording because we don't currently have a good way to ask for a
 		// separate recording for the child such that it's also guaranteed that we
 		// don't get a noopSpan.
-		var sp opentracing.Span
-		if parentSp := opentracing.SpanFromContext(params.ctx); parentSp != nil &&
-			!tracing.IsRecording(parentSp) {
+		var sp *tracing.Span
+		if parentSp := tracing.SpanFromContext(params.ctx); parentSp != nil &&
+			!parentSp.IsRecording() {
 			tracer := parentSp.Tracer()
 			sp = tracer.StartSpan(
-				"explain-distsql", tracing.Recordable,
-				opentracing.ChildOf(parentSp.Context()),
-				tracing.LogTagsFromCtx(params.ctx))
+				"explain-distsql", tracing.WithForceRealSpan(),
+				tracing.WithParent(parentSp),
+				tracing.WithCtxLogTags(params.ctx))
 		} else {
 			tracer := params.extendedEvalCtx.ExecCfg.AmbientCtx.Tracer
 			sp = tracer.StartSpan(
-				"explain-distsql", tracing.Recordable,
-				tracing.LogTagsFromCtx(params.ctx))
+				"explain-distsql", tracing.WithForceRealSpan(),
+				tracing.WithCtxLogTags(params.ctx))
 		}
-		tracing.StartRecording(sp, tracing.SnowballRecording)
-		ctx := opentracing.ContextWithSpan(params.ctx, sp)
+		sp.StartRecording(tracing.SnowballRecording)
+		ctx := tracing.ContextWithSpan(params.ctx, sp)
 		planCtx.ctx = ctx
 		// Make a copy of the evalContext with the recording span in it; we can't
 		// change the original.
-		newEvalCtx := *params.extendedEvalCtx
+		newEvalCtx := params.extendedEvalCtx.copy()
 		newEvalCtx.Context = ctx
 		newParams := params
-		newParams.extendedEvalCtx = &newEvalCtx
+		newParams.extendedEvalCtx = newEvalCtx
 
 		// Discard rows that are returned.
 		rw := newCallbackResultWriter(func(ctx context.Context, row tree.Datums) error {
@@ -199,26 +198,81 @@ func (n *explainDistSQLNode) startExec(params runParams) error {
 			rw,
 			stmtType,
 			execCfg.RangeDescriptorCache,
-			execCfg.LeaseHolderCache,
 			newParams.p.txn,
 			func(ts hlc.Timestamp) {
-				_ = execCfg.Clock.Update(ts)
+				execCfg.Clock.Update(ts)
 			},
 			newParams.extendedEvalCtx.Tracing,
 		)
 		defer recv.Release()
+
+		planCtx.saveFlows = func(flows map[roachpb.NodeID]*execinfrapb.FlowSpec) error {
+			d, err := planCtx.flowSpecsToDiagram(ctx, flows)
+			if err != nil {
+				return err
+			}
+			diagram = d
+			return nil
+		}
+		planCtx.saveDiagramShowInputTypes = n.options.Flags[tree.ExplainFlagTypes]
+
 		distSQLPlanner.Run(
-			planCtx, newParams.p.txn, &plan, recv, newParams.extendedEvalCtx, nil /* finishedSetupFn */)
+			planCtx, newParams.p.txn, physPlan, recv, newParams.extendedEvalCtx, nil, /* finishedSetupFn */
+		)()
 
 		n.run.executedStatement = true
 
 		sp.Finish()
-		spans := tracing.GetRecording(sp)
+		spans := sp.GetRecording()
 
 		if err := rw.Err(); err != nil {
 			return err
 		}
 		diagram.AddSpans(spans)
+	} else {
+		flows := physPlan.GenerateFlowSpecs()
+		showInputTypes := n.options.Flags[tree.ExplainFlagTypes]
+		diagram, err = execinfrapb.GeneratePlanDiagram(params.p.stmt.String(), flows, showInputTypes)
+		if err != nil {
+			return err
+		}
+	}
+
+	if n.analyze && len(n.plan.checkPlans) > 0 {
+		outerChecks := planCtx.planner.curPlan.checkPlans
+		defer func() {
+			planCtx.planner.curPlan.checkPlans = outerChecks
+		}()
+		planCtx.planner.curPlan.checkPlans = n.plan.checkPlans
+
+		// Discard rows that are returned.
+		rw := newCallbackResultWriter(func(ctx context.Context, row tree.Datums) error {
+			return nil
+		})
+		execCfg := params.p.ExecCfg()
+		recv := MakeDistSQLReceiver(
+			planCtx.ctx,
+			rw,
+			tree.Rows,
+			execCfg.RangeDescriptorCache,
+			params.p.txn,
+			func(ts hlc.Timestamp) {
+				execCfg.Clock.Update(ts)
+			},
+			params.extendedEvalCtx.Tracing,
+		)
+		if !distSQLPlanner.PlanAndRunCascadesAndChecks(
+			planCtx.ctx,
+			params.p,
+			params.extendedEvalCtx.copy,
+			&n.plan,
+			recv,
+		) {
+			if err := rw.Err(); err != nil {
+				return err
+			}
+			return recv.commErr
+		}
 	}
 
 	planJSON, planURL, err := diagram.ToURL()
@@ -227,7 +281,7 @@ func (n *explainDistSQLNode) startExec(params runParams) error {
 	}
 
 	n.run.values = tree.Datums{
-		tree.MakeDBool(tree.DBool(recommendation == shouldDistribute)),
+		tree.MakeDBool(tree.DBool(willDistribute)),
 		tree.NewDString(planURL.String()),
 		tree.NewDString(planJSON),
 	}
@@ -244,13 +298,24 @@ func (n *explainDistSQLNode) Next(runParams) (bool, error) {
 
 func (n *explainDistSQLNode) Values() tree.Datums { return n.run.values }
 func (n *explainDistSQLNode) Close(ctx context.Context) {
-	n.plan.Close(ctx)
-	for i := range n.subqueryPlans {
-		// Once a subquery plan has been evaluated, it already closes its
-		// plan.
-		if n.subqueryPlans[i].plan != nil {
-			n.subqueryPlans[i].plan.Close(ctx)
-			n.subqueryPlans[i].plan = nil
-		}
+	n.plan.close(ctx)
+}
+
+func newPhysPlanForExplainPurposes(
+	planCtx *PlanningCtx, distSQLPlanner *DistSQLPlanner, plan planMaybePhysical,
+) (*PhysicalPlan, error) {
+	if plan.isPhysicalPlan() {
+		return plan.physPlan.PhysicalPlan, nil
 	}
+	var physPlan *PhysicalPlan
+	var err error
+	if planNode, ok := plan.planNode.(distSQLExplainable); ok {
+		physPlan, err = planNode.newPlanForExplainDistSQL(planCtx, distSQLPlanner)
+	} else {
+		physPlan, err = distSQLPlanner.createPhysPlanForPlanNode(planCtx, plan.planNode)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return physPlan, nil
 }

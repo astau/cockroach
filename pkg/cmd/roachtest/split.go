@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -23,11 +18,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/storage/split"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
+	"github.com/cockroachdb/errors"
 	humanize "github.com/dustin/go-humanize"
 	_ "github.com/lib/pq"
-	"github.com/pkg/errors"
 )
 
 type splitParams struct {
@@ -42,19 +36,18 @@ type splitParams struct {
 	waitDuration  time.Duration // Duration the workload should run for.
 }
 
-func registerLoadSplits(r *registry) {
+func registerLoadSplits(r *testRegistry) {
 	const numNodes = 3
 
 	r.Add(testSpec{
 		Name:       fmt.Sprintf("splits/load/uniform/nodes=%d", numNodes),
-		MinVersion: "v2.2.0",
-		Nodes:      nodes(numNodes),
+		Owner:      OwnerKV,
+		MinVersion: "v19.1.0",
+		Cluster:    makeClusterSpec(numNodes),
 		Run: func(ctx context.Context, t *test, c *cluster) {
-			// After load based splitting is turned on, from experiments
-			// it's clear that at least 20 splits will happen. We could
-			// change this. Used 20 using pure intuition for a suitable split
-			// count from LBS with this kind of workload.
-			expSplits := 20
+			// This number was determined experimentally. Often, but not always,
+			// more splits will happen.
+			expSplits := 10
 			runLoadSplits(ctx, t, c, splitParams{
 				maxSize:       10 << 30,      // 10 GB
 				concurrency:   64,            // 64 concurrent workers
@@ -78,15 +71,23 @@ func registerLoadSplits(r *registry) {
 				// even with the expected number of splits. This puts a bound on how high the
 				// `expSplits` value can go.
 				// Add 1s for each split for the overhead of the splitting process.
-				waitDuration: time.Duration(int64(math.Ceil(math.Ceil(math.Log2(float64(expSplits)))*
-					float64((split.RecordDurationThreshold/time.Second))))+int64(expSplits)) * time.Second,
+				// waitDuration: time.Duration(int64(math.Ceil(math.Ceil(math.Log2(float64(expSplits)))*
+				// 	float64((split.RecordDurationThreshold/time.Second))))+int64(expSplits)) * time.Second,
+				//
+				// NB: the above has proven flaky. Just use a fixed duration
+				// that we think should be good enough. For example, for five
+				// expected splits we get ~35s, for ten ~50s, and for 20 ~1m10s.
+				// These are all pretty short, so any random abnormality will mess
+				// things up.
+				waitDuration: 10 * time.Minute,
 			})
 		},
 	})
 	r.Add(testSpec{
 		Name:       fmt.Sprintf("splits/load/sequential/nodes=%d", numNodes),
-		MinVersion: "v2.2.0",
-		Nodes:      nodes(numNodes),
+		Owner:      OwnerKV,
+		MinVersion: "v19.1.0",
+		Cluster:    makeClusterSpec(numNodes),
 		Run: func(ctx context.Context, t *test, c *cluster) {
 			runLoadSplits(ctx, t, c, splitParams{
 				maxSize:       10 << 30, // 10 GB
@@ -94,7 +95,10 @@ func registerLoadSplits(r *registry) {
 				readPercent:   0,        // 0% reads
 				qpsThreshold:  100,      // 100 queries per second
 				minimumRanges: 1,        // We expect no splits so require only 1 range.
-				maximumRanges: 1,        // We expect no splits so require only 1 range.
+				// We expect no splits so require only 1 range. However, in practice we
+				// sometimes see a split or two early in, presumably when the sampling
+				// gets lucky.
+				maximumRanges: 3,
 				sequential:    true,
 				waitDuration:  60 * time.Second,
 			})
@@ -102,8 +106,9 @@ func registerLoadSplits(r *registry) {
 	})
 	r.Add(testSpec{
 		Name:       fmt.Sprintf("splits/load/spanning/nodes=%d", numNodes),
-		MinVersion: "v2.2.0",
-		Nodes:      nodes(numNodes),
+		Owner:      OwnerKV,
+		MinVersion: "v19.1.0",
+		Cluster:    makeClusterSpec(numNodes),
 		Run: func(ctx context.Context, t *test, c *cluster) {
 			runLoadSplits(ctx, t, c, splitParams{
 				maxSize:       10 << 30, // 10 GB
@@ -153,14 +158,21 @@ func runLoadSplits(ctx context.Context, t *test, c *cluster, params splitParams)
 		setRangeMaxBytes(params.maxSize)
 
 		t.Status("running uniform kv workload")
-		c.Run(ctx, c.Node(1), fmt.Sprintf("./workload init kv {pgurl:1-%d}", c.nodes))
+		c.Run(ctx, c.Node(1), fmt.Sprintf("./workload init kv {pgurl:1-%d}", c.spec.NodeCount))
 
 		t.Status("checking initial range count")
 		rangeCount := func() int {
 			var ranges int
-			const q = "SELECT count(*) FROM [SHOW EXPERIMENTAL_RANGES FROM TABLE kv.kv]"
+			const q = "SELECT count(*) FROM [SHOW RANGES FROM TABLE kv.kv]"
 			if err := db.QueryRow(q).Scan(&ranges); err != nil {
-				t.Fatalf("failed to get range count: %v", err)
+				// TODO(rafi): Remove experimental_ranges query once we stop testing
+				// 19.1 or earlier.
+				if strings.Contains(err.Error(), "syntax error at or near \"ranges\"") {
+					err = db.QueryRow("SELECT count(*) FROM [SHOW EXPERIMENTAL_RANGES FROM TABLE kv.kv]").Scan(&ranges)
+				}
+				if err != nil {
+					t.Fatalf("failed to get range count: %v", err)
+				}
 			}
 			return ranges
 		}
@@ -183,7 +195,7 @@ func runLoadSplits(ctx context.Context, t *test, c *cluster, params splitParams)
 		}
 		c.Run(ctx, c.Node(1), fmt.Sprintf("./workload run kv "+
 			"--init --concurrency=%d --read-percent=%d --span-percent=%d %s {pgurl:1-%d} --duration='%s'",
-			params.concurrency, params.readPercent, params.spanPercent, extraFlags, c.nodes,
+			params.concurrency, params.readPercent, params.spanPercent, extraFlags, c.spec.NodeCount,
 			params.waitDuration.String()))
 
 		t.Status(fmt.Sprintf("waiting for splits"))
@@ -196,7 +208,7 @@ func runLoadSplits(ctx context.Context, t *test, c *cluster, params splitParams)
 	m.Wait()
 }
 
-func registerLargeRange(r *registry) {
+func registerLargeRange(r *testRegistry) {
 	const size = 10 << 30 // 10 GB
 	// TODO(nvanbenschoten): Snapshots currently hold the entirety of a range in
 	// memory on the receiving side. This is dangerous when we grow a range to
@@ -208,7 +220,8 @@ func registerLargeRange(r *registry) {
 
 	r.Add(testSpec{
 		Name:    fmt.Sprintf("splits/largerange/size=%s,nodes=%d", bytesStr(size), numNodes),
-		Nodes:   nodes(numNodes),
+		Owner:   OwnerKV,
+		Cluster: makeClusterSpec(numNodes),
 		Timeout: 5 * time.Hour,
 		Run: func(ctx context.Context, t *test, c *cluster) {
 			runLargeRangeSplits(ctx, t, c, size)
@@ -281,14 +294,21 @@ func runLargeRangeSplits(ctx context.Context, t *test, c *cluster, size int) {
 		// schema but before populating it. This is ok because upreplication
 		// occurs much faster than we can actually create a large range.
 		c.Run(ctx, c.Node(1), fmt.Sprintf("./workload init bank "+
-			"--rows=%d --payload-bytes=%d --ranges=1 {pgurl:1-%d}", rows, payload, c.nodes))
+			"--rows=%d --payload-bytes=%d --ranges=1 {pgurl:1-%d}", rows, payload, c.spec.NodeCount))
 
 		t.Status("checking for single range")
 		rangeCount := func() int {
 			var ranges int
-			const q = "SELECT count(*) FROM [SHOW EXPERIMENTAL_RANGES FROM TABLE bank.bank]"
+			const q = "SELECT count(*) FROM [SHOW RANGES FROM TABLE bank.bank]"
 			if err := db.QueryRow(q).Scan(&ranges); err != nil {
-				t.Fatalf("failed to get range count: %v", err)
+				// TODO(rafi): Remove experimental_ranges query once we stop testing
+				// 19.1 or earlier.
+				if strings.Contains(err.Error(), "syntax error at or near \"ranges\"") {
+					err = db.QueryRow("SELECT count(*) FROM [SHOW EXPERIMENTAL_RANGES FROM TABLE bank.bank]").Scan(&ranges)
+				}
+				if err != nil {
+					t.Fatalf("failed to get range count: %v", err)
+				}
 			}
 			return ranges
 		}

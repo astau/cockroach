@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package optbuilder
 
@@ -18,23 +14,23 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/sequence"
+	"github.com/cockroachdb/errors"
 )
-
-func checkArrayElementType(t types.T) error {
-	if !types.IsValidArrayElementType(t) {
-		return pgerror.NewErrorf(pgerror.CodeFeatureNotSupportedError,
-			"arrays of %s not allowed", t)
-	}
-	return nil
-}
 
 // buildScalar builds a set of memo groups that represent the given scalar
 // expression. If outScope is not nil, then this is a projection context, and
@@ -56,7 +52,7 @@ func (b *Builder) buildScalar(
 	// Note that GROUP BY columns cannot be reused inside an aggregate input
 	// expression (when inAgg=true) because the aggregate input expressions and
 	// grouping expressions are built as part of the same projection.
-	inGroupingContext := inScope.inGroupingContext() && !inScope.groupby.inAgg &&
+	inGroupingContext := inScope.inGroupingContext() && !inScope.inAgg &&
 		!inScope.groupby.buildingGroupingCols
 	if inGroupingContext {
 		// TODO(rytaft): This currently regenerates a string for each subexpression.
@@ -79,25 +75,54 @@ func (b *Builder) buildScalar(
 			// Non-grouping column was referenced. Note that a column that is part
 			// of a larger grouping expression would have been detected by the
 			// groupStrs checking code above.
-			panic(builderError{newGroupingError(&t.name)})
+			// Normally this would be a "column must appear in the GROUP BY clause"
+			// error. The only cases where we allow this (for compatibility with
+			// Postgres) is when this column is an outer column (and therefore
+			// effectively constant) or it is part of a table and we are already
+			// grouping on the entire PK of that table.
+			g := inScope.groupby
+			if !inScope.isOuterColumn(t.id) && !b.allowImplicitGroupingColumn(t.id, g) {
+				panic(newGroupingError(&t.name))
+			}
+
+			// We add a new grouping column; these show up both in aggInScope and
+			// aggOutScope.
+			//
+			// Note that normalization rules will trim down the list of grouping
+			// columns based on FDs, so this is only for the purposes of building a
+			// valid operator.
+			aggInCol := b.addColumn(g.aggInScope, "" /* alias */, t)
+			b.finishBuildScalarRef(t, inScope, g.aggInScope, aggInCol, nil)
+			g.groupStrs[symbolicExprStr(t)] = aggInCol
+
+			g.aggOutScope.appendColumn(aggInCol)
+
+			return b.finishBuildScalarRef(t, g.aggOutScope, outScope, outCol, colRefs)
 		}
 
 		return b.finishBuildScalarRef(t, inScope, outScope, outCol, colRefs)
 
 	case *aggregateInfo:
-		return b.finishBuildScalarRef(t.col, inScope.groupby.aggOutScope, outScope, outCol, colRefs)
+		var aggOutScope *scope
+		if inScope.groupby != nil {
+			aggOutScope = inScope.groupby.aggOutScope
+		}
+		return b.finishBuildScalarRef(t.col, aggOutScope, outScope, outCol, colRefs)
+
+	case *windowInfo:
+		return b.finishBuildScalarRef(t.col, inScope, outScope, outCol, colRefs)
 
 	case *tree.AndExpr:
-		left := b.buildScalar(t.TypedLeft(), inScope, nil, nil, colRefs)
-		right := b.buildScalar(t.TypedRight(), inScope, nil, nil, colRefs)
+		left := b.buildScalar(tree.ReType(t.TypedLeft(), types.Bool), inScope, nil, nil, colRefs)
+		right := b.buildScalar(tree.ReType(t.TypedRight(), types.Bool), inScope, nil, nil, colRefs)
 		out = b.factory.ConstructAnd(left, right)
 
 	case *tree.Array:
 		els := make(memo.ScalarListExpr, len(t.Exprs))
 		arrayType := t.ResolvedType()
-		elementType := arrayType.(types.TArray).Typ
-		if err := checkArrayElementType(elementType); err != nil {
-			panic(builderError{err})
+		elementType := arrayType.ArrayContents()
+		if err := types.CheckArrayElementType(elementType); err != nil {
+			panic(err)
 		}
 		for i := range t.Exprs {
 			texpr := t.Exprs[i].(tree.TypedExpr)
@@ -110,11 +135,6 @@ func (b *Builder) buildScalar(
 		out = b.factory.ConstructCollate(in, t.Locale)
 
 	case *tree.ArrayFlatten:
-		if b.AllowUnsupportedExpr {
-			out = b.factory.ConstructUnsupportedExpr(t)
-			break
-		}
-
 		s := t.Subquery.(*subquery)
 
 		inCol := s.cols[0].id
@@ -124,11 +144,11 @@ func (b *Builder) buildScalar(
 		// Thus, we reject a query that is correlated and over a type that we can't array_agg.
 		typ := b.factory.Metadata().ColumnMeta(inCol).Type
 		if !s.outerCols.Empty() && !memo.AggregateOverloadExists(opt.ArrayAggOp, typ) {
-			panic(builderError{fmt.Errorf("can't execute a correlated ARRAY(...) over %s", typ)})
+			panic(unimplementedWithIssueDetailf(35710, "", "can't execute a correlated ARRAY(...) over %s", typ))
 		}
 
-		if !types.IsValidArrayElementType(typ) {
-			panic(builderError{fmt.Errorf("arrays of %s not allowed", typ)})
+		if err := types.CheckArrayElementType(typ); err != nil {
+			panic(err)
 		}
 
 		// Perform correctness checks on the outer cols, update colRefs and
@@ -146,12 +166,12 @@ func (b *Builder) buildScalar(
 		expr := b.buildScalar(t.Expr.(tree.TypedExpr), inScope, nil, nil, colRefs)
 
 		if len(t.Indirection) != 1 {
-			panic(unimplementedf("multidimensional arrays are not supported"))
+			panic(unimplementedWithIssueDetailf(32552, "ind", "multidimensional indexing is not supported"))
 		}
 
 		subscript := t.Indirection[0]
 		if subscript.Slice {
-			panic(unimplementedf("array slicing is not supported"))
+			panic(unimplementedWithIssueDetailf(32551, "", "array slicing is not supported"))
 		}
 
 		out = b.factory.ConstructIndirection(
@@ -190,8 +210,8 @@ func (b *Builder) buildScalar(
 		// select the right overload. The solution is to wrap any mismatched
 		// arguments with a CastExpr that preserves the static type.
 
-		left, _ := tree.ReType(t.TypedLeft(), t.ResolvedBinOp().LeftType)
-		right, _ := tree.ReType(t.TypedRight(), t.ResolvedBinOp().RightType)
+		left := tree.ReType(t.TypedLeft(), t.ResolvedBinOp().LeftType)
+		right := tree.ReType(t.TypedRight(), t.ResolvedBinOp().RightType)
 		out = b.constructBinary(t.Operator,
 			b.buildScalar(left, inScope, nil, nil, colRefs),
 			b.buildScalar(right, inScope, nil, nil, colRefs),
@@ -199,6 +219,7 @@ func (b *Builder) buildScalar(
 		)
 
 	case *tree.CaseExpr:
+		valType := t.ResolvedType()
 		var input opt.ScalarExpr
 		if t.Expr != nil {
 			texpr := t.Expr.(tree.TypedExpr)
@@ -209,31 +230,36 @@ func (b *Builder) buildScalar(
 
 		whens := make(memo.ScalarListExpr, 0, len(t.Whens)+1)
 		for i := range t.Whens {
-			texpr := t.Whens[i].Cond.(tree.TypedExpr)
-			cond := b.buildScalar(texpr, inScope, nil, nil, colRefs)
-			texpr = t.Whens[i].Val.(tree.TypedExpr)
-			val := b.buildScalar(texpr, inScope, nil, nil, colRefs)
+			condExpr := t.Whens[i].Cond.(tree.TypedExpr)
+			cond := b.buildScalar(condExpr, inScope, nil, nil, colRefs)
+			valExpr := tree.ReType(t.Whens[i].Val.(tree.TypedExpr), valType)
+			val := b.buildScalar(valExpr, inScope, nil, nil, colRefs)
 			whens = append(whens, b.factory.ConstructWhen(cond, val))
 		}
 		// Add the ELSE expression to the end of whens as a raw scalar expression.
 		var orElse opt.ScalarExpr
 		if t.Else != nil {
-			texpr := t.Else.(tree.TypedExpr)
-			orElse = b.buildScalar(texpr, inScope, nil, nil, colRefs)
+			elseExpr := tree.ReType(t.Else.(tree.TypedExpr), valType)
+			orElse = b.buildScalar(elseExpr, inScope, nil, nil, colRefs)
 		} else {
-			orElse = memo.NullSingleton
+			orElse = b.factory.ConstructNull(valType)
 		}
 		out = b.factory.ConstructCase(input, whens, orElse)
 
 	case *tree.CastExpr:
 		texpr := t.Expr.(tree.TypedExpr)
 		arg := b.buildScalar(texpr, inScope, nil, nil, colRefs)
-		out = b.factory.ConstructCast(arg, t.Type.(coltypes.T))
+		out = b.factory.ConstructCast(arg, t.ResolvedType())
 
 	case *tree.CoalesceExpr:
 		args := make(memo.ScalarListExpr, len(t.Exprs))
+		typ := t.ResolvedType()
 		for i := range args {
-			args[i] = b.buildScalar(t.TypedExprAt(i), inScope, nil, nil, colRefs)
+			// The type of the CoalesceExpr might be different than the inputs (e.g.
+			// when they are NULL). Force all inputs to be the same type, so that we
+			// build coalesce operator with the correct type.
+			expr := tree.ReType(t.TypedExprAt(i), typ)
+			args[i] = b.buildScalar(expr, inScope, nil, nil, colRefs)
 		}
 		out = b.factory.ConstructCoalesce(args)
 
@@ -242,19 +268,19 @@ func (b *Builder) buildScalar(
 		out = b.factory.ConstructColumnAccess(input, memo.TupleOrdinal(t.ColIndex))
 
 	case *tree.ComparisonExpr:
-		if sub, ok := t.Right.(*subquery); ok && sub.wrapInTuple {
+		if sub, ok := t.Right.(*subquery); ok && sub.isMultiRow() {
 			out, _ = b.buildMultiRowSubquery(t, inScope, colRefs)
 			// Perform correctness checks on the outer cols, update colRefs and
 			// b.subquery.outerCols.
 			b.checkSubqueryOuterCols(sub.outerCols, inGroupingContext, inScope, colRefs)
 		} else if b.hasSubOperator(t) {
-			// Cases where the RHS is a subquery and not a scalar (of which only an
-			// array or tuple is legal) were handled above.
+			// Cases where the RHS is a multi-row subquery were handled above, so this
+			// only handles explicit tuples and arrays.
 			out = b.buildAnyScalar(t, inScope, colRefs)
 		} else {
 			left := b.buildScalar(t.TypedLeft(), inScope, nil, nil, colRefs)
 			right := b.buildScalar(t.TypedRight(), inScope, nil, nil, colRefs)
-			out = b.constructComparison(t.Operator, left, right)
+			out = b.constructComparison(t, left, right)
 		}
 
 	case *tree.DTuple:
@@ -268,32 +294,59 @@ func (b *Builder) buildScalar(
 		return b.buildFunction(t, inScope, outScope, outCol, colRefs)
 
 	case *tree.IfExpr:
+		valType := t.ResolvedType()
 		input := b.buildScalar(t.Cond.(tree.TypedExpr), inScope, nil, nil, colRefs)
-		ifTrue := b.buildScalar(t.True.(tree.TypedExpr), inScope, nil, nil, colRefs)
+		ifTrueExpr := tree.ReType(t.True.(tree.TypedExpr), valType)
+		ifTrue := b.buildScalar(ifTrueExpr, inScope, nil, nil, colRefs)
 		whens := memo.ScalarListExpr{b.factory.ConstructWhen(memo.TrueSingleton, ifTrue)}
-		orElse := b.buildScalar(t.Else.(tree.TypedExpr), inScope, nil, nil, colRefs)
+		orElseExpr := tree.ReType(t.Else.(tree.TypedExpr), valType)
+		orElse := b.buildScalar(orElseExpr, inScope, nil, nil, colRefs)
 		out = b.factory.ConstructCase(input, whens, orElse)
 
 	case *tree.IndexedVar:
 		if t.Idx < 0 || t.Idx >= len(inScope.cols) {
-			panic(builderError{pgerror.NewErrorf(pgerror.CodeUndefinedColumnError,
-				"invalid column ordinal: @%d", t.Idx+1)})
+			panic(pgerror.Newf(pgcode.UndefinedColumn,
+				"invalid column ordinal: @%d", t.Idx+1))
 		}
 		out = b.factory.ConstructVariable(inScope.cols[t.Idx].id)
 
 	case *tree.NotExpr:
-		input := b.buildScalar(t.TypedInnerExpr(), inScope, nil, nil, colRefs)
+		input := b.buildScalar(tree.ReType(t.TypedInnerExpr(), types.Bool), inScope, nil, nil, colRefs)
 		out = b.factory.ConstructNot(input)
 
+	case *tree.IsNullExpr:
+		input := b.buildScalar(t.TypedInnerExpr(), inScope, nil, nil, colRefs)
+		if t.TypedInnerExpr().ResolvedType().Family() == types.TupleFamily {
+			out = b.factory.ConstructIsTupleNull(input)
+		} else {
+			out = b.factory.ConstructIs(input, memo.NullSingleton)
+		}
+
+	case *tree.IsNotNullExpr:
+		input := b.buildScalar(t.TypedInnerExpr(), inScope, nil, nil, colRefs)
+		if t.TypedInnerExpr().ResolvedType().Family() == types.TupleFamily {
+			out = b.factory.ConstructIsTupleNotNull(input)
+		} else {
+			out = b.factory.ConstructIsNot(input, memo.NullSingleton)
+		}
+
 	case *tree.NullIfExpr:
-		input := b.buildScalar(t.Expr1.(tree.TypedExpr), inScope, nil, nil, colRefs)
+		valType := t.ResolvedType()
+		// Ensure that the type of the first expression matches the resolved type
+		// of the NULLIF expression so that type inference will be correct in the
+		// CASE expression constructed below. For example, the type of
+		// NULLIF(NULL, 0) should be int.
+		expr1 := tree.ReType(t.Expr1.(tree.TypedExpr), valType)
+		input := b.buildScalar(expr1, inScope, nil, nil, colRefs)
 		cond := b.buildScalar(t.Expr2.(tree.TypedExpr), inScope, nil, nil, colRefs)
-		whens := memo.ScalarListExpr{b.factory.ConstructWhen(cond, memo.NullSingleton)}
+		whens := memo.ScalarListExpr{
+			b.factory.ConstructWhen(cond, b.factory.ConstructNull(valType)),
+		}
 		out = b.factory.ConstructCase(input, whens, input)
 
 	case *tree.OrExpr:
-		left := b.buildScalar(t.TypedLeft(), inScope, nil, nil, colRefs)
-		right := b.buildScalar(t.TypedRight(), inScope, nil, nil, colRefs)
+		left := b.buildScalar(tree.ReType(t.TypedLeft(), types.Bool), inScope, nil, nil, colRefs)
+		right := b.buildScalar(tree.ReType(t.TypedRight(), types.Bool), inScope, nil, nil, colRefs)
 		out = b.factory.ConstructOr(left, right)
 
 	case *tree.ParenExpr:
@@ -306,18 +359,22 @@ func (b *Builder) buildScalar(
 			// Replace placeholders with their value.
 			d, err := t.Eval(b.evalCtx)
 			if err != nil {
-				panic(builderError{err})
+				panic(err)
 			}
-			out = b.factory.ConstructConstVal(d)
+			out = b.factory.ConstructConstVal(d, t.ResolvedType())
 		} else {
 			out = b.factory.ConstructPlaceholder(t)
 		}
 
 	case *tree.RangeCond:
-		input := b.buildScalar(t.TypedLeft(), inScope, nil, nil, colRefs)
+		inputFrom := b.buildScalar(t.TypedLeftFrom(), inScope, nil, nil, colRefs)
 		from := b.buildScalar(t.TypedFrom(), inScope, nil, nil, colRefs)
+		inputTo := b.buildScalar(t.TypedLeftTo(), inScope, nil, nil, colRefs)
 		to := b.buildScalar(t.TypedTo(), inScope, nil, nil, colRefs)
-		out = b.buildRangeCond(t.Not, t.Symmetric, input, from, to)
+		out = b.buildRangeCond(t.Not, t.Symmetric, inputFrom, from, inputTo, to)
+
+	case *sqlFnInfo:
+		out = b.buildSQLFn(t, inScope, outScope, outCol, colRefs)
 
 	case *srf:
 		if len(t.cols) == 1 {
@@ -325,7 +382,7 @@ func (b *Builder) buildScalar(
 				// Non-grouping column was referenced. Note that a column that is part
 				// of a larger grouping expression would have been detected by the
 				// groupStrs checking code above.
-				panic(builderError{newGroupingError(&t.cols[0].name)})
+				panic(newGroupingError(&t.cols[0].name))
 			}
 			return b.finishBuildScalarRef(&t.cols[0], inScope, outScope, outCol, colRefs)
 		}
@@ -358,9 +415,8 @@ func (b *Builder) buildScalar(
 		actualType := t.Expr.(tree.TypedExpr).ResolvedType()
 
 		found := false
-		for _, typ := range t.Types {
-			wantTyp := coltypes.CastTargetToDatumType(typ)
-			if actualType.Equivalent(wantTyp) {
+		for _, typ := range t.ResolvedTypes() {
+			if actualType.Equivalent(typ) {
 				found = true
 				break
 			}
@@ -376,14 +432,10 @@ func (b *Builder) buildScalar(
 	// tree.Datum case needs to occur after *tree.Placeholder which implements
 	// Datum.
 	case tree.Datum:
-		out = b.factory.ConstructConstVal(t)
+		out = b.factory.ConstructConstVal(t, t.ResolvedType())
 
 	default:
-		if b.AllowUnsupportedExpr {
-			out = b.factory.ConstructUnsupportedExpr(scalar)
-		} else {
-			panic(unimplementedf("not yet implemented: scalar expression: %T", scalar))
-		}
+		panic(unimplemented.Newf(fmt.Sprintf("optbuilder.%T", scalar), "not yet implemented: scalar expression: %T", scalar))
 	}
 
 	return b.finishBuildScalar(scalar, out, inScope, outScope, outCol)
@@ -427,19 +479,22 @@ func (b *Builder) buildFunction(
 	f *tree.FuncExpr, inScope, outScope *scope, outCol *scopeColumn, colRefs *opt.ColSet,
 ) (out opt.ScalarExpr) {
 	if f.WindowDef != nil {
-		if inScope.groupby.inAgg {
-			panic(builderError{sqlbase.NewWindowInAggError()})
+		if inScope.inAgg {
+			panic(sqlerrors.NewWindowInAggError())
 		}
-		panic(unimplementedf("window functions are not supported"))
 	}
 
 	def, err := f.Func.Resolve(b.semaCtx.SearchPath)
 	if err != nil {
-		panic(builderError{err})
+		panic(err)
 	}
 
 	if isAggregate(def) {
-		panic("aggregate function should have been replaced")
+		panic(errors.AssertionFailedf("aggregate function should have been replaced"))
+	}
+
+	if isWindow(def) {
+		panic(errors.AssertionFailedf("window function should have been replaced"))
 	}
 
 	args := make(memo.ScalarListExpr, len(f.Exprs))
@@ -456,8 +511,23 @@ func (b *Builder) buildFunction(
 	})
 
 	if isGenerator(def) {
-		columns := len(def.ReturnLabels)
-		return b.finishBuildGeneratorFunction(f, out, columns, inScope, outScope, outCol)
+		return b.finishBuildGeneratorFunction(f, out, inScope, outScope, outCol)
+	}
+
+	// Add a dependency on sequences that are used as a string argument.
+	if b.trackViewDeps {
+		name, err := sequence.GetSequenceFromFunc(f)
+		if err != nil {
+			panic(err)
+		}
+		if name != nil {
+			tn := tree.MakeUnqualifiedTableName(tree.Name(*name))
+			ds, _ := b.resolveDataSource(&tn, privilege.SELECT)
+
+			b.viewDeps = append(b.viewDeps, opt.ViewDep{
+				DataSource: ds,
+			})
+		}
 	}
 
 	return b.finishBuildScalar(f, out, inScope, outScope, outCol)
@@ -469,24 +539,28 @@ func (b *Builder) buildFunction(
 // x BETWEEN SYMMETRIC a AND b      ->  (x >= a AND x <= b) OR (x >= b AND x <= a)
 // x NOT BETWEEN SYMMETRIC a AND b  ->  NOT ((x >= a AND x <= b) OR (x >= b AND x <= a))
 //
+// Note that x can be typed differently in the expressions (x >= a) and (x <= b)
+// because a and b can have different types; the function takes both "variants"
+// of x.
+//
 // Note that these expressions are subject to normalization rules (which can
 // push down the negation).
 // TODO(radu): this doesn't work when the expressions have side-effects.
 func (b *Builder) buildRangeCond(
-	not bool, symmetric bool, input, from, to opt.ScalarExpr,
+	not bool, symmetric bool, inputFrom, from, inputTo, to opt.ScalarExpr,
 ) opt.ScalarExpr {
 	// Build "input >= from AND input <= to".
 	out := b.factory.ConstructAnd(
-		b.factory.ConstructGe(input, from),
-		b.factory.ConstructLe(input, to),
+		b.factory.ConstructGe(inputFrom, from),
+		b.factory.ConstructLe(inputTo, to),
 	)
 
 	if symmetric {
 		// Build "(input >= from AND input <= to) OR (input >= to AND input <= from)".
 		lhs := out
 		rhs := b.factory.ConstructAnd(
-			b.factory.ConstructGe(input, to),
-			b.factory.ConstructLe(input, from),
+			b.factory.ConstructGe(inputTo, to),
+			b.factory.ConstructLe(inputFrom, from),
 		)
 		out = b.factory.ConstructOr(lhs, rhs)
 	}
@@ -513,6 +587,14 @@ func (b *Builder) checkSubqueryOuterCols(
 		return
 	}
 
+	// Register the use of correlation to telemetry.
+	// Note: we don't blindly increment the counter every time this
+	// method is called, to avoid double counting the same query.
+	if !b.isCorrelated {
+		b.isCorrelated = true
+		telemetry.Inc(sqltelemetry.CorrelatedSubqueryUseCounter)
+	}
+
 	var inScopeCols opt.ColSet
 	if b.subquery != nil || inGroupingContext {
 		// Only calculate the set of inScope columns if it will be used below.
@@ -527,13 +609,11 @@ func (b *Builder) checkSubqueryOuterCols(
 	}
 
 	// Check 1 (see function comment).
-	if b.semaCtx.Properties.IsSet(tree.RejectAggregates) && inScope.groupby.aggOutScope != nil {
-		aggCols := inScope.groupby.aggOutScope.getAggregateCols()
+	if b.semaCtx.Properties.IsSet(tree.RejectAggregates) && inScope.groupby != nil {
+		aggCols := inScope.groupby.aggregateResultCols()
 		for i := range aggCols {
-			if subqueryOuterCols.Contains(int(aggCols[i].id)) {
-				panic(builderError{
-					tree.NewInvalidFunctionUsageError(tree.AggregateClass, inScope.context),
-				})
+			if subqueryOuterCols.Contains(aggCols[i].id) {
+				panic(tree.NewInvalidFunctionUsageError(tree.AggregateClass, inScope.context.String()))
 			}
 		}
 	}
@@ -545,19 +625,19 @@ func (b *Builder) checkSubqueryOuterCols(
 			!subqueryOuterCols.SubsetOf(inScope.groupby.aggOutScope.colSet()) {
 			subqueryOuterCols.DifferenceWith(inScope.groupby.aggOutScope.colSet())
 			colID, _ := subqueryOuterCols.Next(0)
-			col := inScope.getColumn(opt.ColumnID(colID))
-			panic(builderError{pgerror.NewErrorf(
-				pgerror.CodeGroupingError,
+			col := inScope.getColumn(colID)
+			panic(pgerror.Newf(
+				pgcode.Grouping,
 				"subquery uses ungrouped column \"%s\" from outer query",
-				tree.ErrString(&col.name))})
+				tree.ErrString(&col.name)))
 		}
 	}
 }
 
 func (b *Builder) constructComparison(
-	cmp tree.ComparisonOperator, left, right opt.ScalarExpr,
+	cmp *tree.ComparisonExpr, left, right opt.ScalarExpr,
 ) opt.ScalarExpr {
-	switch cmp {
+	switch cmp.Operator {
 	case tree.EQ:
 		return b.factory.ConstructEq(left, right)
 	case tree.LT:
@@ -587,6 +667,13 @@ func (b *Builder) constructComparison(
 	case tree.NotSimilarTo:
 		return b.factory.ConstructNotSimilarTo(left, right)
 	case tree.RegMatch:
+		leftFam, rightFam := cmp.Fn.LeftType.Family(), cmp.Fn.RightType.Family()
+		if (leftFam == types.GeometryFamily || leftFam == types.Box2DFamily) &&
+			(rightFam == types.GeometryFamily || rightFam == types.Box2DFamily) {
+			// The ~ operator means "covers" when used with geometry or bounding box
+			// operands.
+			return b.factory.ConstructBBoxCovers(left, right)
+		}
 		return b.factory.ConstructRegMatch(left, right)
 	case tree.NotRegMatch:
 		return b.factory.ConstructNotRegMatch(left, right)
@@ -609,12 +696,21 @@ func (b *Builder) constructComparison(
 		return b.factory.ConstructJsonAllExists(left, right)
 	case tree.JSONSomeExists:
 		return b.factory.ConstructJsonSomeExists(left, right)
+	case tree.Overlaps:
+		leftFam, rightFam := cmp.Fn.LeftType.Family(), cmp.Fn.RightType.Family()
+		if (leftFam == types.GeometryFamily || leftFam == types.Box2DFamily) &&
+			(rightFam == types.GeometryFamily || rightFam == types.Box2DFamily) {
+			// The && operator means "intersects" when used with geometry or bounding
+			// box operands.
+			return b.factory.ConstructBBoxIntersects(left, right)
+		}
+		return b.factory.ConstructOverlaps(left, right)
 	}
-	panic(fmt.Sprintf("unhandled comparison operator: %s", cmp))
+	panic(errors.AssertionFailedf("unhandled comparison operator: %s", log.Safe(cmp.Operator)))
 }
 
 func (b *Builder) constructBinary(
-	bin tree.BinaryOperator, left, right opt.ScalarExpr, typ types.T,
+	bin tree.BinaryOperator, left, right opt.ScalarExpr, typ *types.T,
 ) opt.ScalarExpr {
 	switch bin {
 	case tree.Bitand:
@@ -652,19 +748,23 @@ func (b *Builder) constructBinary(
 	case tree.JSONFetchTextPath:
 		return b.factory.ConstructFetchTextPath(left, right)
 	}
-	panic(fmt.Sprintf("unhandled binary operator: %s", bin))
+	panic(errors.AssertionFailedf("unhandled binary operator: %s", log.Safe(bin)))
 }
 
 func (b *Builder) constructUnary(
-	un tree.UnaryOperator, input opt.ScalarExpr, typ types.T,
+	un tree.UnaryOperator, input opt.ScalarExpr, typ *types.T,
 ) opt.ScalarExpr {
 	switch un {
 	case tree.UnaryMinus:
 		return b.factory.ConstructUnaryMinus(input)
 	case tree.UnaryComplement:
 		return b.factory.ConstructUnaryComplement(input)
+	case tree.UnarySqrt:
+		return b.factory.ConstructUnarySqrt(input)
+	case tree.UnaryCbrt:
+		return b.factory.ConstructUnaryCbrt(input)
 	}
-	panic(fmt.Sprintf("unhandled unary operator: %s", un))
+	panic(errors.AssertionFailedf("unhandled unary operator: %s", log.Safe(un)))
 }
 
 // ScalarBuilder is a specialized variant of Builder that can be used to create
@@ -711,22 +811,23 @@ func NewScalar(
 
 // Build a memo structure from a TypedExpr: the root group represents a scalar
 // expression equivalent to expr.
-func (sb *ScalarBuilder) Build(expr tree.TypedExpr) (err error) {
+func (sb *ScalarBuilder) Build(expr tree.Expr) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			// This code allows us to propagate builder errors without adding
-			// lots of checks for `if err != nil` throughout the code. This is
-			// only possible because the code does not update shared state and does
-			// not manipulate locks.
-			if bldErr, ok := r.(builderError); ok {
-				err = bldErr
+			// This code allows us to propagate errors without adding lots of checks
+			// for `if err != nil` throughout the construction code. This is only
+			// possible because the code does not update shared state and does not
+			// manipulate locks.
+			if ok, e := errorutil.ShouldCatch(r); ok {
+				err = e
 			} else {
 				panic(r)
 			}
 		}
 	}()
 
-	scalar := sb.buildScalar(expr, &sb.scope, nil, nil, nil)
+	typedExpr := sb.scope.resolveType(expr, types.Any)
+	scalar := sb.buildScalar(typedExpr, &sb.scope, nil, nil, nil)
 	sb.factory.Memo().SetScalarRoot(scalar)
 	return nil
 }

@@ -1,17 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package syncbench
 
@@ -25,15 +20,16 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/sysutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 	"github.com/codahale/hdrhistogram"
-	"github.com/pkg/errors"
 )
 
 var numOps uint64
@@ -55,7 +51,7 @@ func clampLatency(d, min, max time.Duration) time.Duration {
 }
 
 type worker struct {
-	db      *engine.RocksDB
+	db      storage.Engine
 	latency struct {
 		syncutil.Mutex
 		*hdrhistogram.WindowedHistogram
@@ -63,7 +59,7 @@ type worker struct {
 	logOnly bool
 }
 
-func newWorker(db *engine.RocksDB) *worker {
+func newWorker(db storage.Engine) *worker {
 	w := &worker{db: db}
 	w.latency.WindowedHistogram = hdrhistogram.NewWindowed(1,
 		minLatency.Nanoseconds(), maxLatency.Nanoseconds(), 1)
@@ -91,28 +87,28 @@ func (w *worker) run(wg *sync.WaitGroup) {
 		if w.logOnly {
 			block := randBlock(300, 400)
 			if err := b.LogData(block); err != nil {
-				log.Fatal(ctx, err)
+				log.Fatalf(ctx, "%v", err)
 			}
 		} else {
 			for j := 0; j < 5; j++ {
 				block := randBlock(60, 80)
 				key := encoding.EncodeUint32Ascending(buf, rand.Uint32())
-				if err := b.Put(engine.MakeMVCCMetadataKey(key), block); err != nil {
-					log.Fatal(ctx, err)
+				if err := b.PutUnversioned(key, block); err != nil {
+					log.Fatalf(ctx, "%v", err)
 				}
 				buf = key[:0]
 			}
 		}
 		bytes := uint64(b.Len())
 		if err := b.Commit(true); err != nil {
-			log.Fatal(ctx, err)
+			log.Fatalf(ctx, "%v", err)
 		}
 		atomic.AddUint64(&numOps, 1)
 		atomic.AddUint64(&numBytes, bytes)
 		elapsed := clampLatency(timeutil.Since(start), minLatency, maxLatency)
 		w.latency.Lock()
 		if err := w.latency.Current.RecordValue(elapsed.Nanoseconds()); err != nil {
-			log.Fatal(ctx, err)
+			log.Fatalf(ctx, "%v", err)
 		}
 		w.latency.Unlock()
 	}
@@ -143,12 +139,12 @@ func Run(opts Options) error {
 
 	fmt.Printf("writing to %s\n", opts.Dir)
 
-	db, err := engine.NewRocksDB(
-		engine.RocksDBConfig{
+	db, err := storage.NewDefaultEngine(
+		0,
+		base.StorageConfig{
 			Settings: cluster.MakeTestingClusterSettings(),
 			Dir:      opts.Dir,
-		},
-		engine.RocksDBCache{})
+		})
 	if err != nil {
 		return err
 	}

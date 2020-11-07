@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package parser
 
@@ -19,10 +15,12 @@ import (
 	"go/constant"
 	"go/token"
 	"strconv"
+	"strings"
 	"unicode/utf8"
 	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
+	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
@@ -114,8 +112,11 @@ func (s *scanner) scan(lval *sqlSymType) {
 	switch ch {
 	case '$':
 		// placeholder? $[0-9]+
-		if lex.IsDigit(s.peek()) {
+		if lexbase.IsDigit(s.peek()) {
 			s.scanPlaceholder(lval)
+			return
+		} else if s.scanDollarQuotedString(lval) {
+			lval.id = SCONST
 			return
 		}
 		return
@@ -192,7 +193,7 @@ func (s *scanner) scan(lval *sqlSymType) {
 			s.pos++
 			lval.id = DOT_DOT
 			return
-		case lex.IsDigit(t):
+		case lexbase.IsDigit(t):
 			s.scanNumber(lval, ch)
 			return
 		}
@@ -299,7 +300,17 @@ func (s *scanner) scan(lval *sqlSymType) {
 		switch s.peek() {
 		case '|': // ||
 			s.pos++
+			switch s.peek() {
+			case '/': // ||/
+				s.pos++
+				lval.id = CBRT
+				return
+			}
 			lval.id = CONCAT
+			return
+		case '/': // |/
+			s.pos++
+			lval.id = SQRT
 			return
 		}
 		return
@@ -335,7 +346,7 @@ func (s *scanner) scan(lval *sqlSymType) {
 		switch s.peek() {
 		case '&': // &&
 			s.pos++
-			lval.id = INET_CONTAINS_OR_CONTAINED_BY
+			lval.id = AND_AND
 			return
 		}
 		return
@@ -375,11 +386,11 @@ func (s *scanner) scan(lval *sqlSymType) {
 		return
 
 	default:
-		if lex.IsDigit(ch) {
+		if lexbase.IsDigit(ch) {
 			s.scanNumber(lval, ch)
 			return
 		}
-		if lex.IsIdentStart(ch) {
+		if lexbase.IsIdentStart(ch) {
 			s.scanIdent(lval)
 			return
 		}
@@ -516,7 +527,7 @@ func (s *scanner) scanIdent(lval *sqlSymType) {
 			isLower = false
 		}
 
-		if !lex.IsIdentMiddle(ch) {
+		if !lexbase.IsIdentMiddle(ch) {
 			break
 		}
 
@@ -541,12 +552,38 @@ func (s *scanner) scanIdent(lval *sqlSymType) {
 		lval.str = *(*string)(unsafe.Pointer(&b))
 	} else {
 		// The string has unicode in it. No choice but to run Normalize.
-		lval.str = lex.NormalizeName(s.in[start:s.pos])
+		lval.str = lexbase.NormalizeName(s.in[start:s.pos])
 	}
-	if id, ok := lex.Keywords[lval.str]; ok {
-		lval.id = int32(id.Tok)
+
+	isExperimental := false
+	kw := lval.str
+	switch {
+	case strings.HasPrefix(lval.str, "experimental_"):
+		kw = lval.str[13:]
+		isExperimental = true
+	case strings.HasPrefix(lval.str, "testing_"):
+		kw = lval.str[8:]
+		isExperimental = true
+	}
+	lval.id = lex.GetKeywordID(kw)
+	if lval.id != lex.IDENT {
+		if isExperimental {
+			if _, ok := lex.AllowedExperimental[kw]; !ok {
+				// If the parsed token is not on the allowlisted set of keywords,
+				// then it might have been intended to be parsed as something else.
+				// In that case, re-tokenize the original string.
+				lval.id = lex.GetKeywordID(lval.str)
+			} else {
+				// It is a allowlisted keyword, so remember the shortened
+				// keyword for further processing.
+				lval.str = kw
+			}
+		}
 	} else {
-		lval.id = IDENT
+		// If the word after experimental_ or testing_ is an identifier,
+		// then we might have classified it incorrectly after removing the
+		// experimental_/testing_ prefix.
+		lval.id = lex.GetKeywordID(lval.str)
 	}
 }
 
@@ -558,7 +595,7 @@ func (s *scanner) scanNumber(lval *sqlSymType, ch int) {
 
 	for {
 		ch := s.peek()
-		if (isHex && lex.IsHexDigit(ch)) || lex.IsDigit(ch) {
+		if (isHex && lexbase.IsHexDigit(ch)) || lexbase.IsDigit(ch) {
 			s.pos++
 			continue
 		}
@@ -600,7 +637,7 @@ func (s *scanner) scanNumber(lval *sqlSymType, ch int) {
 				s.pos++
 			}
 			ch = s.peek()
-			if !lex.IsDigit(ch) {
+			if !lexbase.IsDigit(ch) {
 				lval.id = ERROR
 				lval.str = "invalid floating point literal"
 				return
@@ -619,7 +656,7 @@ func (s *scanner) scanNumber(lval *sqlSymType, ch int) {
 			lval.str = fmt.Sprintf("could not make constant float from literal %q", lval.str)
 			return
 		}
-		lval.union.val = &tree.NumVal{Value: floatConst, OrigString: lval.str}
+		lval.union.val = tree.NewNumVal(floatConst, lval.str, false /* negative */)
 	} else {
 		if isHex && s.pos == start+2 {
 			lval.id = ERROR
@@ -644,13 +681,13 @@ func (s *scanner) scanNumber(lval *sqlSymType, ch int) {
 			lval.str = fmt.Sprintf("could not make constant int from literal %q", lval.str)
 			return
 		}
-		lval.union.val = &tree.NumVal{Value: intConst, OrigString: lval.str}
+		lval.union.val = tree.NewNumVal(intConst, lval.str, false /* negative */)
 	}
 }
 
 func (s *scanner) scanPlaceholder(lval *sqlSymType) {
 	start := s.pos
-	for lex.IsDigit(s.peek()) {
+	for lexbase.IsDigit(s.peek()) {
 		s.pos++
 	}
 	lval.str = s.in[start:s.pos]
@@ -857,6 +894,83 @@ outer:
 	return true
 }
 
+// scanDollarQuotedString scans for so called dollar-quoted strings, which start/end with either $$ or $tag$, where
+// tag is some arbitrary string.  e.g. $$a string$$ or $escaped$a string$escaped$.
+func (s *scanner) scanDollarQuotedString(lval *sqlSymType) bool {
+	buf := s.buffer()
+	start := s.pos
+
+	foundStartTag := false
+	possibleEndTag := false
+	startTagIndex := -1
+	var startTag string
+
+outer:
+	for {
+		ch := s.peek()
+		switch ch {
+		case '$':
+			s.pos++
+			if foundStartTag {
+				if possibleEndTag {
+					if len(startTag) == startTagIndex {
+						// Found end tag.
+						buf = append(buf, s.in[start+len(startTag)+1:s.pos-len(startTag)-2]...)
+						break outer
+					} else {
+						// Was not the end tag but the current $ might be the start of the end tag we are looking for, so
+						// just reset the startTagIndex.
+						startTagIndex = 0
+					}
+				} else {
+					possibleEndTag = true
+					startTagIndex = 0
+				}
+			} else {
+				startTag = s.in[start : s.pos-1]
+				foundStartTag = true
+			}
+
+		case eof:
+			if foundStartTag {
+				// A start tag was found, therefore we expect an end tag before the eof, otherwise it is an error.
+				lval.id = ERROR
+				lval.str = errUnterminated
+			} else {
+				// This is not a dollar-quoted string, reset the pos back to the start.
+				s.pos = start
+			}
+			return false
+
+		default:
+			// If we haven't found a start tag yet, check whether the current characters is a valid for a tag.
+			if !foundStartTag && !lexbase.IsIdentStart(ch) && !lexbase.IsDigit(ch) {
+				return false
+			}
+			s.pos++
+			if possibleEndTag {
+				// Check whether this could be the end tag.
+				if startTagIndex >= len(startTag) || ch != int(startTag[startTagIndex]) {
+					// This is not the end tag we are looking for.
+					possibleEndTag = false
+					startTagIndex = -1
+				} else {
+					startTagIndex++
+				}
+			}
+		}
+	}
+
+	if !utf8.Valid(buf) {
+		lval.id = ERROR
+		lval.str = errInvalidUTF8
+		return false
+	}
+
+	lval.str = s.finishString(buf)
+	return true
+}
+
 // SplitFirstStatement returns the length of the prefix of the string up to and
 // including the first semicolon that separates statements. If there is no
 // semicolon, returns ok=false.
@@ -874,6 +988,29 @@ func SplitFirstStatement(sql string) (pos int, ok bool) {
 	}
 }
 
+// Tokens decomposes the input into lexical tokens.
+func Tokens(sql string) (tokens []TokenString, ok bool) {
+	s := makeScanner(sql)
+	for {
+		var lval sqlSymType
+		s.scan(&lval)
+		if lval.id == ERROR {
+			return nil, false
+		}
+		if lval.id == 0 {
+			break
+		}
+		tokens = append(tokens, TokenString{TokenID: lval.id, Str: lval.str})
+	}
+	return tokens, true
+}
+
+// TokenString is the unit value returned by Tokens.
+type TokenString struct {
+	TokenID int32
+	Str     string
+}
+
 // LastLexicalToken returns the last lexical token. If the string has no lexical
 // tokens, returns 0 and ok=false.
 func LastLexicalToken(sql string) (lastTok int, ok bool) {
@@ -882,17 +1019,8 @@ func LastLexicalToken(sql string) (lastTok int, ok bool) {
 	for {
 		last := lval.id
 		s.scan(&lval)
-		if lval.id == ERROR {
-			return ERROR, true
-		}
 		if lval.id == 0 {
 			return int(last), last != 0
 		}
 	}
-}
-
-// EndsInSemicolon returns true if the last lexical token is a semicolon.
-func EndsInSemicolon(sql string) bool {
-	lastTok, ok := LastLexicalToken(sql)
-	return ok && lastTok == ';'
 }

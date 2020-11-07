@@ -1,32 +1,29 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package status
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"runtime"
 	"runtime/debug"
-	"sync/atomic"
 	"time"
-	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/redact"
 	"github.com/dustin/go-humanize"
 	"github.com/elastic/gosigar"
 	"github.com/shirou/gopsutil/net"
@@ -117,7 +114,7 @@ var (
 		Measurement: "CPU Time",
 		Unit:        metric.Unit_PERCENT,
 	}
-	metaRSS = metric.Metadata{
+	metaRSSBytes = metric.Metadata{
 		Name:        "sys.rss",
 		Help:        "Current process RSS",
 		Measurement: "RSS",
@@ -158,6 +155,12 @@ var (
 		Measurement: "Bytes",
 		Help:        "Bytes read from all disks since this process started",
 	}
+	metaHostDiskReadTime = metric.Metadata{
+		Name:        "sys.host.disk.read.time",
+		Unit:        metric.Unit_NANOSECONDS,
+		Measurement: "Time",
+		Help:        "Time spent reading from all disks since this process started",
+	}
 	metaHostDiskWriteCount = metric.Metadata{
 		Name:        "sys.host.disk.write.count",
 		Unit:        metric.Unit_COUNT,
@@ -169,6 +172,24 @@ var (
 		Unit:        metric.Unit_BYTES,
 		Measurement: "Bytes",
 		Help:        "Bytes written to all disks since this process started",
+	}
+	metaHostDiskWriteTime = metric.Metadata{
+		Name:        "sys.host.disk.write.time",
+		Unit:        metric.Unit_NANOSECONDS,
+		Measurement: "Time",
+		Help:        "Time spent writing to all disks since this process started",
+	}
+	metaHostDiskIOTime = metric.Metadata{
+		Name:        "sys.host.disk.io.time",
+		Unit:        metric.Unit_NANOSECONDS,
+		Measurement: "Time",
+		Help:        "Time spent reading from or writing to all disks since this process started",
+	}
+	metaHostDiskWeightedIOTime = metric.Metadata{
+		Name:        "sys.host.disk.weightedio.time",
+		Unit:        metric.Unit_NANOSECONDS,
+		Measurement: "Time",
+		Help:        "Weighted time spent reading from or writing to to all disks since this process started",
 	}
 	metaHostIopsInProgress = metric.Metadata{
 		Name:        "sys.host.disk.iopsinprogress",
@@ -202,12 +223,6 @@ var (
 	}
 )
 
-type memStats struct {
-	goAllocated uint64
-	goIdle      uint64
-	goTotal     uint64
-}
-
 // getCgoMemStats is a function that fetches stats for the C++ portion of the code.
 // We will not necessarily have implementations for all builds, so check for nil first.
 // Returns the following:
@@ -237,9 +252,6 @@ type RuntimeStatSampler struct {
 		net         net.IOCountersStat
 	}
 
-	// Memory stats that are updated atomically by SampleMemStats.
-	memStats unsafe.Pointer
-
 	initialDiskCounters diskStats
 	initialNetCounters  net.IOCountersStat
 
@@ -264,20 +276,24 @@ type RuntimeStatSampler struct {
 	CPUSysPercent          *metric.GaugeFloat64
 	CPUCombinedPercentNorm *metric.GaugeFloat64
 	// Memory stats.
-	Rss *metric.Gauge
+	RSSBytes *metric.Gauge
 	// File descriptor stats.
 	FDOpen      *metric.Gauge
 	FDSoftLimit *metric.Gauge
 	// Disk and network stats.
-	HostDiskReadBytes  *metric.Gauge
-	HostDiskReadCount  *metric.Gauge
-	HostDiskWriteBytes *metric.Gauge
-	HostDiskWriteCount *metric.Gauge
-	IopsInProgress     *metric.Gauge // not collected on macOS.
-	HostNetRecvBytes   *metric.Gauge
-	HostNetRecvPackets *metric.Gauge
-	HostNetSendBytes   *metric.Gauge
-	HostNetSendPackets *metric.Gauge
+	HostDiskReadBytes      *metric.Gauge
+	HostDiskReadCount      *metric.Gauge
+	HostDiskReadTime       *metric.Gauge
+	HostDiskWriteBytes     *metric.Gauge
+	HostDiskWriteCount     *metric.Gauge
+	HostDiskWriteTime      *metric.Gauge
+	HostDiskIOTime         *metric.Gauge
+	HostDiskWeightedIOTime *metric.Gauge
+	IopsInProgress         *metric.Gauge
+	HostNetRecvBytes       *metric.Gauge
+	HostNetRecvPackets     *metric.Gauge
+	HostNetSendBytes       *metric.Gauge
+	HostNetSendPackets     *metric.Gauge
 	// Uptime and build.
 	Uptime         *metric.Gauge // We use a gauge to be able to call Update.
 	BuildTimestamp *metric.Gauge
@@ -291,7 +307,7 @@ func NewRuntimeStatSampler(ctx context.Context, clock *hlc.Clock) *RuntimeStatSa
 	timestamp, err := info.Timestamp()
 	if err != nil {
 		// We can't panic here, tests don't have a build timestamp.
-		log.Warningf(ctx, "Could not parse build timestamp: %v", err)
+		log.Warningf(ctx, "could not parse build timestamp: %v", err)
 	}
 
 	// Build information.
@@ -335,24 +351,60 @@ func NewRuntimeStatSampler(ctx context.Context, clock *hlc.Clock) *RuntimeStatSa
 		CPUSysNS:               metric.NewGauge(metaCPUSysNS),
 		CPUSysPercent:          metric.NewGaugeFloat64(metaCPUSysPercent),
 		CPUCombinedPercentNorm: metric.NewGaugeFloat64(metaCPUCombinedPercentNorm),
-		Rss:                metric.NewGauge(metaRSS),
-		HostDiskReadBytes:  metric.NewGauge(metaHostDiskReadBytes),
-		HostDiskReadCount:  metric.NewGauge(metaHostDiskReadCount),
-		HostDiskWriteBytes: metric.NewGauge(metaHostDiskWriteBytes),
-		HostDiskWriteCount: metric.NewGauge(metaHostDiskWriteCount),
-		IopsInProgress:     metric.NewGauge(metaHostIopsInProgress),
-		HostNetRecvBytes:   metric.NewGauge(metaHostNetRecvBytes),
-		HostNetRecvPackets: metric.NewGauge(metaHostNetRecvPackets),
-		HostNetSendBytes:   metric.NewGauge(metaHostNetSendBytes),
-		HostNetSendPackets: metric.NewGauge(metaHostNetSendPackets),
-		FDOpen:             metric.NewGauge(metaFDOpen),
-		FDSoftLimit:        metric.NewGauge(metaFDSoftLimit),
-		Uptime:             metric.NewGauge(metaUptime),
-		BuildTimestamp:     buildTimestamp,
+		RSSBytes:               metric.NewGauge(metaRSSBytes),
+		HostDiskReadBytes:      metric.NewGauge(metaHostDiskReadBytes),
+		HostDiskReadCount:      metric.NewGauge(metaHostDiskReadCount),
+		HostDiskReadTime:       metric.NewGauge(metaHostDiskReadTime),
+		HostDiskWriteBytes:     metric.NewGauge(metaHostDiskWriteBytes),
+		HostDiskWriteCount:     metric.NewGauge(metaHostDiskWriteCount),
+		HostDiskWriteTime:      metric.NewGauge(metaHostDiskWriteTime),
+		HostDiskIOTime:         metric.NewGauge(metaHostDiskIOTime),
+		HostDiskWeightedIOTime: metric.NewGauge(metaHostDiskWeightedIOTime),
+		IopsInProgress:         metric.NewGauge(metaHostIopsInProgress),
+		HostNetRecvBytes:       metric.NewGauge(metaHostNetRecvBytes),
+		HostNetRecvPackets:     metric.NewGauge(metaHostNetRecvPackets),
+		HostNetSendBytes:       metric.NewGauge(metaHostNetSendBytes),
+		HostNetSendPackets:     metric.NewGauge(metaHostNetSendPackets),
+		FDOpen:                 metric.NewGauge(metaFDOpen),
+		FDSoftLimit:            metric.NewGauge(metaFDSoftLimit),
+		Uptime:                 metric.NewGauge(metaUptime),
+		BuildTimestamp:         buildTimestamp,
 	}
 	rsr.last.disk = rsr.initialDiskCounters
 	rsr.last.net = rsr.initialNetCounters
 	return rsr
+}
+
+// GoMemStats groups a runtime.MemStats structure with the timestamp when it
+// was collected.
+type GoMemStats struct {
+	runtime.MemStats
+	// Collected is the timestamp at which these values were collected.
+	Collected time.Time
+}
+
+// CGoMemStats reports what has been allocated outside of Go.
+type CGoMemStats struct {
+	// CGoAllocated represents allocated bytes.
+	CGoAllocatedBytes int64
+	// CGoTotal represents total bytes (allocated + metadata etc).
+	CGoTotalBytes int64
+}
+
+// GetCGoMemStats collects non-Go memory statistics.
+func GetCGoMemStats(ctx context.Context) *CGoMemStats {
+	var cgoAllocated, cgoTotal uint
+	if getCgoMemStats != nil {
+		var err error
+		cgoAllocated, cgoTotal, err = getCgoMemStats(ctx)
+		if err != nil {
+			log.Warningf(ctx, "problem fetching CGO memory stats: %s; CGO stats will be empty.", err)
+		}
+	}
+	return &CGoMemStats{
+		CGoAllocatedBytes: int64(cgoAllocated),
+		CGoTotalBytes:     int64(cgoTotal),
+	}
 }
 
 // SampleEnvironment queries the runtime system for various interesting metrics,
@@ -362,7 +414,13 @@ func NewRuntimeStatSampler(ctx context.Context, clock *hlc.Clock) *RuntimeStatSa
 //
 // This method should be called periodically by a higher level system in order
 // to keep runtime statistics current.
-func (rsr *RuntimeStatSampler) SampleEnvironment(ctx context.Context) {
+//
+// SampleEnvironment takes GoMemStats as input because that is collected
+// separately, on a different schedule.
+// The CGoMemStats should be provided via GetCGoMemStats().
+func (rsr *RuntimeStatSampler) SampleEnvironment(
+	ctx context.Context, ms *GoMemStats, cs *CGoMemStats,
+) {
 	// Note that debug.ReadGCStats() does not suffer the same problem as
 	// runtime.ReadMemStats(). The only way you can know that is by reading the
 	// source.
@@ -385,7 +443,7 @@ func (rsr *RuntimeStatSampler) SampleEnvironment(ctx context.Context) {
 
 	fds := gosigar.ProcFDUsage{}
 	if err := fds.Get(pid); err != nil {
-		if _, ok := err.(gosigar.ErrNotImplemented); ok {
+		if gosigar.IsNotImplemented(err) {
 			if !rsr.fdUsageNotImplemented {
 				rsr.fdUsageNotImplemented = true
 				log.Warningf(ctx, "unable to get file descriptor usage (will not try again): %s", err)
@@ -407,8 +465,12 @@ func (rsr *RuntimeStatSampler) SampleEnvironment(ctx context.Context) {
 
 		rsr.HostDiskReadBytes.Update(diskCounters.readBytes)
 		rsr.HostDiskReadCount.Update(diskCounters.readCount)
+		rsr.HostDiskReadTime.Update(int64(diskCounters.readTime))
 		rsr.HostDiskWriteBytes.Update(diskCounters.writeBytes)
 		rsr.HostDiskWriteCount.Update(diskCounters.writeCount)
+		rsr.HostDiskWriteTime.Update(int64(diskCounters.writeTime))
+		rsr.HostDiskIOTime.Update(int64(diskCounters.ioTime))
+		rsr.HostDiskWeightedIOTime.Update(int64(diskCounters.weightedIOTime))
 		rsr.IopsInProgress.Update(diskCounters.iopsInProgress)
 	}
 
@@ -445,38 +507,37 @@ func (rsr *RuntimeStatSampler) SampleEnvironment(ctx context.Context) {
 	rsr.last.stime = stime
 	rsr.last.gcPauseTime = uint64(gc.PauseTotal)
 
-	var cgoAllocated, cgoTotal uint
-	if getCgoMemStats != nil {
-		var err error
-		cgoAllocated, cgoTotal, err = getCgoMemStats(ctx)
-		if err != nil {
-			log.Warningf(ctx, "problem fetching CGO memory stats: %s; CGO stats will be empty.", err)
-		}
-	}
-
-	ms := (*memStats)(atomic.LoadPointer(&rsr.memStats))
-	if ms == nil {
-		ms = &memStats{}
-	}
-
 	// Log summary of statistics to console.
 	cgoRate := float64((numCgoCall-rsr.last.cgoCall)*int64(time.Second)) / dur
-	log.Infof(ctx, "runtime stats: %s RSS, %d goroutines, %s/%s/%s GO alloc/idle/total, "+
+	goMemStatsStale := timeutil.Now().Sub(ms.Collected) > time.Second
+	var staleMsg = ""
+	if goMemStatsStale {
+		staleMsg = "(stale)"
+	}
+	goTotal := ms.Sys - ms.HeapReleased
+
+	// TODO(knz): make utility wrapper around humanize.IBytes that
+	// returns a safe value and collapse the entire log.Infof -> Safe ->
+	// Sprintf sequence as a flat Infof call.
+	log.Infof(ctx, "%s", redact.Safe(fmt.Sprintf("runtime stats: %s RSS, %d goroutines, %s/%s/%s GO alloc/idle/total%s, "+
 		"%s/%s CGO alloc/total, %.1f CGO/sec, %.1f/%.1f %%(u/s)time, %.1f %%gc (%dx), "+
 		"%s/%s (r/w)net",
 		humanize.IBytes(mem.Resident), numGoroutine,
-		humanize.IBytes(ms.goAllocated), humanize.IBytes(ms.goIdle), humanize.IBytes(ms.goTotal),
-		humanize.IBytes(uint64(cgoAllocated)), humanize.IBytes(uint64(cgoTotal)),
+		humanize.IBytes(ms.HeapAlloc), humanize.IBytes(ms.HeapIdle), humanize.IBytes(goTotal),
+		staleMsg,
+		humanize.IBytes(uint64(cs.CGoAllocatedBytes)), humanize.IBytes(uint64(cs.CGoTotalBytes)),
 		cgoRate, 100*uPerc, 100*sPerc, 100*gcPausePercent, gc.NumGC-rsr.last.gcCount,
 		humanize.IBytes(deltaNet.BytesRecv), humanize.IBytes(deltaNet.BytesSent),
-	)
+	)))
 	rsr.last.cgoCall = numCgoCall
 	rsr.last.gcCount = gc.NumGC
 
+	rsr.GoAllocBytes.Update(int64(ms.HeapAlloc))
+	rsr.GoTotalBytes.Update(int64(goTotal))
 	rsr.CgoCalls.Update(numCgoCall)
 	rsr.Goroutines.Update(int64(numGoroutine))
-	rsr.CgoAllocBytes.Update(int64(cgoAllocated))
-	rsr.CgoTotalBytes.Update(int64(cgoTotal))
+	rsr.CgoAllocBytes.Update(cs.CGoAllocatedBytes)
+	rsr.CgoTotalBytes.Update(cs.CGoTotalBytes)
 	rsr.GcCount.Update(gc.NumGC)
 	rsr.GcPauseNS.Update(int64(gc.PauseTotal))
 	rsr.GcPausePercent.Update(gcPausePercent)
@@ -487,55 +548,45 @@ func (rsr *RuntimeStatSampler) SampleEnvironment(ctx context.Context) {
 	rsr.CPUCombinedPercentNorm.Update(combinedNormalizedPerc)
 	rsr.FDOpen.Update(int64(fds.Open))
 	rsr.FDSoftLimit.Update(int64(fds.SoftLimit))
-	rsr.Rss.Update(int64(mem.Resident))
+	rsr.RSSBytes.Update(int64(mem.Resident))
 	rsr.Uptime.Update((now - rsr.startTimeNanos) / 1e9)
 }
 
-// SampleMemStats queries the runtime system for memory metrics, updating the
-// memory metric gauges and making these metrics available for logging by
-// SampleEnvironment.
-//
-// This method should be called periodically by a higher level system in order
-// to keep runtime statistics current. It is distinct from SampleEnvironment
-// due to a limitation in the Go runtime which causes runtime.ReadMemStats() to
-// block waiting for a GC cycle to finish which can take upwards of 10 seconds
-// on a large heap.
-func (rsr *RuntimeStatSampler) SampleMemStats(ctx context.Context) {
-	// Record memory and call stats from the runtime package. It might be useful
-	// to call ReadMemStats() more often, but it stops the world while collecting
-	// stats so shouldn't be called too often. For a similar reason, we want this
-	// call to come first because ReadMemStats() needs to wait for an existing GC
-	// to finish which can take multiple seconds on large heaps.
-	//
-	// NOTE: the MemStats fields do not get decremented when memory is released,
-	// to get accurate numbers, be sure to subtract. eg: ms.Sys - ms.HeapReleased
-	// for current memory reserved.
-	ms := &runtime.MemStats{}
-	runtime.ReadMemStats(ms)
-
-	goAllocated := ms.Alloc
-	goTotal := ms.Sys - ms.HeapReleased
-	atomic.StorePointer(&rsr.memStats, unsafe.Pointer(&memStats{
-		goAllocated: goAllocated,
-		goIdle:      ms.HeapIdle - ms.HeapReleased,
-		goTotal:     goTotal,
-	}))
-
-	rsr.GoAllocBytes.Update(int64(goAllocated))
-	rsr.GoTotalBytes.Update(int64(goTotal))
-
-	if log.V(2) {
-		log.Infof(ctx, "memstats: %+v", ms)
-	}
+// GetCPUCombinedPercentNorm is part of the rowexec.RuntimeStats interface.
+func (rsr *RuntimeStatSampler) GetCPUCombinedPercentNorm() float64 {
+	return rsr.CPUCombinedPercentNorm.Value()
 }
 
+// diskStats contains the disk statistics returned by the operating
+// system. Interpretation of some of these stats varies by platform,
+// although as much as possible they are normalized to the semantics
+// used by linux's diskstats interface.
+//
+// Except for iopsInProgress, these metrics act like counters (always
+// increasing, and best interpreted as a rate).
 type diskStats struct {
 	readBytes int64
 	readCount int64
 
+	// readTime (and writeTime) may increase more than 1s per second if
+	// access to storage is parallelized.
+	readTime time.Duration
+
 	writeBytes int64
 	writeCount int64
+	writeTime  time.Duration
 
+	// ioTime is the amount of time that iopsInProgress is non-zero (so
+	// its increase is capped at 1s/s). Only available on linux.
+	ioTime time.Duration
+
+	// weightedIOTime is a linux-specific metric that attempts to
+	// represent "an easy measure of both I/O completion time and the
+	// backlog that may be accumulating."
+	weightedIOTime time.Duration
+
+	// iopsInProgress is a gauge of the number of pending IO operations.
+	// Not available on macOS.
 	iopsInProgress int64
 }
 
@@ -564,9 +615,14 @@ func sumDiskCounters(disksStats []diskStats) diskStats {
 	for _, stats := range disksStats {
 		output.readBytes += stats.readBytes
 		output.readCount += stats.readCount
+		output.readTime += stats.readTime
 
 		output.writeBytes += stats.writeBytes
 		output.writeCount += stats.writeCount
+		output.writeTime += stats.writeTime
+
+		output.ioTime += stats.ioTime
+		output.weightedIOTime += stats.weightedIOTime
 
 		output.iopsInProgress += stats.iopsInProgress
 	}
@@ -578,9 +634,14 @@ func sumDiskCounters(disksStats []diskStats) diskStats {
 func subtractDiskCounters(from *diskStats, sub diskStats) {
 	from.writeCount -= sub.writeCount
 	from.writeBytes -= sub.writeBytes
+	from.writeTime -= sub.writeTime
 
 	from.readCount -= sub.readCount
 	from.readBytes -= sub.readBytes
+	from.readTime -= sub.readTime
+
+	from.ioTime -= sub.ioTime
+	from.weightedIOTime -= sub.weightedIOTime
 }
 
 // sumNetworkCounters returns a new net.IOCountersStat whose values are the sum of the

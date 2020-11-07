@@ -1,27 +1,22 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tpcc
 
 import (
 	"context"
-	"math/rand"
 
 	"github.com/cockroachdb/cockroach-go/crdb"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
+	"golang.org/x/exp/rand"
 )
 
 // 2.8 The Stock-Level Transaction
@@ -95,12 +90,12 @@ func createStockLevel(
 }
 
 func (s *stockLevel) run(ctx context.Context, wID int) (interface{}, error) {
-	rng := rand.New(rand.NewSource(timeutil.Now().UnixNano()))
+	rng := rand.New(rand.NewSource(uint64(timeutil.Now().UnixNano())))
 
 	// 2.8.1.2: The threshold of minimum quantity in stock is selected at random
 	// within [10..20].
 	d := stockLevelData{
-		threshold: randInt(rng, 10, 20),
+		threshold: int(randInt(rng, 10, 20)),
 		dID:       rng.Intn(10) + 1,
 	}
 
@@ -111,15 +106,6 @@ func (s *stockLevel) run(ctx context.Context, wID int) (interface{}, error) {
 	if err := crdb.ExecuteInTx(
 		ctx, (*workload.PgxTx)(tx),
 		func() error {
-			// This is the only join in the application, so we don't need to worry about
-			// this setting persisting incorrectly across queries.
-			// Note that this is not needed (and doesn't do anything) when the
-			// optimizer is on. We still set it for when the optimizer is disabled
-			// or when running against older versions of CRDB.
-			if _, err := tx.Exec(`set experimental_force_lookup_join=true`); err != nil {
-				return err
-			}
-
 			var dNextOID int
 			if err := s.selectDNextOID.QueryRowTx(
 				ctx, tx, wID, d.dID,

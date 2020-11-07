@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 import { assert } from "chai";
 import * as timewindow from "./timewindow";
@@ -54,7 +50,7 @@ describe("time window reducer", function() {
       );
       assert.deepEqual(
         (new timewindow.TimeWindowState()).scale,
-        timewindow.availableTimeScales["10 min"],
+        timewindow.availableTimeScales["Past 10 Minutes"],
       );
     });
 
@@ -95,6 +91,14 @@ describe("time window reducer", function() {
           })),
           expected,
         );
+      });
+    });
+    describe("findClosestTimeScale", () => {
+      it("should found correctly time scale", () => {
+        assert.deepEqual(timewindow.findClosestTimeScale(15), { ...timewindow.availableTimeScales["Past 10 Minutes"], key: "Custom" });
+        assert.deepEqual(timewindow.findClosestTimeScale(moment.duration(10, "minutes").asSeconds()), { ...timewindow.availableTimeScales["Past 10 Minutes"], key: "Past 10 Minutes"});
+        assert.deepEqual(timewindow.findClosestTimeScale(moment.duration(14, "days").asSeconds()), { ...timewindow.availableTimeScales["Past 2 Weeks"], key: "Past 2 Weeks" });
+        assert.deepEqual(timewindow.findClosestTimeScale(moment.duration(moment().daysInMonth() * 5, "days").asSeconds()), { ...timewindow.availableTimeScales["Past 2 Months"], key: "Custom" });
       });
     });
   });

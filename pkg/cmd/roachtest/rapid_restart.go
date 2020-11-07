@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -21,9 +17,10 @@ import (
 	"os/exec"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/sysutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 func runRapidRestart(ctx context.Context, t *test, c *cluster) {
@@ -50,7 +47,7 @@ func runRapidRestart(ctx context.Context, t *test, c *cluster) {
 			exitCh := make(chan error, 1)
 			go func() {
 				err := c.RunE(ctx, nodes,
-					`mkdir -p {log-dir} && ./cockroach start --insecure --store={store-dir} `+
+					`mkdir -p {log-dir} && ./cockroach start-single-node --insecure --store={store-dir} `+
 						`--log-dir={log-dir} --cache=10% --max-sql-memory=10% `+
 						`--listen-addr=:{pgport:1} --http-port=$[{pgport:1}+1] `+
 						`> {log-dir}/cockroach.stdout 2> {log-dir}/cockroach.stderr`)
@@ -78,13 +75,12 @@ func runRapidRestart(ctx context.Context, t *test, c *cluster) {
 					t.l.Printf("no exit status yet, killing again")
 				}
 			}
-			cause := errors.Cause(err)
-			if exitErr, ok := cause.(*exec.ExitError); ok {
+			if exitErr := (*exec.ExitError)(nil); errors.As(err, &exitErr) {
 				switch status := sysutil.ExitStatus(exitErr); status {
 				case -1:
 					// Received SIGINT before setting up our own signal handlers or
 					// SIGKILL.
-				case 1:
+				case 20:
 					// Exit code from a SIGINT received by our signal handlers.
 				default:
 					t.Fatalf("unexpected exit status %d", status)
@@ -94,13 +90,17 @@ func runRapidRestart(ctx context.Context, t *test, c *cluster) {
 			}
 		}
 
+		// The var dump below may take a while to generate, maybe more
+		// than the 3 second timeout of the default http client.
+		httpClient := httputil.NewClientWithTimeout(15 * time.Second)
+
 		// Verify the cluster is ok by torturing the prometheus endpoint until it
 		// returns success. A side-effect is to prevent regression of #19559.
 		for !done() {
 			base := `http://` + c.ExternalAdminUIAddr(ctx, nodes)[0]
 			// Torture the prometheus endpoint to prevent regression of #19559.
 			url := base + `/_status/vars`
-			resp, err := http.Get(url)
+			resp, err := httpClient.Get(ctx, url)
 			if err == nil {
 				if resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusOK {
 					t.Fatalf("unexpected status code from %s: %d", url, resp.StatusCode)
@@ -111,4 +111,10 @@ func runRapidRestart(ctx context.Context, t *test, c *cluster) {
 
 		t.l.Printf("%d OK\n", j)
 	}
+
+	// Clean up for the test harness. Usually we want to leave nodes running so
+	// that consistency checks can be run, but in this case there's not much
+	// there in the first place anyway.
+	c.Stop(ctx, nodes)
+	c.Wipe(ctx, nodes)
 }

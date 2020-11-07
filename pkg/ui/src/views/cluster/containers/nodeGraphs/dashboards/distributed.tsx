@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 import React from "react";
 import _ from "lodash";
@@ -57,10 +53,13 @@ export default function (props: GraphDashboardProps) {
     <LineGraph title="KV Transaction Restarts" sources={nodeSources}>
       <Axis label="restarts">
         <Metric name="cr.node.txn.restarts.writetooold" title="Write Too Old" nonNegativeRate />
-        <Metric name="cr.node.txn.restarts.deleterange" title="Forwarded Timestamp (delete range)" nonNegativeRate />
+        <Metric name="cr.node.txn.restarts.writetoooldmulti" title="Write Too Old (multiple)" nonNegativeRate />
         <Metric name="cr.node.txn.restarts.serializable" title="Forwarded Timestamp (iso=serializable)" nonNegativeRate />
-        <Metric name="cr.node.txn.restarts.possiblereplay" title="Possible Replay" nonNegativeRate />
         <Metric name="cr.node.txn.restarts.asyncwritefailure" title="Async Consensus Failure" nonNegativeRate />
+        <Metric name="cr.node.txn.restarts.readwithinuncertainty" title="Read Within Uncertainty Interval" nonNegativeRate />
+        <Metric name="cr.node.txn.restarts.txnaborted" title="Aborted" nonNegativeRate />
+        <Metric name="cr.node.txn.restarts.txnpush" title="Push Failure" nonNegativeRate />
+        <Metric name="cr.node.txn.restarts.unknown" title="Unknown" nonNegativeRate />
       </Axis>
     </LineGraph>,
 

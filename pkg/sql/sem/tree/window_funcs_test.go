@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tree
 
@@ -21,9 +17,11 @@ import (
 	"math/rand"
 	"testing"
 
-	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
@@ -36,9 +34,8 @@ func testRangeMode(t *testing.T, count int) {
 	defer evalCtx.Stop(context.Background())
 
 	wfr := &WindowFrameRun{
-		Rows:        makeIntSortedPartition(count),
-		ArgIdxStart: 0,
-		ArgCount:    1,
+		Rows:     makeIntSortedPartition(count),
+		ArgsIdxs: []uint32{0},
 	}
 	wfr.PlusOp, wfr.MinusOp, _ = WindowFrameRangeOps{}.LookupImpl(types.Int, types.Int)
 	testStartPreceding(t, evalCtx, wfr, types.Int)
@@ -53,7 +50,7 @@ func testRangeMode(t *testing.T, count int) {
 	testEndPreceding(t, evalCtx, wfr, types.Float)
 	testEndFollowing(t, evalCtx, wfr, types.Float)
 
-	wfr.Rows = makeDecimalSortedPartition(count)
+	wfr.Rows = makeDecimalSortedPartition(t, count)
 	wfr.PlusOp, wfr.MinusOp, _ = WindowFrameRangeOps{}.LookupImpl(types.Decimal, types.Decimal)
 	testStartPreceding(t, evalCtx, wfr, types.Decimal)
 	testStartFollowing(t, evalCtx, wfr, types.Decimal)
@@ -62,7 +59,7 @@ func testRangeMode(t *testing.T, count int) {
 }
 
 func testStartPreceding(
-	t *testing.T, evalCtx *EvalContext, wfr *WindowFrameRun, offsetType types.T,
+	t *testing.T, evalCtx *EvalContext, wfr *WindowFrameRun, offsetType *types.T,
 ) {
 	wfr.Frame = &WindowFrame{
 		Mode:   RANGE,
@@ -70,32 +67,39 @@ func testStartPreceding(
 	}
 	for offset := minOffset; offset < maxOffset; offset += rand.Intn(maxOffset / 10) {
 		var typedOffset Datum
-		switch offsetType {
-		case types.Int:
+		switch offsetType.Family() {
+		case types.IntFamily:
 			typedOffset = NewDInt(DInt(offset))
-		case types.Float:
+		case types.FloatFamily:
 			typedOffset = NewDFloat(DFloat(offset))
-		case types.Decimal:
+		case types.DecimalFamily:
 			decimal := apd.Decimal{}
 			decimal.SetInt64(int64(offset))
 			typedOffset = &DDecimal{Decimal: decimal}
 		default:
-			panic("unsupported offset type")
+			t.Fatal("unsupported offset type")
 		}
 		wfr.StartBoundOffset = typedOffset
 		for wfr.RowIdx = 0; wfr.RowIdx < wfr.PartitionSize(); wfr.RowIdx++ {
-			frameStart := wfr.FrameStartIdx(evalCtx)
-			value, err := wfr.getValueByOffset(evalCtx, typedOffset, true /* negative */)
+			frameStartIdx, err := wfr.FrameStartIdx(evalCtx.Ctx(), evalCtx)
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+			value, err := wfr.getValueByOffset(evalCtx.Ctx(), evalCtx, typedOffset, true /* negative */)
 			if err != nil {
 				t.Errorf("unexpected error: %v", err)
 			}
 			for idx := 0; idx <= wfr.RowIdx; idx++ {
-				if value.Compare(evalCtx, wfr.valueAt(idx)) <= 0 {
-					if idx != frameStart {
-						t.Errorf("FrameStartIdx returned wrong result on Preceding: expected %+v, found %+v", idx, frameStart)
-						t.Errorf("Search for %+v when cur is %+v with wfr.RowIdx=%+v", value, wfr.valueAt(wfr.RowIdx), wfr.RowIdx)
-						t.Errorf(partitionToString(wfr.Rows))
-						panic("")
+				valueAt, err := wfr.valueAt(evalCtx.Ctx(), idx)
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
+				if value.Compare(evalCtx, valueAt) <= 0 {
+					if idx != frameStartIdx {
+						t.Errorf("FrameStartIdx returned wrong result on Preceding: expected %+v, found %+v", idx, frameStartIdx)
+						t.Errorf("Search for %+v when wfr.RowIdx=%+v", value, wfr.RowIdx)
+						t.Errorf(partitionToString(evalCtx.Ctx(), wfr.Rows))
+						t.Fatal("")
 					}
 					break
 				}
@@ -105,7 +109,7 @@ func testStartPreceding(
 }
 
 func testStartFollowing(
-	t *testing.T, evalCtx *EvalContext, wfr *WindowFrameRun, offsetType types.T,
+	t *testing.T, evalCtx *EvalContext, wfr *WindowFrameRun, offsetType *types.T,
 ) {
 	wfr.Frame = &WindowFrame{
 		Mode:   RANGE,
@@ -113,32 +117,48 @@ func testStartFollowing(
 	}
 	for offset := minOffset; offset < maxOffset; offset += rand.Intn(maxOffset / 10) {
 		var typedOffset Datum
-		switch offsetType {
-		case types.Int:
+		switch offsetType.Family() {
+		case types.IntFamily:
 			typedOffset = NewDInt(DInt(offset))
-		case types.Float:
+		case types.FloatFamily:
 			typedOffset = NewDFloat(DFloat(offset))
-		case types.Decimal:
+		case types.DecimalFamily:
 			decimal := apd.Decimal{}
 			decimal.SetInt64(int64(offset))
 			typedOffset = &DDecimal{Decimal: decimal}
 		default:
-			panic("unsupported offset type")
+			t.Fatal("unsupported offset type")
 		}
 		wfr.StartBoundOffset = typedOffset
 		for wfr.RowIdx = 0; wfr.RowIdx < wfr.PartitionSize(); wfr.RowIdx++ {
-			frameStart := wfr.FrameStartIdx(evalCtx)
-			value, err := wfr.getValueByOffset(evalCtx, typedOffset, false /* negative */)
+			frameStartIdx, err := wfr.FrameStartIdx(evalCtx.Ctx(), evalCtx)
 			if err != nil {
 				t.Errorf("unexpected error: %v", err)
 			}
-			for idx := wfr.RowIdx; idx <= wfr.PartitionSize(); idx++ {
-				if idx == wfr.PartitionSize() || value.Compare(evalCtx, wfr.valueAt(idx)) <= 0 {
-					if idx != frameStart {
-						t.Errorf("FrameStartIdx returned wrong result on Following: expected %+v, found %+v", idx, frameStart)
-						t.Errorf("Search for %+v when cur is %+v with wfr.RowIdx=%+v", value, wfr.valueAt(wfr.RowIdx), wfr.RowIdx)
-						t.Errorf(partitionToString(wfr.Rows))
-						panic("")
+			value, err := wfr.getValueByOffset(evalCtx.Ctx(), evalCtx, typedOffset, false /* negative */)
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+			for idx := 0; idx <= wfr.PartitionSize(); idx++ {
+				if idx == wfr.PartitionSize() {
+					if idx != frameStartIdx {
+						t.Errorf("FrameStartIdx returned wrong result on Following: expected %+v, found %+v", idx, frameStartIdx)
+						t.Errorf("Search for %+v when wfr.RowIdx=%+v", value, wfr.RowIdx)
+						t.Errorf(partitionToString(evalCtx.Ctx(), wfr.Rows))
+						t.Fatal("")
+					}
+					break
+				}
+				valueAt, err := wfr.valueAt(evalCtx.Ctx(), idx)
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
+				if value.Compare(evalCtx, valueAt) <= 0 {
+					if idx != frameStartIdx {
+						t.Errorf("FrameStartIdx returned wrong result on Following: expected %+v, found %+v", idx, frameStartIdx)
+						t.Errorf("Search for %+v when wfr.RowIdx=%+v", value, wfr.RowIdx)
+						t.Errorf(partitionToString(evalCtx.Ctx(), wfr.Rows))
+						t.Fatal("")
 					}
 					break
 				}
@@ -147,39 +167,48 @@ func testStartFollowing(
 	}
 }
 
-func testEndPreceding(t *testing.T, evalCtx *EvalContext, wfr *WindowFrameRun, offsetType types.T) {
+func testEndPreceding(
+	t *testing.T, evalCtx *EvalContext, wfr *WindowFrameRun, offsetType *types.T,
+) {
 	wfr.Frame = &WindowFrame{
 		Mode:   RANGE,
 		Bounds: WindowFrameBounds{StartBound: &WindowFrameBound{BoundType: OffsetPreceding}, EndBound: &WindowFrameBound{BoundType: OffsetPreceding}},
 	}
 	for offset := minOffset; offset < maxOffset; offset += rand.Intn(maxOffset / 10) {
 		var typedOffset Datum
-		switch offsetType {
-		case types.Int:
+		switch offsetType.Family() {
+		case types.IntFamily:
 			typedOffset = NewDInt(DInt(offset))
-		case types.Float:
+		case types.FloatFamily:
 			typedOffset = NewDFloat(DFloat(offset))
-		case types.Decimal:
+		case types.DecimalFamily:
 			decimal := apd.Decimal{}
 			decimal.SetInt64(int64(offset))
 			typedOffset = &DDecimal{Decimal: decimal}
 		default:
-			panic("unsupported offset type")
+			t.Fatal("unsupported offset type")
 		}
 		wfr.EndBoundOffset = typedOffset
 		for wfr.RowIdx = 0; wfr.RowIdx < wfr.PartitionSize(); wfr.RowIdx++ {
-			frameEnd := wfr.FrameEndIdx(evalCtx)
-			value, err := wfr.getValueByOffset(evalCtx, typedOffset, true /* negative */)
+			frameEndIdx, err := wfr.FrameEndIdx(evalCtx.Ctx(), evalCtx)
 			if err != nil {
 				t.Errorf("unexpected error: %v", err)
 			}
-			for idx := wfr.RowIdx; idx >= 0; idx-- {
-				if value.Compare(evalCtx, wfr.valueAt(idx)) >= 0 {
-					if idx+1 != frameEnd {
-						t.Errorf("FrameEndIdx returned wrong result on Preceding: expected %+v, found %+v", idx+1, frameEnd)
-						t.Errorf("Search for %+v when cur is %+v with wfr.RowIdx=%+v", value, wfr.valueAt(wfr.RowIdx), wfr.RowIdx)
-						t.Errorf(partitionToString(wfr.Rows))
-						panic("")
+			value, err := wfr.getValueByOffset(evalCtx.Ctx(), evalCtx, typedOffset, true /* negative */)
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+			for idx := wfr.PartitionSize() - 1; idx >= 0; idx-- {
+				valueAt, err := wfr.valueAt(evalCtx.Ctx(), idx)
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
+				if value.Compare(evalCtx, valueAt) >= 0 {
+					if idx+1 != frameEndIdx {
+						t.Errorf("FrameEndIdx returned wrong result on Preceding: expected %+v, found %+v", idx+1, frameEndIdx)
+						t.Errorf("Search for %+v when wfr.RowIdx=%+v", value, wfr.RowIdx)
+						t.Errorf(partitionToString(evalCtx.Ctx(), wfr.Rows))
+						t.Fatal("")
 					}
 					break
 				}
@@ -188,39 +217,48 @@ func testEndPreceding(t *testing.T, evalCtx *EvalContext, wfr *WindowFrameRun, o
 	}
 }
 
-func testEndFollowing(t *testing.T, evalCtx *EvalContext, wfr *WindowFrameRun, offsetType types.T) {
+func testEndFollowing(
+	t *testing.T, evalCtx *EvalContext, wfr *WindowFrameRun, offsetType *types.T,
+) {
 	wfr.Frame = &WindowFrame{
 		Mode:   RANGE,
 		Bounds: WindowFrameBounds{StartBound: &WindowFrameBound{BoundType: OffsetPreceding}, EndBound: &WindowFrameBound{BoundType: OffsetFollowing}},
 	}
 	for offset := minOffset; offset < maxOffset; offset += rand.Intn(maxOffset / 10) {
 		var typedOffset Datum
-		switch offsetType {
-		case types.Int:
+		switch offsetType.Family() {
+		case types.IntFamily:
 			typedOffset = NewDInt(DInt(offset))
-		case types.Float:
+		case types.FloatFamily:
 			typedOffset = NewDFloat(DFloat(offset))
-		case types.Decimal:
+		case types.DecimalFamily:
 			decimal := apd.Decimal{}
 			decimal.SetInt64(int64(offset))
 			typedOffset = &DDecimal{Decimal: decimal}
 		default:
-			panic("unsupported offset type")
+			t.Fatal("unsupported offset type")
 		}
 		wfr.EndBoundOffset = typedOffset
 		for wfr.RowIdx = 0; wfr.RowIdx < wfr.PartitionSize(); wfr.RowIdx++ {
-			frameEnd := wfr.FrameEndIdx(evalCtx)
-			value, err := wfr.getValueByOffset(evalCtx, typedOffset, false /* negative */)
+			frameEndIdx, err := wfr.FrameEndIdx(evalCtx.Ctx(), evalCtx)
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+			value, err := wfr.getValueByOffset(evalCtx.Ctx(), evalCtx, typedOffset, false /* negative */)
 			if err != nil {
 				t.Errorf("unexpected error: %v", err)
 			}
 			for idx := wfr.PartitionSize() - 1; idx >= wfr.RowIdx; idx-- {
-				if value.Compare(evalCtx, wfr.valueAt(idx)) >= 0 {
-					if idx+1 != frameEnd {
-						t.Errorf("FrameEndIdx returned wrong result on Following: expected %+v, found %+v", idx+1, frameEnd)
-						t.Errorf("Search for %+v when cur is %+v with wfr.RowIdx=%+v", value, wfr.valueAt(wfr.RowIdx), wfr.RowIdx)
-						t.Errorf(partitionToString(wfr.Rows))
-						panic("")
+				valueAt, err := wfr.valueAt(evalCtx.Ctx(), idx)
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
+				if value.Compare(evalCtx, valueAt) >= 0 {
+					if idx+1 != frameEndIdx {
+						t.Errorf("FrameEndIdx returned wrong result on Following: expected %+v, found %+v", idx+1, frameEndIdx)
+						t.Errorf("Search for %+v when wfr.RowIdx=%+v", value, wfr.RowIdx)
+						t.Errorf(partitionToString(evalCtx.Ctx(), wfr.Rows))
+						t.Fatal("")
 					}
 					break
 				}
@@ -255,7 +293,7 @@ func makeFloatSortedPartition(count int) indexedRows {
 	return partition
 }
 
-func makeDecimalSortedPartition(count int) indexedRows {
+func makeDecimalSortedPartition(t *testing.T, count int) indexedRows {
 	partition := indexedRows{rows: make([]indexedRow, count)}
 	r := rand.New(rand.NewSource(timeutil.Now().UnixNano()))
 	number := &DDecimal{}
@@ -264,37 +302,44 @@ func makeDecimalSortedPartition(count int) indexedRows {
 		if r.Float64() < probabilityOfNewNumber {
 			_, err := tmp.SetFloat64(r.Float64() * 10)
 			if err != nil {
-				panic(fmt.Sprintf("unexpected error: %v", err))
+				t.Fatalf("unexpected error: %v", err)
 			}
 			_, err = ExactCtx.Add(&number.Decimal, &number.Decimal, &tmp)
 			if err != nil {
-				panic(fmt.Sprintf("unexpected error: %v", err))
+				t.Fatalf("unexpected error: %v", err)
 			}
 		}
 		value := &DDecimal{}
 		_, err := tmp.SetFloat64(0)
 		if err != nil {
-			panic(fmt.Sprintf("unexpected error: %v", err))
+			t.Fatalf("unexpected error: %v", err)
 		}
 		_, err = ExactCtx.Add(&value.Decimal, &number.Decimal, &tmp)
 		if err != nil {
-			panic(fmt.Sprintf("unexpected error: %v", err))
+			t.Fatalf("unexpected error: %v", err)
 		}
 		partition.rows[idx] = indexedRow{idx: idx, row: Datums{value}}
 	}
 	return partition
 }
 
-func partitionToString(partition IndexedRows) string {
+func partitionToString(ctx context.Context, partition IndexedRows) string {
 	var buffer bytes.Buffer
+	var err error
+	var row IndexedRow
 	buffer.WriteString("\n")
 	for idx := 0; idx < partition.Len(); idx++ {
-		buffer.WriteString(fmt.Sprintf("%+v\n", partition.GetRow(idx)))
+		if row, err = partition.GetRow(ctx, idx); err != nil {
+			return err.Error()
+		}
+		buffer.WriteString(fmt.Sprintf("%+v\n", row))
 	}
 	return buffer.String()
 }
 
 func TestRangeMode(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	var counts = [...]int{1, 17, 42, 91}
 	for _, count := range counts {
 		testRangeMode(t, count)
@@ -312,8 +357,8 @@ func (ir indexedRows) Len() int {
 }
 
 // GetRow implements IndexedRows interface.
-func (ir indexedRows) GetRow(idx int) IndexedRow {
-	return ir.rows[idx]
+func (ir indexedRows) GetRow(_ context.Context, idx int) (IndexedRow, error) {
+	return ir.rows[idx], nil
 }
 
 // indexedRow is a row with a corresponding index.
@@ -328,11 +373,15 @@ func (ir indexedRow) GetIdx() int {
 }
 
 // GetDatum implements IndexedRow interface.
-func (ir indexedRow) GetDatum(colIdx int) Datum {
-	return ir.row[colIdx]
+func (ir indexedRow) GetDatum(colIdx int) (Datum, error) {
+	return ir.row[colIdx], nil
 }
 
-// GetDatum implements tree.IndexedRow interface.
-func (ir indexedRow) GetDatums(firstColIdx, lastColIdx int) Datums {
-	return ir.row[firstColIdx:lastColIdx]
+// GetDatums implements IndexedRow interface.
+func (ir indexedRow) GetDatums(firstColIdx, lastColIdx int) (Datums, error) {
+	return ir.row[firstColIdx:lastColIdx], nil
+}
+
+func (ir indexedRow) String() string {
+	return fmt.Sprintf("%d: %s", ir.idx, ir.row.String())
 }

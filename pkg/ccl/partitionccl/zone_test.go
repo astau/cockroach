@@ -15,24 +15,28 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
 func TestValidIndexPartitionSetShowZones(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	sqlDB := sqlutils.MakeSQLRunner(db)
 	sqlDB.Exec(t, `
@@ -43,77 +47,65 @@ func TestValidIndexPartitionSetShowZones(t *testing.T) {
 			PARTITION p1 VALUES IN (DEFAULT)
 		)`)
 
-	yamlDefault := fmt.Sprintf("gc: {ttlseconds: %d}", config.DefaultZoneConfig().GC.TTLSeconds)
+	yamlDefault := fmt.Sprintf("gc: {ttlseconds: %d}", s.(*server.TestServer).Cfg.DefaultZoneConfig.GC.TTLSeconds)
 	yamlOverride := "gc: {ttlseconds: 42}"
-	zoneOverride := config.DefaultZoneConfig()
-	zoneOverride.GC = &config.GCPolicy{TTLSeconds: 42}
-	partialZoneOverride := *config.NewZoneConfig()
-	partialZoneOverride.GC = &config.GCPolicy{TTLSeconds: 42}
+	zoneOverride := s.(*server.TestServer).Cfg.DefaultZoneConfig
+	zoneOverride.GC = &zonepb.GCPolicy{TTLSeconds: 42}
+	partialZoneOverride := *zonepb.NewZoneConfig()
+	partialZoneOverride.GC = &zonepb.GCPolicy{TTLSeconds: 42}
 
 	dbID := sqlutils.QueryDatabaseID(t, db, "d")
-	tableID := sqlutils.QueryTableID(t, db, "d", "t")
+	tableID := sqlutils.QueryTableID(t, db, "d", "public", "t")
 
 	defaultRow := sqlutils.ZoneRow{
-		ID:           keys.RootNamespaceID,
-		CLISpecifier: ".default",
-		Config:       config.DefaultZoneConfig(),
+		ID:     keys.RootNamespaceID,
+		Config: s.(*server.TestServer).Cfg.DefaultZoneConfig,
 	}
 	defaultOverrideRow := sqlutils.ZoneRow{
-		ID:           keys.RootNamespaceID,
-		CLISpecifier: ".default",
-		Config:       zoneOverride,
+		ID:     keys.RootNamespaceID,
+		Config: zoneOverride,
 	}
 	dbRow := sqlutils.ZoneRow{
-		ID:           dbID,
-		CLISpecifier: "d",
-		Config:       zoneOverride,
+		ID:     dbID,
+		Config: zoneOverride,
 	}
 	tableRow := sqlutils.ZoneRow{
-		ID:           tableID,
-		CLISpecifier: "d.t",
-		Config:       zoneOverride,
+		ID:     tableID,
+		Config: zoneOverride,
 	}
 	primaryRow := sqlutils.ZoneRow{
-		ID:           tableID,
-		CLISpecifier: "d.t@primary",
-		Config:       zoneOverride,
+		ID:     tableID,
+		Config: zoneOverride,
 	}
 	p0Row := sqlutils.ZoneRow{
-		ID:           tableID,
-		CLISpecifier: "d.t.p0",
-		Config:       zoneOverride,
+		ID:     tableID,
+		Config: zoneOverride,
 	}
 	p1Row := sqlutils.ZoneRow{
-		ID:           tableID,
-		CLISpecifier: "d.t.p1",
-		Config:       zoneOverride,
+		ID:     tableID,
+		Config: zoneOverride,
 	}
 
 	// Partially filled config rows
 	partialDbRow := sqlutils.ZoneRow{
-		ID:           dbID,
-		CLISpecifier: "d",
-		Config:       partialZoneOverride,
+		ID:     dbID,
+		Config: partialZoneOverride,
 	}
 	partialTableRow := sqlutils.ZoneRow{
-		ID:           tableID,
-		CLISpecifier: "d.t",
-		Config:       partialZoneOverride,
+		ID:     tableID,
+		Config: partialZoneOverride,
 	}
 	partialPrimaryRow := sqlutils.ZoneRow{
-		ID:           tableID,
-		CLISpecifier: "d.t@primary",
-		Config:       partialZoneOverride,
+		ID:     tableID,
+		Config: partialZoneOverride,
 	}
 	partialP0Row := sqlutils.ZoneRow{
-		ID:           tableID,
-		CLISpecifier: "d.t.p0",
-		Config:       partialZoneOverride,
+		ID:     tableID,
+		Config: partialZoneOverride,
 	}
 	partialP1Row := sqlutils.ZoneRow{
-		ID:           tableID,
-		CLISpecifier: "d.t.p1",
-		Config:       partialZoneOverride,
+		ID:     tableID,
+		Config: partialZoneOverride,
 	}
 
 	// Remove stock zone configs installed at cluster bootstrap. Otherwise this
@@ -242,9 +234,10 @@ func TestValidIndexPartitionSetShowZones(t *testing.T) {
 
 func TestInvalidIndexPartitionSetShowZones(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	for i, tc := range []struct {
 		query string
@@ -283,6 +276,7 @@ func TestInvalidIndexPartitionSetShowZones(t *testing.T) {
 
 func TestGenerateSubzoneSpans(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	rng, _ := randutil.NewPseudoRand()
 
 	partitioningTests := allPartitioningTests(rng)
@@ -298,8 +292,8 @@ func TestGenerateSubzoneSpans(t *testing.T) {
 			}
 			clusterID := uuid.MakeV4()
 			hasNewSubzones := false
-			spans, err := GenerateSubzoneSpans(
-				cluster.NoSettings, clusterID, test.parsed.tableDesc, test.parsed.subzones, hasNewSubzones)
+			spans, err := sql.GenerateSubzoneSpans(
+				cluster.NoSettings, clusterID, keys.SystemSQLCodec, test.parsed.tableDesc, test.parsed.subzones, hasNewSubzones)
 			if err != nil {
 				t.Fatalf("generating subzone spans: %+v", err)
 			}
@@ -307,7 +301,7 @@ func TestGenerateSubzoneSpans(t *testing.T) {
 			var actual []string
 			for _, span := range spans {
 				subzone := test.parsed.subzones[span.SubzoneIndex]
-				idxDesc, err := test.parsed.tableDesc.FindIndexByID(sqlbase.IndexID(subzone.IndexID))
+				idxDesc, err := test.parsed.tableDesc.FindIndexByID(descpb.IndexID(subzone.IndexID))
 				if err != nil {
 					t.Fatalf("could not find index with ID %d: %+v", subzone.IndexID, err)
 				}

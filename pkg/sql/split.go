@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -18,97 +14,33 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/errors"
 )
 
 type splitNode struct {
 	optColumnsSlot
 
-	force     bool
-	tableDesc *sqlbase.TableDescriptor
-	index     *sqlbase.IndexDescriptor
-	rows      planNode
-	run       splitRun
-}
-
-// Split executes a KV split.
-// Privileges: INSERT on table.
-func (p *planner) Split(ctx context.Context, n *tree.Split) (planNode, error) {
-	tableDesc, index, err := p.getTableAndIndex(ctx, n.Table, n.Index, privilege.INSERT)
-	if err != nil {
-		return nil, err
-	}
-	// Calculate the desired types for the select statement. It is OK if the
-	// select statement returns fewer columns (the relevant prefix is used).
-	desiredTypes := make([]types.T, len(index.ColumnIDs))
-	for i, colID := range index.ColumnIDs {
-		c, err := tableDesc.FindColumnByID(colID)
-		if err != nil {
-			return nil, err
-		}
-		desiredTypes[i] = c.Type.ToDatumType()
-	}
-
-	// Create the plan for the split rows source.
-	rows, err := p.newPlan(ctx, n.Rows, desiredTypes)
-	if err != nil {
-		return nil, err
-	}
-
-	cols := planColumns(rows)
-	if len(cols) == 0 {
-		return nil, errors.Errorf("no columns in SPLIT AT data")
-	}
-	if len(cols) > len(index.ColumnIDs) {
-		return nil, errors.Errorf("too many columns in SPLIT AT data")
-	}
-	for i := range cols {
-		if !cols[i].Typ.Equivalent(desiredTypes[i]) {
-			return nil, errors.Errorf(
-				"SPLIT AT data column %d (%s) must be of type %s, not type %s",
-				i+1, index.ColumnNames[i], desiredTypes[i], cols[i].Typ,
-			)
-		}
-	}
-
-	return &splitNode{
-		force:     p.SessionData().ForceSplitAt,
-		tableDesc: tableDesc.TableDesc(),
-		index:     index,
-		rows:      rows,
-	}, nil
-}
-
-var splitNodeColumns = sqlbase.ResultColumns{
-	{
-		Name: "key",
-		Typ:  types.Bytes,
-	},
-	{
-		Name: "pretty",
-		Typ:  types.String,
-	},
+	tableDesc      *tabledesc.Immutable
+	index          *descpb.IndexDescriptor
+	rows           planNode
+	run            splitRun
+	expirationTime hlc.Timestamp
 }
 
 // splitRun contains the run-time state of splitNode during local execution.
 type splitRun struct {
-	lastSplitKey []byte
+	lastSplitKey       []byte
+	lastExpirationTime hlc.Timestamp
 }
 
 func (n *splitNode) startExec(params runParams) error {
-	// This check is not intended to be foolproof. The setting could be outdated
-	// because of gossip inconsistency, or it could change halfway through the
-	// SPLIT AT's execution. It is, however, likely to prevent user error and
-	// confusion in the common case.
-	if !n.force && storagebase.MergeQueueEnabled.Get(&params.p.ExecCfg().Settings.SV) {
-		return errors.New("splits would be immediately discarded by merge queue; " +
-			"disable the merge queue first by running 'SET CLUSTER SETTING kv.range_merge.queue_enabled = false'")
-	}
 	return nil
 }
 
@@ -121,24 +53,30 @@ func (n *splitNode) Next(params runParams) (bool, error) {
 		return ok, err
 	}
 
-	rowKey, err := getRowKey(n.tableDesc, n.index, n.rows.Values())
+	rowKey, err := getRowKey(params.ExecCfg().Codec, n.tableDesc, n.index, n.rows.Values())
 	if err != nil {
 		return false, err
 	}
 
-	if err := params.extendedEvalCtx.ExecCfg.DB.AdminSplit(params.ctx, rowKey, rowKey); err != nil {
+	if err := params.ExecCfg().DB.AdminSplit(params.ctx, rowKey, n.expirationTime); err != nil {
 		return false, err
 	}
 
 	n.run.lastSplitKey = rowKey
+	n.run.lastExpirationTime = n.expirationTime
 
 	return true, nil
 }
 
 func (n *splitNode) Values() tree.Datums {
+	splitEnforcedUntil := tree.DNull
+	if (n.run.lastExpirationTime != hlc.Timestamp{}) {
+		splitEnforcedUntil = tree.TimestampToInexactDTimestamp(n.run.lastExpirationTime)
+	}
 	return tree.Datums{
 		tree.NewDBytes(tree.DBytes(n.run.lastSplitKey)),
-		tree.NewDString(keys.PrettyPrint(nil /* valDirs */, n.run.lastSplitKey)),
+		tree.NewDString(catalogkeys.PrettyKey(nil /* valDirs */, n.run.lastSplitKey, 2)),
+		splitEnforcedUntil,
 	}
 }
 
@@ -149,18 +87,47 @@ func (n *splitNode) Close(ctx context.Context) {
 // getRowKey generates a key that corresponds to a row (or prefix of a row) in a table or index.
 // Both tableDesc and index are required (index can be the primary index).
 func getRowKey(
-	tableDesc *sqlbase.TableDescriptor, index *sqlbase.IndexDescriptor, values []tree.Datum,
+	codec keys.SQLCodec,
+	tableDesc catalog.TableDescriptor,
+	index *descpb.IndexDescriptor,
+	values []tree.Datum,
 ) ([]byte, error) {
-	colMap := make(map[sqlbase.ColumnID]int)
+	colMap := make(map[descpb.ColumnID]int)
 	for i := range values {
 		colMap[index.ColumnIDs[i]] = i
 	}
-	prefix := sqlbase.MakeIndexKeyPrefix(tableDesc, index.ID)
-	key, _, err := sqlbase.EncodePartialIndexKey(
+	prefix := rowenc.MakeIndexKeyPrefix(codec, tableDesc, index.ID)
+	key, _, err := rowenc.EncodePartialIndexKey(
 		tableDesc, index, len(values), colMap, values, prefix,
 	)
 	if err != nil {
 		return nil, err
 	}
 	return key, nil
+}
+
+// parseExpriationTime parses an expression into a hlc.Timestamp representing
+// the expiration time of the split.
+func parseExpirationTime(
+	evalCtx *tree.EvalContext, expireExpr tree.TypedExpr,
+) (hlc.Timestamp, error) {
+	if !tree.IsConst(evalCtx, expireExpr) {
+		return hlc.Timestamp{}, errors.Errorf("SPLIT AT: only constant expressions are allowed for expiration")
+	}
+	d, err := expireExpr.Eval(evalCtx)
+	if err != nil {
+		return hlc.Timestamp{}, err
+	}
+	if d == tree.DNull {
+		return hlc.MaxTimestamp, nil
+	}
+	stmtTimestamp := evalCtx.GetStmtTimestamp()
+	ts, err := tree.DatumToHLC(evalCtx, stmtTimestamp, d)
+	if err != nil {
+		return ts, errors.Wrap(err, "SPLIT AT")
+	}
+	if ts.GoTime().Before(stmtTimestamp) {
+		return ts, errors.Errorf("SPLIT AT: expiration time should be greater than or equal to current time")
+	}
+	return ts, nil
 }

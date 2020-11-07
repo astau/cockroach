@@ -1,25 +1,25 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 import React from "react";
 import _ from "lodash";
 import { assert } from "chai";
 import { shallow } from "enzyme";
 import * as sinon from "sinon";
+import classNames from "classnames/bind";
+import styles from "./sortabletable.module.styl";
 
 import "src/enzymeInit";
 import { SortableTable, SortableColumn, SortSetting } from "src/views/shared/components/sortabletable";
+
+const cx = classNames.bind(styles);
 
 const columns: SortableColumn[] = [
   {
@@ -52,7 +52,7 @@ describe("<SortableTable>", () => {
       const wrapper = makeTable(1);
       assert.lengthOf(wrapper.find("table"), 1, "one table");
       assert.lengthOf(wrapper.find("thead").find("tr"), 1, "one header row");
-      assert.lengthOf(wrapper.find("tr.sort-table__row--header"), 1, "column header row");
+      assert.lengthOf(wrapper.find(`tr.${cx("sort-table__row--header")}`), 1, "column header row");
       assert.lengthOf(wrapper.find("tbody"), 1, "tbody element");
     });
 
@@ -62,10 +62,10 @@ describe("<SortableTable>", () => {
 
       // Verify header structure.
       assert.equal(wrapper.find("tbody").find("tr").length, rowCount, "correct number of rows");
-      const headers = wrapper.find("tr.sort-table__row--header");
+      const headers = wrapper.find(`tr.${cx("sort-table__row--header")}`);
       _.each(columns, (c, index) => {
         const header = headers.childAt(index);
-        assert.isTrue(header.is(".sort-table__cell"), "header is correct class.");
+        assert.isTrue(header.is(`.${cx("sort-table__cell")}`), "header is correct class.");
         assert.equal(header.text(), c.title, "header has correct title.");
       });
 
@@ -80,27 +80,27 @@ describe("<SortableTable>", () => {
       });
 
       // Nothing is sorted.
-      assert.lengthOf(wrapper.find("th.sort-table__cell--ascending"), 0, "expected zero sorted columns.");
-      assert.lengthOf(wrapper.find("th.sort-table__cell--descending"), 0, "expected zero sorted columns.");
+      assert.lengthOf(wrapper.find(`th.${cx("sort-table__cell--ascending")}`), 0, "expected zero sorted columns.");
+      assert.lengthOf(wrapper.find(`th.${cx("sort-table__cell--descending")}`), 0, "expected zero sorted columns.");
     });
 
     it("renders sorted column correctly.", () => {
       // ascending = false.
       let wrapper = makeTable(1, { sortKey: 1, ascending: false });
 
-      let sortHeader = wrapper.find("th.sort-table__cell--descending");
+      let sortHeader = wrapper.find(`th.${cx("sort-table__cell--descending")}`);
       assert.lengthOf(sortHeader, 1, "only a single column is sorted descending.");
       assert.equal(sortHeader.text(), columns[0].title, "first column should be sorted.");
-      sortHeader = wrapper.find("th.sort-table__cell--ascending");
+      sortHeader = wrapper.find(`th.${cx("sort-table__cell--ascending")}`);
       assert.lengthOf(sortHeader, 0, "no columns are sorted ascending.");
 
       // ascending = true
       wrapper = makeTable(1, { sortKey: 2, ascending: true });
 
-      sortHeader = wrapper.find("th.sort-table__cell--ascending");
+      sortHeader = wrapper.find(`th.${cx("sort-table__cell--ascending")}`);
       assert.lengthOf(sortHeader, 1, "only a single column is sorted ascending.");
       assert.equal(sortHeader.text(), columns[1].title, "second column should be sorted.");
-      sortHeader = wrapper.find("th.sort-table__cell--descending");
+      sortHeader = wrapper.find(`th.${cx("sort-table__cell--descending")}`);
       assert.lengthOf(sortHeader, 0, "no columns are sorted descending.");
     });
   });
@@ -109,7 +109,7 @@ describe("<SortableTable>", () => {
     it("sorts descending on initial click.", () => {
       const spy = sinon.spy();
       const wrapper = makeTable(1, undefined, spy);
-      wrapper.find("th.sort-table__cell--sortable").first().simulate("click");
+      wrapper.find(`th.${cx("sort-table__cell")}`).first().simulate("click");
       assert.isTrue(spy.calledOnce);
       assert.isTrue(spy.calledWith({
         sortKey: 1,
@@ -122,7 +122,7 @@ describe("<SortableTable>", () => {
       const spy = sinon.spy();
       const wrapper = makeTable(1, {sortKey: 2, ascending: true}, spy);
 
-      wrapper.find("th.sort-table__cell--sortable").first().simulate("click");
+      wrapper.find(`th.${cx("sort-table__cell")}`).first().simulate("click");
       assert.isTrue(spy.calledOnce);
       assert.isTrue(spy.calledWith({
         sortKey: 1,
@@ -134,7 +134,7 @@ describe("<SortableTable>", () => {
       const spy = sinon.spy();
       const wrapper = makeTable(1, {sortKey: 1, ascending: false}, spy);
 
-      wrapper.find("th.sort-table__cell--sortable").first().simulate("click");
+      wrapper.find(`th.${cx("sort-table__cell")}`).first().simulate("click");
       assert.isTrue(spy.calledOnce);
       assert.isTrue( spy.calledWith({
         sortKey: 1,
@@ -146,7 +146,7 @@ describe("<SortableTable>", () => {
       const spy = sinon.spy();
       const wrapper = makeTable(1, {sortKey: 1, ascending: true}, spy);
 
-      wrapper.find("th.sort-table__cell--sortable").first().simulate("click");
+      wrapper.find(`th.${cx("sort-table__cell")}`).first().simulate("click");
       assert.isTrue(spy.calledOnce);
       assert.isTrue( spy.calledWith({
         sortKey: null,
@@ -159,7 +159,7 @@ describe("<SortableTable>", () => {
       const spy = sinon.spy();
       const wrapper = makeTable(1, {sortKey: 1, ascending: true}, spy);
 
-      wrapper.find("thead th.sort-table__cell").last().simulate("click");
+      wrapper.find(`thead th.${cx("sort-table__cell")}`).last().simulate("click");
       assert.isTrue(spy.notCalled);
     });
   });

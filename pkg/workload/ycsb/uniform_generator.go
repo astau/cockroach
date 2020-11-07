@@ -1,68 +1,55 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package ycsb
 
 import (
-	"math/rand"
-
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"golang.org/x/exp/rand"
 )
 
 // UniformGenerator is a random number generator that generates draws from a
 // uniform distribution.
 type UniformGenerator struct {
-	mu struct {
+	iMin uint64
+	mu   struct {
 		syncutil.Mutex
-		r        *rand.Rand
-		sequence uint64
+		r    *rand.Rand
+		iMax uint64
 	}
 }
 
 // NewUniformGenerator constructs a new UniformGenerator with the given parameters.
 // It returns an error if the parameters are outside the accepted range.
-func NewUniformGenerator(rng *rand.Rand, minInsertRow uint64) (*UniformGenerator, error) {
+func NewUniformGenerator(rng *rand.Rand, iMin, iMax uint64) (*UniformGenerator, error) {
 
 	z := UniformGenerator{}
+	z.iMin = iMin
 	z.mu.r = rng
-	z.mu.sequence = minInsertRow
+	z.mu.iMax = iMax
 
 	return &z, nil
 }
 
-// IMaxHead returns the current value of IMaxHead, without incrementing.
-func (z *UniformGenerator) IMaxHead() uint64 {
+// IncrementIMax increments iMax by count.
+func (z *UniformGenerator) IncrementIMax(count uint64) error {
 	z.mu.Lock()
-	max := z.mu.sequence
-	z.mu.Unlock()
-	return max
-}
-
-// IncrementIMax increments the sequence number.
-func (z *UniformGenerator) IncrementIMax() error {
-	z.mu.Lock()
-	z.mu.sequence++
-	z.mu.Unlock()
+	defer z.mu.Unlock()
+	z.mu.iMax += count
 	return nil
 }
 
-// Uint64 returns a random Uint64 between min and sequence, drawn from a uniform
+// Uint64 returns a random Uint64 between iMin and iMax, drawn from a uniform
 // distribution.
 func (z *UniformGenerator) Uint64() uint64 {
 	z.mu.Lock()
-	result := rand.Uint64() % z.mu.sequence
-	z.mu.Unlock()
-	return result
+	defer z.mu.Unlock()
+	return (uint64)(z.mu.r.Int63n((int64)(z.mu.iMax-z.iMin+1))) + z.iMin
 }

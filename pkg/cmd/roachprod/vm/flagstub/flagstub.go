@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package flagstub
 
@@ -19,7 +14,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachprod/vm"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // New wraps a delegate vm.Provider to only return its name and
@@ -28,12 +23,12 @@ import (
 // implemented as no-op or no-value. All other operations will
 // return the provided error.
 func New(delegate vm.Provider, unimplemented string) vm.Provider {
-	return &provider{delegate: delegate, unimplemented: errors.New(unimplemented)}
+	return &provider{delegate: delegate, unimplemented: unimplemented}
 }
 
 type provider struct {
 	delegate      vm.Provider
-	unimplemented error
+	unimplemented string
 }
 
 // CleanSSH implements vm.Provider and is a no-op.
@@ -48,17 +43,17 @@ func (p *provider) ConfigSSH() error {
 
 // Create implements vm.Provider and returns Unimplemented.
 func (p *provider) Create(names []string, opts vm.CreateOpts) error {
-	return p.unimplemented
+	return errors.Newf("%s", p.unimplemented)
 }
 
 // Delete implements vm.Provider and returns Unimplemented.
 func (p *provider) Delete(vms vm.List) error {
-	return p.unimplemented
+	return errors.Newf("%s", p.unimplemented)
 }
 
 // Extend implements vm.Provider and returns Unimplemented.
 func (p *provider) Extend(vms vm.List, lifetime time.Duration) error {
-	return p.unimplemented
+	return errors.Newf("%s", p.unimplemented)
 }
 
 // FindActiveAccount implements vm.Provider and returns an empty account.
@@ -79,4 +74,9 @@ func (p *provider) List() (vm.List, error) {
 // Name implements vm.Provider and returns the delegate's name.
 func (p *provider) Name() string {
 	return p.delegate.Name()
+}
+
+// Active is part of the vm.Provider interface.
+func (p *provider) Active() bool {
+	return false
 }

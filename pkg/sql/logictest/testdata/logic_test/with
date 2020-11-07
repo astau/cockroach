@@ -1,8 +1,3 @@
-# LogicTest: local local-opt local-parallel-stmts fakedist fakedist-opt fakedist-metadata
-
-query error unsupported multiple use of CTE clause "a"
-WITH a AS (SELECT 1) SELECT * FROM a CROSS JOIN a
-
 statement ok
 CREATE TABLE x(a) AS SELECT generate_series(1, 3)
 
@@ -55,6 +50,9 @@ WITH t(b, a) AS (SELECT true a, false b)
   SELECT a, b FROM t
 ----
 false  true
+
+statement error WITH clause containing a data-modifying statement must be at the top level
+SELECT (WITH foo AS (INSERT INTO y VALUES (1) RETURNING *) SELECT * FROM foo)
 
 statement error WITH query name t specified more than once
 WITH
@@ -138,46 +136,11 @@ SELECT * from x
 ----
 
 # #22420: ensure okay error message for CTE clause without output columns
-query error WITH clause "t" does not have a RETURNING clause
+query error WITH clause "t" does not return any columns
 WITH t AS (
     INSERT INTO x(a) VALUES(0)
 )
 SELECT * FROM t
-
-# Regression test for #24307 until CockroachDB learns how to execute
-# side effects no matter what.
-query error unimplemented: common table expression "t" with side effects was not used in query
-WITH t AS (
-   INSERT INTO x(a) VALUES(0) RETURNING a
-)
-SELECT 1
-
-query error unimplemented: common table expression "t" with side effects was not used in query
-WITH t AS (
-   SELECT * FROM (
-      WITH b AS (INSERT INTO x(a) VALUES(0) RETURNING a)
-	  TABLE b
-   )
-)
-SELECT 1
-
-query error unimplemented: common table expression "t" with side effects was not used in query
-WITH t AS (
-   DELETE FROM x RETURNING a
-)
-SELECT 1
-
-query error unimplemented: common table expression "t" with side effects was not used in query
-WITH t AS (
-   UPSERT INTO x(a) VALUES(0) RETURNING a
-)
-SELECT 1
-
-query error unimplemented: common table expression "t" with side effects was not used in query
-WITH t AS (
-   UPDATE x SET a = 0 RETURNING a
-)
-SELECT 1
 
 # however if there are no side effects, no errors are required.
 query I
@@ -237,3 +200,450 @@ query I
 ((WITH lim(x) AS (SELECT 1) SELECT 123) LIMIT (SELECT x FROM lim))
 ----
 123
+
+# CTE with an ORDER BY.
+
+statement ok
+CREATE TABLE ab (a INT PRIMARY KEY, b INT)
+
+statement ok
+INSERT INTO ab VALUES (1, 2), (3, 4), (5, 6)
+
+query I rowsort
+WITH a AS (SELECT a FROM ab ORDER BY b) SELECT * FROM a
+----
+1
+3
+5
+
+statement ok
+CREATE TABLE x2(a) AS SELECT generate_series(1, 3)
+
+statement ok
+CREATE TABLE y2(b) AS SELECT generate_series(2, 4)
+
+# Referencing a CTE multiple times.
+query II rowsort
+WITH t AS (SELECT b FROM y2) SELECT * FROM t JOIN t AS q ON true
+----
+2  2
+2  3
+2  4
+3  2
+3  3
+3  4
+4  2
+4  3
+4  4
+
+query II rowsort
+WITH
+    one AS (SELECT a AS u FROM x2),
+    two AS (SELECT b AS v FROM (SELECT b FROM y2 UNION ALL SELECT u FROM one))
+SELECT
+    *
+FROM
+    one JOIN two ON u = v
+----
+1  1
+2  2
+3  3
+2  2
+3  3
+
+# Mutation CTEs that aren't referenced elsewhere in the query.
+statement ok
+CREATE TABLE z (c INT PRIMARY KEY);
+
+query I
+WITH foo AS (INSERT INTO z VALUES (10) RETURNING 1) SELECT 2
+----
+2
+
+query I
+SELECT * FROM z
+----
+10
+
+query I
+WITH foo AS (UPDATE z SET c = 20 RETURNING 1) SELECT 3
+----
+3
+
+query I
+SELECT * FROM z
+----
+20
+
+query I
+WITH foo AS (DELETE FROM z RETURNING 1) SELECT 4
+----
+4
+
+query I
+SELECT count(*) FROM z
+----
+0
+
+# WITH and prepared statements.
+
+statement ok
+CREATE TABLE engineer (
+    fellow BOOL NOT NULL, id INT4 NOT NULL, companyname VARCHAR(255) NOT NULL,
+    PRIMARY KEY (id, companyname)
+)
+
+statement ok
+PREPARE x (INT4, VARCHAR, INT4, VARCHAR) AS
+  WITH ht_engineer (id, companyname) AS (
+    SELECT id, companyname FROM (VALUES ($1, $2), ($3, $4)) AS ht (id, companyname)
+  )
+DELETE FROM engineer WHERE (id, companyname) IN (SELECT id, companyname FROM ht_engineer)
+
+statement ok
+EXECUTE x (1, 'fo', 2, 'bar')
+
+statement ok
+PREPARE z(int) AS WITH foo AS (SELECT * FROM x2 WHERE a = $1) SELECT * FROM foo
+
+query I
+EXECUTE z(1)
+----
+1
+
+query I
+EXECUTE z(2)
+----
+2
+
+query I
+EXECUTE z(3)
+----
+3
+
+# WITH containing a placeholder that isn't referenced.
+
+statement ok
+PREPARE z2(int) AS WITH foo AS (SELECT * FROM x WHERE a = $1) SELECT * FROM x2 ORDER BY a
+
+query I
+EXECUTE z2(1)
+----
+1
+2
+3
+
+statement ok
+PREPARE z3(int) AS WITH foo AS (SELECT $1) SELECT * FROM foo
+
+query I
+EXECUTE z3(3)
+----
+3
+
+statement ok
+PREPARE z4(int) AS WITH foo AS (SELECT $1), bar AS (SELECT * FROM foo) SELECT * FROM bar
+
+query I
+EXECUTE z4(3)
+----
+3
+
+statement ok
+PREPARE z5(int, int) AS WITH foo AS (SELECT $1), bar AS (SELECT $2) (SELECT * FROM foo) UNION ALL (SELECT * FROM bar)
+
+query I rowsort
+EXECUTE z5(3, 5)
+----
+3
+5
+
+# TODO(justin): re-enable this, we don't allow WITHs having outer columns.
+# statement ok
+# PREPARE z6(int) AS
+#     SELECT * FROM
+#     (VALUES (1), (2)) v(x),
+#     LATERAL (SELECT * FROM
+#       (WITH foo AS (SELECT $1 + x) SELECT * FROM foo)
+#     )
+
+# query II
+# EXECUTE z6(3)
+# ----
+# 1 4
+# 2 5
+
+# Recursive CTE example from postgres docs.
+query T
+WITH RECURSIVE t(n) AS (
+    VALUES (1)
+  UNION ALL
+    SELECT n+1 FROM t WHERE n < 100
+)
+SELECT sum(n) FROM t
+----
+5050
+
+# Test where initial query has duplicate columns.
+query II
+WITH RECURSIVE cte(a, b) AS (
+    SELECT 0, 0
+  UNION ALL
+    SELECT a+1, b+10 FROM cte WHERE a < 5
+) SELECT * FROM cte;
+----
+0  0
+1  10
+2  20
+3  30
+4  40
+5  50
+
+# Test where recursive query has duplicate columns.
+query II
+WITH RECURSIVE cte(a, b) AS (
+    SELECT 0, 1
+  UNION ALL
+    SELECT a+1, a+1 FROM cte WHERE a < 5
+) SELECT * FROM cte;
+----
+0  1
+1  1
+2  2
+3  3
+4  4
+5  5
+
+# Recursive CTE examples adapted from
+# https://malisper.me/generating-fractals-with-postgres-escape-time-fractals.
+query T
+WITH RECURSIVE points AS (
+  SELECT i::float * 0.05 AS r, j::float * 0.05 AS c
+  FROM generate_series(-20, 20) AS a (i), generate_series(-40, 20) AS b (j)
+), iterations AS (
+     SELECT r,
+            c,
+            0.0::float AS zr,
+            0.0::float AS zc,
+            0 AS iteration
+     FROM points
+   UNION ALL
+     SELECT r,
+            c,
+            zr*zr - zc*zc + c AS zr,
+            2*zr*zc + r AS zc,
+            iteration+1 AS iteration
+     FROM iterations WHERE zr*zr + zc*zc < 4 AND iteration < 20
+), final_iteration AS (
+  SELECT * FROM iterations WHERE iteration = 20
+), marked_points AS (
+   SELECT r,
+          c,
+          (CASE WHEN EXISTS (SELECT 1 FROM final_iteration i WHERE p.r = i.r AND p.c = i.c)
+                THEN 'oo' ELSE '··' END) AS marker FROM points p
+), lines AS (
+   SELECT r, string_agg(marker, '' ORDER BY c ASC) AS r_text
+   FROM marked_points
+   GROUP BY r
+) SELECT string_agg(r_text, E'\n' ORDER BY r DESC) FROM lines
+----
+················································································oo········································
+············································································oo············································
+··········································································oooo············································
+······································································oo··oooo············································
+········································································oooooooo··········································
+······································································oooooooooooo········································
+········································································oooooooo··········································
+··························································oo····oooooooooooooooooooo··oo··································
+··························································oooo··oooooooooooooooooooooooo··································
+··························································oooooooooooooooooooooooooooooooooooooo··························
+··························································oooooooooooooooooooooooooooooooooooooo··························
+····················································oooooooooooooooooooooooooooooooooooooooooo····························
+······················································oooooooooooooooooooooooooooooooooooooooo····························
+····················································oooooooooooooooooooooooooooooooooooooooooooooo························
+··································oo····oo··········oooooooooooooooooooooooooooooooooooooooooooo··························
+··································oooooooooooo······oooooooooooooooooooooooooooooooooooooooooooo··························
+··································oooooooooooooo····oooooooooooooooooooooooooooooooooooooooooooooo························
+································oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo························
+······························oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo··························
+··························oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo····························
+··oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo······························
+··························oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo····························
+······························oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo··························
+································oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo························
+··································oooooooooooooo····oooooooooooooooooooooooooooooooooooooooooooooo························
+··································oooooooooooo······oooooooooooooooooooooooooooooooooooooooooooo··························
+··································oo····oo··········oooooooooooooooooooooooooooooooooooooooooooo··························
+····················································oooooooooooooooooooooooooooooooooooooooooooooo························
+······················································oooooooooooooooooooooooooooooooooooooooo····························
+····················································oooooooooooooooooooooooooooooooooooooooooo····························
+··························································oooooooooooooooooooooooooooooooooooooo··························
+··························································oooooooooooooooooooooooooooooooooooooo··························
+··························································oooo··oooooooooooooooooooooooo··································
+··························································oo····oooooooooooooooooooo··oo··································
+········································································oooooooo··········································
+······································································oooooooooooo········································
+········································································oooooooo··········································
+······································································oo··oooo············································
+··········································································oooo············································
+············································································oo············································
+················································································oo········································
+
+query T
+WITH RECURSIVE points AS (
+  SELECT i::float * 0.05 AS r, j::float * 0.05 AS c
+  FROM generate_series(-20, 20) AS a (i), generate_series(-30, 30) AS b (j)
+), iterations AS (
+   SELECT r, c, c::float AS zr, r::float AS zc, 0 AS iteration FROM points
+   UNION ALL
+   SELECT r, c, zr*zr - zc*zc + 1 - 1.61803398875 AS zr, 2*zr*zc AS zc, iteration+1 AS iteration
+   FROM iterations WHERE zr*zr + zc*zc < 4 AND iteration < 20
+), final_iteration AS (
+  SELECT * FROM iterations WHERE iteration = 20
+), marked_points AS (
+   SELECT r, c, (CASE WHEN EXISTS (SELECT 1 FROM final_iteration i WHERE p.r = i.r AND p.c = i.c)
+                  THEN 'oo'
+                  ELSE '··'
+                  END) AS marker
+   FROM points p
+), rows AS (
+   SELECT r, string_agg(marker, '' ORDER BY c ASC) AS r_text
+   FROM marked_points
+   GROUP BY r
+) SELECT string_agg(r_text, E'\n' ORDER BY r DESC) FROM rows
+----
+··························································································································
+··························································································································
+····························································oo····························································
+····························································oo····························································
+························································oooooooooo························································
+························································oooooooooo························································
+························································oooooooooo························································
+··············································oo··oooooooooooooooooooooo··oo··············································
+··············································oooooooooooooooooooooooooooooo··············································
+············································oooooooooooooooooooooooooooooooooo············································
+··········································oooooooooooooooooooooooooooooooooooooo··········································
+························oooo····oo········oooooooooooooooooooooooooooooooooooooo········oo····oooo························
+························oooooooooooooo····oooooooooooooooooooooooooooooooooooooo····oooooooooooooo························
+······················oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo······················
+····················oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo····················
+··················oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo··················
+··················oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo··················
+··········oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo··········
+··········oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo··········
+······oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo······
+····oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo····
+······oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo······
+··········oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo··········
+··········oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo··········
+··················oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo··················
+··················oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo··················
+····················oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo····················
+······················oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo······················
+························oooooooooooooo····oooooooooooooooooooooooooooooooooooooo····oooooooooooooo························
+························oooo····oo········oooooooooooooooooooooooooooooooooooooo········oo····oooo························
+··········································oooooooooooooooooooooooooooooooooooooo··········································
+············································oooooooooooooooooooooooooooooooooo············································
+··············································oooooooooooooooooooooooooooooo··············································
+··············································oo··oooooooooooooooooooooo··oo··············································
+························································oooooooooo························································
+························································oooooooooo························································
+························································oooooooooo························································
+····························································oo····························································
+····························································oo····························································
+··························································································································
+··························································································································
+
+# Regression test for #45869 (CTE inside recursive CTE).
+query T rowsort
+WITH RECURSIVE x(a) AS (
+    VALUES ('a'), ('b')
+  UNION ALL
+    (WITH z AS (SELECT * FROM x)
+      SELECT z.a || z1.a AS a FROM z CROSS JOIN z AS z1 WHERE length(z.a) < 3
+    )
+)
+SELECT * FROM x
+----
+a
+b
+aa
+ba
+ab
+bb
+aaaa
+baaa
+abaa
+bbaa
+aaba
+baba
+abba
+bbba
+aaab
+baab
+abab
+bbab
+aabb
+babb
+abbb
+bbbb
+
+# Regression test for #53951: placeholder inside a recursive CTE.
+statement ok
+PREPARE
+  ctestmt
+AS
+  (WITH RECURSIVE cte (x) AS (VALUES (1) UNION ALL SELECT x + $1 FROM cte WHERE x < 50) SELECT * FROM cte)
+
+query I rowsort
+EXECUTE ctestmt (10)
+----
+1
+11
+21
+31
+41
+51
+
+# Verify that the query inside the CTE can refer to an outer CTE.
+statement ok
+DROP TABLE IF EXISTS ab
+
+statement ok
+CREATE TABLE ab (a INT PRIMARY KEY, b INT)
+
+statement ok
+INSERT INTO ab VALUES (1,1)
+
+query I rowsort
+WITH
+  cte1 AS MATERIALIZED (SELECT a FROM ab WHERE a = b)
+SELECT * FROM
+  (
+    WITH RECURSIVE
+      cte2 (x) AS (SELECT 1 UNION ALL SELECT x + a FROM cte2, cte1 WHERE x < 10)
+    SELECT * FROM cte2
+  )
+----
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+# Test CTE with order-by projection (#55196).
+statement ok
+CREATE TABLE xy (x INT, y INT);
+INSERT INTO xy VALUES (1,1),(1,2),(2,1),(2,2);
+
+query I rowsort
+WITH cte AS (SELECT x*10+y FROM xy ORDER BY x+y LIMIT 3) SELECT * FROM cte
+----
+11
+12
+21

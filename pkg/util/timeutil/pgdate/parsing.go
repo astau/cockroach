@@ -1,25 +1,22 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package pgdate
 
 import (
-	"math"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 )
 
 // Various keywords that appear in timestamps.
@@ -57,6 +54,8 @@ var (
 		fieldTZHour, fieldTZMinute, fieldTZSecond)
 	timeRequiredFields = newFieldSet(fieldHour, fieldMinute)
 
+	db2TimeRequiredFields = newFieldSet(fieldHour, fieldMinute, fieldSecond)
+
 	dateTimeFields = dateFields.AddAll(timeFields)
 
 	tzFields = newFieldSet(fieldTZHour, fieldTZMinute, fieldTZSecond)
@@ -65,9 +64,21 @@ var (
 // These are sentinel values for handling special values:
 // https://www.postgresql.org/docs/10/static/datatype-datetime.html#DATATYPE-DATETIME-SPECIAL-TABLE
 var (
-	TimeEpoch            = timeutil.Unix(0, 0)
-	TimeInfinity         = timeutil.Unix(math.MaxInt64, math.MaxInt64)
-	TimeNegativeInfinity = timeutil.Unix(math.MinInt64, math.MinInt64)
+	TimeEpoch = timeutil.Unix(0, 0)
+	// TimeInfinity represents the "highest" possible time.
+	// TODO (#41564): this should actually behave as infinity, i.e. any operator
+	// leaves this as infinity. This time should always be greater than any other time.
+	// We should probably use the next microsecond after this value, i.e. timeutil.Unix(9224318016000, 0).
+	// Postgres uses math.MaxInt64 microseconds as the infinity value.
+	// See: https://github.com/postgres/postgres/blob/42aa1f0ab321fd43cbfdd875dd9e13940b485900/src/include/datatype/timestamp.h#L107.
+	TimeInfinity = timeutil.Unix(9224318016000-1, 999999000)
+	// TimeNegativeInfinity represents the "lowest" possible time.
+	// TODO (#41564): this should actually behave as -infinity, i.e. any operator
+	// leaves this as -infinity. This time should always be less than any other time.
+	// We should probably use the next microsecond before this value, i.e. timeutil.Unix(9224318016000-1, 999999000).
+	// Postgres uses math.MinInt64 microseconds as the -infinity value.
+	// See: https://github.com/postgres/postgres/blob/42aa1f0ab321fd43cbfdd875dd9e13940b485900/src/include/datatype/timestamp.h#L107.
+	TimeNegativeInfinity = timeutil.Unix(-210866803200, 0)
 )
 
 //go:generate stringer -type=ParseMode
@@ -85,12 +96,21 @@ const (
 	ParseModeMDY
 )
 
-// ParseDate converts a string into a time value.
-func ParseDate(now time.Time, mode ParseMode, s string) (time.Time, error) {
+// ParseDate converts a string into Date.
+//
+// Any specified timezone is inconsequential. Examples:
+//  - "now": parses to the local date (in the current timezone)
+//  - "2020-06-26 01:09:15.511971": parses to '2020-06-26'
+//  - "2020-06-26 01:09:15.511971-05": parses to '2020-06-26'
+//
+// The dependsOnContext return value indicates if we had to consult the given
+// `now` value (either for the time or the local timezone).
+//
+func ParseDate(now time.Time, mode ParseMode, s string) (_ Date, dependsOnContext bool, _ error) {
 	fe := fieldExtract{
-		now:      now,
-		mode:     mode,
-		required: dateRequiredFields,
+		currentTime: now,
+		mode:        mode,
+		required:    dateRequiredFields,
 		// We allow time fields to be provided since they occur after
 		// the date fields that we're really looking for and for
 		// time values like 24:00:00, would push into the next day.
@@ -98,41 +118,90 @@ func ParseDate(now time.Time, mode ParseMode, s string) (time.Time, error) {
 	}
 
 	if err := fe.Extract(s); err != nil {
-		return TimeEpoch, parseError(err, "date", s)
+		return Date{}, false, parseError(err, "date", s)
 	}
-	return fe.MakeDate(), nil
+	date, err := fe.MakeDate()
+	return date, fe.currentTimeUsed, err
 }
 
 // ParseTime converts a string into a time value on the epoch day.
-func ParseTime(now time.Time, mode ParseMode, s string) (time.Time, error) {
+//
+// The dependsOnContext return value indicates if we had to consult the given
+// `now` value (either for the time or the local timezone).
+func ParseTime(
+	now time.Time, mode ParseMode, s string,
+) (_ time.Time, dependsOnContext bool, _ error) {
 	fe := fieldExtract{
-		now:      now,
-		required: timeRequiredFields,
-		wanted:   timeFields,
+		currentTime: now,
+		required:    timeRequiredFields,
+		wanted:      timeFields,
 	}
 
 	if err := fe.Extract(s); err != nil {
 		// It's possible that the user has given us a complete
 		// timestamp string; let's try again, accepting more fields.
 		fe = fieldExtract{
-			now:      now,
-			mode:     mode,
-			required: timeRequiredFields,
-			wanted:   dateTimeFields,
+			currentTime: now,
+			mode:        mode,
+			required:    timeRequiredFields,
+			wanted:      dateTimeFields,
 		}
 
 		if err := fe.Extract(s); err != nil {
-			return TimeEpoch, parseError(err, "time", s)
+			return TimeEpoch, false, parseError(err, "time", s)
 		}
 	}
-	return fe.MakeTime(), nil
+	res := fe.MakeTime()
+	return res, fe.currentTimeUsed, nil
+}
+
+// ParseTimeWithoutTimezone converts a string into a time value on the epoch
+// day, dropping any timezone information. The returned time always has UTC
+// location.
+//
+// Any specified timezone is inconsequential. Examples:
+//  - "now": parses to the local time of day (in the current timezone)
+//  - "01:09:15.511971" and "01:09:15.511971-05" parse to the same result
+//
+// The dependsOnContext return value indicates if we had to consult the given
+// `now` value (either for the time or the local timezone).
+func ParseTimeWithoutTimezone(
+	now time.Time, mode ParseMode, s string,
+) (_ time.Time, dependsOnContext bool, _ error) {
+	fe := fieldExtract{
+		currentTime: now,
+		required:    timeRequiredFields,
+		wanted:      timeFields,
+	}
+
+	if err := fe.Extract(s); err != nil {
+		// It's possible that the user has given us a complete
+		// timestamp string; let's try again, accepting more fields.
+		fe = fieldExtract{
+			currentTime: now,
+			mode:        mode,
+			required:    timeRequiredFields,
+			wanted:      dateTimeFields,
+		}
+
+		if err := fe.Extract(s); err != nil {
+			return TimeEpoch, false, parseError(err, "time", s)
+		}
+	}
+	res := fe.MakeTimeWithoutTimezone()
+	return res, fe.currentTimeUsed, nil
 }
 
 // ParseTimestamp converts a string into a timestamp.
-func ParseTimestamp(now time.Time, mode ParseMode, s string) (time.Time, error) {
+//
+// The dependsOnContext return value indicates if we had to consult the given
+// `now` value (either for the time or the local timezone).
+func ParseTimestamp(
+	now time.Time, mode ParseMode, s string,
+) (_ time.Time, dependsOnContext bool, _ error) {
 	fe := fieldExtract{
-		mode: mode,
-		now:  now,
+		mode:        mode,
+		currentTime: now,
 		// A timestamp only actually needs a date component; the time
 		// would be midnight.
 		required: dateRequiredFields,
@@ -140,34 +209,66 @@ func ParseTimestamp(now time.Time, mode ParseMode, s string) (time.Time, error) 
 	}
 
 	if err := fe.Extract(s); err != nil {
-		return TimeEpoch, parseError(err, "timestamp", s)
+		return TimeEpoch, false, parseError(err, "timestamp", s)
 	}
-	return fe.MakeTimestamp(), nil
+	res := fe.MakeTimestamp()
+	return res, fe.currentTimeUsed, nil
 }
 
-// badFieldPrefixError constructs a CodeInvalidDatetimeFormatError pgerror.
+// ParseTimestampWithoutTimezone converts a string into a timestamp, stripping
+// away any timezone information. Any specified timezone is inconsequential. The
+// returned time always has UTC location.
+//
+// For example, all these inputs return 2020-06-26 01:02:03 +0000 UTC:
+//   - '2020-06-26 01:02:03';
+//   - '2020-06-26 01:02:03+04';
+//   - 'now', if the local local time (in the current timezone) is
+//     2020-06-26 01:02:03. Note that this does not represent the same time
+//     instant, but the one that "reads" the same in UTC.
+//
+// The dependsOnContext return value indicates if we had to consult the given
+// `now` value (either for the time or the local timezone).
+func ParseTimestampWithoutTimezone(
+	now time.Time, mode ParseMode, s string,
+) (_ time.Time, dependsOnContext bool, _ error) {
+	fe := fieldExtract{
+		mode:        mode,
+		currentTime: now,
+		// A timestamp only actually needs a date component; the time
+		// would be midnight.
+		required: dateRequiredFields,
+		wanted:   dateTimeFields,
+	}
+
+	if err := fe.Extract(s); err != nil {
+		return TimeEpoch, false, parseError(err, "timestamp", s)
+	}
+	res := fe.MakeTimestampWithoutTimezone()
+	return res, fe.currentTimeUsed, nil
+}
+
+// badFieldPrefixError constructs an error with pg code InvalidDatetimeFormat.
 func badFieldPrefixError(field field, prefix rune) error {
-	return inputErrorf("unexpected separator '%v' for field %s", prefix, field.Pretty())
+	return inputErrorf("unexpected separator '%s' for field %s",
+		string(prefix), errors.Safe(field.Pretty()))
 }
 
-// inputErrorf returns a CodeInvalidDatetimeFormatError pgerror.
+// inputErrorf returns an error with pg code InvalidDatetimeFormat.
 func inputErrorf(format string, args ...interface{}) error {
-	return pgerror.NewErrorf(pgerror.CodeInvalidDatetimeFormatError, format, args...)
+	err := errors.Newf(format, args...)
+	return pgerror.WithCandidateCode(err, pgcode.InvalidDatetimeFormat)
 }
 
-// outOfRangeError returns a CodeDatetimeFieldOverflowError pgerror.
+// outOfRangeError returns an error with pg code DatetimeFieldOverflow.
 func outOfRangeError(field string, val int) error {
-	return pgerror.NewErrorf(pgerror.CodeDatetimeFieldOverflowError,
-		"field %s value %d is out of range", field, val)
+	err := errors.Newf("field %s value %d is out of range", errors.Safe(field), errors.Safe(val))
+	return pgerror.WithCandidateCode(err, pgcode.DatetimeFieldOverflow)
 }
 
 // parseError ensures that any error we return to the client will
-// be some kind of pgerror.
+// be some kind of error with a pg code.
 func parseError(err error, kind string, s string) error {
-	if err, ok := err.(*pgerror.Error); ok {
-		err.Message += " as type " + kind
-		return err
-	}
-	return pgerror.NewErrorf(pgerror.CodeInvalidDatetimeFormatError,
-		`could not parse "%s" as type %s`, s, kind)
+	return pgerror.WithCandidateCode(
+		errors.Wrapf(err, "parsing as type %s", errors.Safe(kind)),
+		pgcode.InvalidDatetimeFormat)
 }

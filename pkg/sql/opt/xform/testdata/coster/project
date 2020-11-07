@@ -1,47 +1,42 @@
 exec-ddl
 CREATE TABLE a (k INT PRIMARY KEY, i INT, s STRING, d DECIMAL NOT NULL)
 ----
-TABLE a
- ├── k int not null
- ├── i int
- ├── s string
- ├── d decimal not null
- └── INDEX primary
-      └── k int not null
 
 opt
 SELECT k, i, s || 'foo' FROM a
 ----
 project
- ├── columns: k:1(int!null) i:2(int) "?column?":5(string)
+ ├── columns: k:1!null i:2 "?column?":6
+ ├── immutable
  ├── stats: [rows=1000]
- ├── cost: 1090.02
+ ├── cost: 1094.03
  ├── key: (1)
- ├── fd: (1)-->(2,5)
+ ├── fd: (1)-->(2,6)
  ├── scan a
- │    ├── columns: k:1(int!null) i:2(int) s:3(string)
+ │    ├── columns: k:1!null i:2 s:3
  │    ├── stats: [rows=1000]
- │    ├── cost: 1070.01
+ │    ├── cost: 1074.02
  │    ├── key: (1)
  │    └── fd: (1)-->(2,3)
  └── projections
-      └── s || 'foo' [type=string, outer=(3)]
+      └── s:3 || 'foo' [as="?column?":6, outer=(3), immutable]
 
 opt
 SELECT k, k+2, i*d FROM a
 ----
 project
- ├── columns: k:1(int!null) "?column?":5(int) "?column?":6(decimal)
+ ├── columns: k:1!null "?column?":6!null "?column?":7
+ ├── immutable
  ├── stats: [rows=1000]
- ├── cost: 1100.02
+ ├── cost: 1104.03
  ├── key: (1)
- ├── fd: (1)-->(5,6)
+ ├── fd: (1)-->(6,7)
  ├── scan a
- │    ├── columns: k:1(int!null) i:2(int) d:4(decimal!null)
+ │    ├── columns: k:1!null i:2 d:4!null
  │    ├── stats: [rows=1000]
- │    ├── cost: 1070.01
+ │    ├── cost: 1074.02
  │    ├── key: (1)
  │    └── fd: (1)-->(2,4)
  └── projections
-      ├── k + 2 [type=int, outer=(1)]
-      └── i * d [type=decimal, outer=(2,4)]
+      ├── k:1 + 2 [as="?column?":6, outer=(1), immutable]
+      └── i:2 * d:4 [as="?column?":7, outer=(2,4), immutable]
